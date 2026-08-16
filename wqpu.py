@@ -21,6 +21,7 @@ import signal
 import socket
 import ssl
 import subprocess
+import sys
 import tarfile
 import time
 import urllib.request
