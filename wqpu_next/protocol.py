@@ -15,6 +15,13 @@ from typing import Dict, List, Optional
 PROTOCOL_VERSION = 1
 BPS = 10_000
 
+SESSION_PERM_PROVIDER = 1 << 0
+SESSION_PERM_JOB = 1 << 1
+SESSION_PERM_SETTLE = 1 << 2
+SESSION_ALL_PERMISSIONS = (
+    SESSION_PERM_PROVIDER | SESSION_PERM_JOB | SESSION_PERM_SETTLE
+)
+
 
 def canonical_json(value: object) -> bytes:
     """Stable JSON encoding suitable for hashing/signing protocol objects."""
@@ -58,6 +65,7 @@ class SessionDelegation:
     max_spend_units: int
     max_job_units: int
     revocation_nonce: int
+    permissions: int = 0
     protocol_version: int = PROTOCOL_VERSION
 
     def validate(self) -> None:
@@ -69,6 +77,9 @@ class SessionDelegation:
         _require_nonnegative("max_spend_units", self.max_spend_units)
         _require_nonnegative("max_job_units", self.max_job_units)
         _require_nonnegative("revocation_nonce", self.revocation_nonce)
+        _require_nonnegative("permissions", self.permissions)
+        if self.permissions & ~SESSION_ALL_PERMISSIONS:
+            raise ValueError("unknown session permission bit")
         if self.expires_height <= self.issued_height:
             raise ValueError("session expiry must be after issue height")
         if self.protocol_version != PROTOCOL_VERSION:
