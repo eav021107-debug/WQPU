@@ -1,9 +1,6 @@
 package kernel
 
-import (
-	"encoding/hex"
-	"errors"
-)
+import "errors"
 
 type ProviderReservation struct {
 	ProviderWallet       string
@@ -13,26 +10,26 @@ type ProviderReservation struct {
 }
 
 type JobReservation struct {
-	JobID                  string
-	RequesterWallet        string
-	RequesterSessionPubkey [32]byte
-	ModelHash               string
-	PriceEpoch              uint64
-	PricePerMillionUnits    uint64
-	MaxComputeUnits         uint64
-	MaxChargeUnits          uint64
-	CreatedHeight           uint64
-	ExpiresHeight           uint64
-	Providers               []ProviderReservation
+	JobID                    string
+	RequesterWallet          string
+	RequesterSessionAddress  string
+	ModelHash                 string
+	PriceEpoch                uint64
+	PricePerMillionUnits      uint64
+	MaxComputeUnits           uint64
+	MaxChargeUnits            uint64
+	CreatedHeight             uint64
+	ExpiresHeight             uint64
+	Providers                 []ProviderReservation
 }
 
 func (j JobReservation) Validate() error {
 	if j.JobID == "" || j.RequesterWallet == "" || j.ModelHash == "" {
 		return errors.New("job identity fields must be non-empty")
 	}
-	var zero [32]byte
-	if j.RequesterSessionPubkey == zero {
-		return errors.New("job session key must be non-zero")
+	canonical, err := CanonicalSessionAddress(j.RequesterSessionAddress)
+	if err != nil || canonical != j.RequesterSessionAddress {
+		return errors.New("job requester session address must be canonical")
 	}
 	if j.PricePerMillionUnits == 0 || j.MaxComputeUnits == 0 || j.MaxChargeUnits == 0 {
 		return errors.New("job price, compute and charge limits must be positive")
@@ -92,15 +89,19 @@ func NewState(chainID string, initialPrice uint64) (*State, error) {
 	}, nil
 }
 
-func sessionKey(wallet string, pubkey [32]byte) string {
-	return wallet + ":" + hex.EncodeToString(pubkey[:])
+func sessionKey(wallet, sessionAddress string) string {
+	return wallet + ":" + sessionAddress
 }
 
-func (s *State) session(wallet string, pubkey [32]byte) (*SessionState, error) {
+func (s *State) session(wallet, sessionAddress string) (*SessionState, error) {
 	if s == nil {
 		return nil, errors.New("nil state")
 	}
-	session := s.Sessions[sessionKey(wallet, pubkey)]
+	canonical, err := CanonicalSessionAddress(sessionAddress)
+	if err != nil || canonical != sessionAddress {
+		return nil, errors.New("invalid session address")
+	}
+	session := s.Sessions[sessionKey(wallet, sessionAddress)]
 	if session == nil {
 		return nil, errors.New("unknown session")
 	}
@@ -124,7 +125,7 @@ func (s *State) AuthorizeSession(d SessionDelegation) error {
 	if d.RevocationNonce != s.WalletRevocationNonce[d.Wallet] {
 		return errors.New("stale or future wallet revocation nonce")
 	}
-	key := sessionKey(d.Wallet, d.SessionPubkey)
+	key := sessionKey(d.Wallet, d.SessionAddress)
 	if _, exists := s.Sessions[key]; exists {
 		return errors.New("session already authorized")
 	}
@@ -151,8 +152,8 @@ func (s *State) RevokeWalletSessions(wallet string, newNonce uint64) error {
 }
 
 // PublishProvider applies a session-signature-verified provider heartbeat.
-func (s *State) PublishProvider(wallet string, sessionPubkey [32]byte, p Provider) error {
-	session, err := s.session(wallet, sessionPubkey)
+func (s *State) PublishProvider(wallet, sessionAddress string, p Provider) error {
+	session, err := s.session(wallet, sessionAddress)
 	if err != nil {
 		return err
 	}
@@ -220,7 +221,7 @@ func (s *State) ReserveJob(j JobReservation) error {
 		return errors.New("job uses stale global price")
 	}
 
-	session, err := s.session(j.RequesterWallet, j.RequesterSessionPubkey)
+	session, err := s.session(j.RequesterWallet, j.RequesterSessionAddress)
 	if err != nil {
 		return err
 	}
@@ -326,7 +327,7 @@ func (s *State) canSettleJob(j JobReservation, settlement Settlement) error {
 	if settlement.TotalCharge > j.MaxChargeUnits {
 		return errors.New("settlement exceeds job maximum")
 	}
-	session, err := s.session(j.RequesterWallet, j.RequesterSessionPubkey)
+	session, err := s.session(j.RequesterWallet, j.RequesterSessionAddress)
 	if err != nil {
 		return err
 	}
@@ -337,18 +338,16 @@ func (s *State) canSettleJob(j JobReservation, settlement Settlement) error {
 }
 
 func (s *State) settleJob(j JobReservation, settlement Settlement) {
-	session, _ := s.session(j.RequesterWallet, j.RequesterSessionPubkey)
+	session, _ := s.session(j.RequesterWallet, j.RequesterSessionAddress)
 	s.releaseJobResources(j)
 	if err := session.Settle(j.MaxChargeUnits, settlement.TotalCharge); err != nil {
-		panic(err) // preflight established this invariant
+		panic(err)
 	}
 	delete(s.Jobs, j.JobID)
 	delete(s.LatestReceipts, j.JobID)
 	s.CompletedSettlements[j.JobID] = settlement
 }
 
-// FinalizeJob has no caller-supplied price. The only payable amount is derived
-// from the latest verified receipts at the job's immutable global price.
 func (s *State) FinalizeJob(jobID string) (Settlement, error) {
 	if s == nil {
 		return Settlement{}, errors.New("nil state")
@@ -391,7 +390,7 @@ func (s *State) expireJobs() {
 		}
 		settlement, err := BuildTimeoutSettlement(job, s.LatestReceipts[job.JobID])
 		if err != nil {
-			panic(err) // preflight established this invariant
+			panic(err)
 		}
 		s.settleJob(job, settlement)
 	}
