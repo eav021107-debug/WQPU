@@ -23,12 +23,8 @@ func uint256(value uint64) *ethmath.HexOrDecimal256 {
 	return &out
 }
 
-func sessionPubkeyHex(key [32]byte) string {
-	return "0x" + hex.EncodeToString(key[:])
-}
-
-// SessionTypedData must stay byte-for-byte semantically equivalent to the
-// object shown by the WQPU wallet connector.
+// SessionTypedData must stay semantically equivalent to the object shown by
+// the WQPU wallet connector.
 func SessionTypedData(d kernel.SessionDelegation, evmChainID uint64) (apitypes.TypedData, error) {
 	if err := d.Validate(); err != nil {
 		return apitypes.TypedData{}, err
@@ -38,6 +34,9 @@ func SessionTypedData(d kernel.SessionDelegation, evmChainID uint64) (apitypes.T
 	}
 	if !common.IsHexAddress(d.Wallet) {
 		return apitypes.TypedData{}, errors.New("wallet is not a valid EVM address")
+	}
+	if !common.IsHexAddress(d.SessionAddress) {
+		return apitypes.TypedData{}, errors.New("session is not a valid EVM address")
 	}
 
 	return apitypes.TypedData{
@@ -49,7 +48,7 @@ func SessionTypedData(d kernel.SessionDelegation, evmChainID uint64) (apitypes.T
 			},
 			"WQPUSession": {
 				{Name: "wallet", Type: "address"},
-				{Name: "sessionPubkey", Type: "bytes32"},
+				{Name: "sessionAddress", Type: "address"},
 				{Name: "wqpuChainId", Type: "string"},
 				{Name: "issuedHeight", Type: "uint64"},
 				{Name: "expiresHeight", Type: "uint64"},
@@ -68,7 +67,7 @@ func SessionTypedData(d kernel.SessionDelegation, evmChainID uint64) (apitypes.T
 		},
 		Message: apitypes.TypedDataMessage{
 			"wallet":          d.Wallet,
-			"sessionPubkey":   sessionPubkeyHex(d.SessionPubkey),
+			"sessionAddress":  d.SessionAddress,
 			"wqpuChainId":     d.ChainID,
 			"issuedHeight":    strconv.FormatUint(d.IssuedHeight, 10),
 			"expiresHeight":   strconv.FormatUint(d.ExpiresHeight, 10),
@@ -104,7 +103,6 @@ func decodeEthereumSignature(signatureHex string) ([]byte, error) {
 	if err != nil || len(sig) != crypto.SignatureLength {
 		return nil, errors.New("signature must contain exactly 65 bytes")
 	}
-	// Browser wallets may return V as 27/28 while go-ethereum expects 0/1.
 	if sig[64] == 27 || sig[64] == 28 {
 		sig[64] -= 27
 	}
