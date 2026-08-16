@@ -14,7 +14,10 @@ import (
 	"github.com/eav021107-debug/WQPU/client/internal/rpcmesh"
 )
 
-const MaxInferencePeers = 8
+const (
+	MaxInferencePeers   = 8
+	DefaultRemoteLayers = 99
+)
 
 type InferenceTuning struct {
 	GPULayers   int
@@ -47,6 +50,26 @@ func validateRemotePeers(local common.Hash, remotes []common.Hash) error {
 	return nil
 }
 
+func validateInferenceTuning(remoteCount, apiPort int, tuning InferenceTuning) error {
+	if apiPort < 1 || apiPort > 65535 { return errors.New("WQPU inference API port is invalid") }
+	if tuning.GPULayers < 0 || tuning.ContextSize < 0 || tuning.Parallel < 0 || tuning.Threads < 0 {
+		return errors.New("WQPU inference tuning values cannot be negative")
+	}
+	if tuning.SplitMode != "" {
+		switch tuning.SplitMode {
+		case "none", "layer", "row", "tensor":
+		default: return errors.New("unsupported WQPU inference split mode")
+		}
+	}
+	if len(tuning.TensorSplit) > 0 {
+		if len(tuning.TensorSplit) != remoteCount { return errors.New("WQPU inference tensor split must match remote peer count") }
+		for _, value := range tuning.TensorSplit {
+			if value == 0 { return errors.New("WQPU inference tensor split proportions must be positive") }
+		}
+	}
+	return nil
+}
+
 func remoteDeviceNames(count int) []string {
 	devices := make([]string, count)
 	for index := range devices { devices[index] = fmt.Sprintf("RPC%d", index) }
@@ -56,9 +79,11 @@ func remoteDeviceNames(count int) []string {
 func runtimeTuning(remoteCount int, tuning InferenceTuning) llamaruntime.ServerTuning {
 	splitMode := tuning.SplitMode
 	if splitMode == "" && remoteCount > 1 { splitMode = "layer" }
+	gpuLayers := tuning.GPULayers
+	if gpuLayers == 0 { gpuLayers = DefaultRemoteLayers }
 	return llamaruntime.ServerTuning{
 		Devices: remoteDeviceNames(remoteCount),
-		GPULayers: tuning.GPULayers,
+		GPULayers: gpuLayers,
 		ContextSize: tuning.ContextSize,
 		Parallel: tuning.Parallel,
 		Threads: tuning.Threads,
@@ -69,7 +94,7 @@ func runtimeTuning(remoteCount int, tuning InferenceTuning) llamaruntime.ServerT
 
 func inferenceContext(node context.Context, parent context.Context) (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(node)
-	if parent != nil && parent != node {
+	if parent != nil {
 		go func() {
 			select {
 			case <-parent.Done(): cancel()
@@ -83,6 +108,7 @@ func inferenceContext(node context.Context, parent context.Context) (context.Con
 func (n *Node) StartHFFileInference(parent context.Context, remotes []common.Hash, apiPort int, repo, file string, tuning InferenceTuning, output io.Writer, readiness time.Duration) (*InferenceSession, error) {
 	if n == nil || n.mesh == nil { return nil, errors.New("WQPU compute node is not running") }
 	if err := validateRemotePeers(n.config.LocalPeerID, remotes); err != nil { return nil, err }
+	if err := validateInferenceTuning(len(remotes), apiPort, tuning); err != nil { return nil, err }
 	ctx, cancel := inferenceContext(n.ctx, parent)
 	forwarders := make([]*rpcmesh.Forwarder, 0, len(remotes))
 	closeForwarders := func() {
