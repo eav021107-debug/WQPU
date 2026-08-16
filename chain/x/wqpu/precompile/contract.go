@@ -25,6 +25,8 @@ var (
 
 type Contract struct{}
 
+var _ vm.PrecompiledContract = Contract{}
+
 func New() Contract { return Contract{} }
 
 func (Contract) Address() common.Address { return Address }
@@ -93,10 +95,16 @@ func currentGlobalPrice(state WordState) (uint64, error) {
 }
 
 func providerCount(state WordState) (uint64, error) {
+	if state == nil {
+		return 0, errors.New("nil WQPU state")
+	}
 	return hashToUint64(state.GetState(Address, AddressIndexCountSlot("providers")))
 }
 
 func providerAt(state WordState, index uint64) (common.Address, error) {
+	if state == nil {
+		return common.Address{}, errors.New("nil WQPU state")
+	}
 	if index == 0 {
 		return common.Address{}, errors.New("provider index is 1-based")
 	}
