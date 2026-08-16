@@ -51,10 +51,11 @@ func TestHelloBinaryRoundTrip(t *testing.T) {
 	encoded := left.Bytes()
 	decoded, err := ParseHello(encoded)
 	if err != nil { t.Fatal(err) }
-	if decoded.ChainID != left.Hello().ChainID || decoded.PeerID != left.Hello().PeerID || decoded.Session != left.Hello().Session || decoded.Role != RoleInitiator {
+	leftHello := left.Hello()
+	if decoded.ChainID != leftHello.ChainID || decoded.PeerID != leftHello.PeerID || decoded.Session != leftHello.Session || decoded.Role != RoleInitiator {
 		t.Fatalf("decoded=%+v", decoded)
 	}
-	if !bytes.Equal(decoded.Signature[:], left.Hello().Signature[:]) { t.Fatal("signature changed during hello round trip") }
+	if !bytes.Equal(decoded.Signature[:], leftHello.Signature[:]) { t.Fatal("signature changed during hello round trip") }
 	if _, err := ParseHello(append(encoded, 0)); err == nil { t.Fatal("trailing hello bytes should fail") }
 }
 
