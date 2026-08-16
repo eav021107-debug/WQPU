@@ -61,7 +61,6 @@ jobs:
           test -n "$CLI" && test -x "$CLI"
           case "$ROOT" in "$BASE"/*) ;; *) echo 'runtime escaped WQPU base directory' >&2; exit 1;; esac
 
-          # A second invocation must safely reuse the complete installed runtime.
           (cd client && go run ./cmd/wqpu-runtime-install "$BASE") > runtime.second.paths
           cmp runtime.paths runtime.second.paths
 
@@ -107,11 +106,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # b10453's own server tests use ggml-org/models +
-          # tinyllamas/stories260K.gguf. The helper starts llama-server with
-          # --device RPC0 --n-gpu-layers 99, waits for /health=200, then POSTs
-          # /completion. If the encrypted remote backend is absent, startup fails.
+          # The helper forces --device RPC0 --n-gpu-layers 99, performs a real
+          # completion, and enables upstream GGML_RPC_DEBUG only in the remote
+          # backend. Success requires a server-side [alloc_buffer] operation,
+          # proving model memory was actually allocated through the encrypted RPC.
           (cd client && go run ./cmd/wqpu-llama-model-smoke --runtime-base "$WQPU_RUNTIME_BASE") 2>&1 | tee model-smoke.log
-          grep -F 'tiny model inference crossed remote WQPU RPC0' model-smoke.log
-          grep -F 'RPC0' "$WQPU_RUNTIME_BASE/model-smoke-server.log"
-          echo 'Remote WQPU RPC0 model-load and inference smoke passed.'
+          grep -F 'tiny model inference crossed remote WQPU RPC0 with remote allocation' model-smoke.log
+          grep -F '[alloc_buffer]' "$WQPU_RUNTIME_BASE/model-smoke-rpc.log"
+          echo 'Remote WQPU RPC0 model allocation and inference smoke passed.'
