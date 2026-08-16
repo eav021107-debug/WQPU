@@ -7,11 +7,13 @@ import (
 )
 
 type ServerTuning struct {
-	Devices    []string
-	GPULayers  int
+	Devices     []string
+	GPULayers   int
 	ContextSize int
-	Parallel   int
-	Threads    int
+	Parallel    int
+	Threads     int
+	SplitMode   string
+	TensorSplit []uint64
 }
 
 func validateHFFile(file string) error {
@@ -37,6 +39,25 @@ func appendServerTuning(args []string, tuning ServerTuning) ([]string, error) {
 			seen[device] = struct{}{}
 		}
 		args = append(args, "--device", strings.Join(tuning.Devices, ","))
+	}
+	if tuning.SplitMode != "" {
+		switch tuning.SplitMode {
+		case "none", "layer", "row", "tensor":
+		default:
+			return nil, errors.New("unsupported llama.cpp split mode")
+		}
+		args = append(args, "--split-mode", tuning.SplitMode)
+	}
+	if len(tuning.TensorSplit) > 0 {
+		if len(tuning.Devices) > 0 && len(tuning.TensorSplit) != len(tuning.Devices) {
+			return nil, errors.New("tensor split must match the selected offload device count")
+		}
+		parts := make([]string, len(tuning.TensorSplit))
+		for index, value := range tuning.TensorSplit {
+			if value == 0 { return nil, errors.New("tensor split proportions must be positive") }
+			parts[index] = strconv.FormatUint(value, 10)
+		}
+		args = append(args, "--tensor-split", strings.Join(parts, ","))
 	}
 	if tuning.GPULayers > 0 { args = append(args, "--n-gpu-layers", strconv.Itoa(tuning.GPULayers)) }
 	if tuning.ContextSize > 0 { args = append(args, "--ctx-size", strconv.Itoa(tuning.ContextSize)) }
