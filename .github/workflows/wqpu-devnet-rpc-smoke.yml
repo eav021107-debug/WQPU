@@ -31,6 +31,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25.9'
+      - name: Resolve pinned WQPU Go module checksums
+        working-directory: chain
+        run: go mod tidy
       - name: Boot sovereign WQPU devnet and exercise native precompile
         shell: bash
         env:
