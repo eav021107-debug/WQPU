@@ -3,12 +3,10 @@ package kernel
 import "testing"
 
 func validSession() SessionState {
-	var key [32]byte
-	key[0] = 1
 	return SessionState{Delegation: SessionDelegation{
 		ChainID:         "wqpu-dev-1",
 		Wallet:          "0x1111111111111111111111111111111111111111",
-		SessionPubkey:   key,
+		SessionAddress:  "0x2222222222222222222222222222222222222222",
 		IssuedHeight:    100,
 		ExpiresHeight:   200,
 		MaxSpendUnits:   1000,
@@ -86,10 +84,15 @@ func TestUnknownPermissionBitIsRejected(t *testing.T) {
 	}
 }
 
-func TestZeroSessionKeyRejected(t *testing.T) {
+func TestInvalidOrNonCanonicalSessionAddressRejected(t *testing.T) {
 	s := validSession()
-	s.Delegation.SessionPubkey = [32]byte{}
+	s.Delegation.SessionAddress = "0x1234"
 	if err := s.Delegation.Validate(); err == nil {
-		t.Fatal("zero session key should be rejected")
+		t.Fatal("short session address should be rejected")
+	}
+	s = validSession()
+	s.Delegation.SessionAddress = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	if err := s.Delegation.Validate(); err == nil {
+		t.Fatal("non-canonical uppercase session address should be rejected")
 	}
 }
