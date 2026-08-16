@@ -1,81 +1,48 @@
 #!/usr/bin/env python3
-"""WQPU: one llama.cpp model across several trusted computers."""
+"""WQPU equal-peer client.
+
+Each online node contributes a localhost llama.cpp RPC worker. The node that
+originates a question starts a temporary local llama-server for that request,
+connects the other online workers through the encrypted relay, prints the
+answer, then tears the temporary coordinator down.
+"""
 from __future__ import annotations
 
 import argparse
+import asyncio
+import base64
 import ctypes
-import ipaddress
+import hashlib
 import json
 import os
 import platform
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
-import sys
 import tarfile
-import threading
 import time
 import urllib.request
 import uuid
 import zipfile
 from pathlib import Path
 
-VERSION = "0.2.0"
+VERSION = "0.5.0"
 HOME = Path(os.environ.get("WQPU_HOME", str(Path.home() / ".wqpu"))).expanduser()
-CONFIG_FILE = HOME / "config.json"
+NET_FILE = HOME / "network.json"
 NODE_FILE = HOME / "node-id"
 STATUS_FILE = HOME / "status.json"
-STOP_FILE = HOME / "stop"
 RUNTIME_DIR = HOME / "runtime"
 LOG_DIR = HOME / "logs"
-DISCOVERY_PORT = 51111
 RPC_PORT = 50052
-API_PORT = 8080
-PEER_TTL = 8.0
-DISCOVERY_EVERY = 1.5
-DEFAULTS = {
-    "cluster": "home",
-    "model": "ggml-org/gemma-3-1b-it-GGUF:Q4_K_M",
-    "cpu_fraction": 0.50,
-    "ram_reserve_fraction": 0.30,
-    "min_ram_reserve_mb": 512,
-    "min_coordinator_ram_mb": 3072,
-    "context": 4096,
-    "discovery_port": DISCOVERY_PORT,
-    "rpc_port": RPC_PORT,
-    "api_port": API_PORT,
-}
+DEFAULT_MODEL = "ggml-org/gemma-3-1b-it-GGUF:Q4_K_M"
+STATUS_MAX_AGE = 30
 
 
 def ensure_home() -> None:
-    HOME.mkdir(parents=True, exist_ok=True)
-    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-
-def load_config() -> dict:
-    ensure_home()
-    cfg = dict(DEFAULTS)
-    if CONFIG_FILE.exists():
-        try:
-            cfg.update(json.loads(CONFIG_FILE.read_text(encoding="utf-8")))
-        except Exception as exc:
-            print(f"WQPU: config warning: {exc}", file=sys.stderr)
-    if os.environ.get("WQPU_CPU_FRACTION"):
-        cfg["cpu_fraction"] = float(os.environ["WQPU_CPU_FRACTION"])
-    if os.environ.get("WQPU_RAM_RESERVE_FRACTION"):
-        cfg["ram_reserve_fraction"] = float(os.environ["WQPU_RAM_RESERVE_FRACTION"])
-    if os.environ.get("WQPU_MODEL"):
-        cfg["model"] = os.environ["WQPU_MODEL"]
-    if os.environ.get("WQPU_CLUSTER"):
-        cfg["cluster"] = os.environ["WQPU_CLUSTER"]
-    return cfg
-
-
-def save_config(cfg: dict) -> None:
-    ensure_home()
-    CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    for path in (HOME, RUNTIME_DIR, LOG_DIR):
+        path.mkdir(parents=True, exist_ok=True)
 
 
 def node_id() -> str:
@@ -90,59 +57,61 @@ def node_id() -> str:
 
 
 def total_ram_mb() -> int:
-    system = platform.system()
     try:
-        if system == "Windows":
-            class MEMORYSTATUSEX(ctypes.Structure):
-                _fields_ = [
-                    ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
-                    ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
-                ]
-            state = MEMORYSTATUSEX()
-            state.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
-            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(state))
-            return int(state.ullTotalPhys // (1024 * 1024))
+        system = platform.system()
         if system == "Linux":
             for line in Path("/proc/meminfo").read_text().splitlines():
                 if line.startswith("MemTotal:"):
                     return int(line.split()[1]) // 1024
         if system == "Darwin":
             out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()
-            return int(out) // (1024 * 1024)
+            return int(out) // 1048576
+        if system == "Windows":
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [
+                    ("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                ]
+            state = MemoryStatus()
+            state.dwLength = ctypes.sizeof(MemoryStatus)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(state))
+            return int(state.ullTotalPhys // 1048576)
     except Exception:
         pass
     return 0
 
 
-def threads_for(cfg: dict) -> int:
-    fraction = max(0.10, min(float(cfg.get("cpu_fraction", 0.5)), 0.90))
+def threads_for() -> int:
+    fraction = max(0.10, min(float(os.environ.get("WQPU_CPU_FRACTION", "0.5")), 0.90))
     return max(1, int((os.cpu_count() or 2) * fraction))
 
 
-def reserve_mb(cfg: dict, ram_mb: int | None = None) -> int:
-    ram_mb = ram_mb if ram_mb is not None else total_ram_mb()
-    if not ram_mb:
-        return int(cfg.get("min_ram_reserve_mb", 512))
-    minimum = max(256, int(cfg.get("min_ram_reserve_mb", 512)))
-    fraction = max(0.10, min(float(cfg.get("ram_reserve_fraction", 0.3)), 0.8))
-    wanted = max(minimum, int(ram_mb * fraction))
-    cap = max(256, ram_mb - 512)
-    return min(wanted, cap)
+def model_name() -> str:
+    return os.environ.get("WQPU_MODEL", DEFAULT_MODEL)
 
 
-def api_get_json(url: str) -> dict:
-    req = urllib.request.Request(url, headers={"User-Agent": f"WQPU/{VERSION}"})
-    with urllib.request.urlopen(req, timeout=30) as response:
+def reserve_mb() -> int:
+    ram = total_ram_mb()
+    return max(128, min(1024, int(ram * 0.12) if ram else 256))
+
+
+def download(url: str, destination: Path) -> None:
+    request = urllib.request.Request(url, headers={"User-Agent": f"WQPU/{VERSION}"})
+    with urllib.request.urlopen(request, timeout=120) as response, destination.open("wb") as out:
+        shutil.copyfileobj(response, out, 1024 * 1024)
+
+
+def api_json(url: str) -> dict:
+    request = urllib.request.Request(url, headers={"User-Agent": f"WQPU/{VERSION}"})
+    with urllib.request.urlopen(request, timeout=30) as response:
         return json.load(response)
-
-
-def download(url: str, dest: Path) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": f"WQPU/{VERSION}"})
-    with urllib.request.urlopen(req, timeout=120) as response, dest.open("wb") as out:
-        shutil.copyfileobj(response, out, length=1024 * 1024)
 
 
 def asset_suffix() -> str:
@@ -166,21 +135,18 @@ def asset_suffix() -> str:
 
 
 def find_binary(root: Path, stem: str) -> Path:
-    candidates = []
-    for name in ([stem + ".exe", stem] if os.name == "nt" else [stem, stem + ".exe"]):
-        candidates.extend(root.rglob(name))
-    for path in candidates:
+    for path in list(root.rglob(stem)) + list(root.rglob(stem + ".exe")):
         if path.is_file():
             if os.name != "nt":
                 path.chmod(path.stat().st_mode | 0o111)
             return path
-    raise FileNotFoundError(f"{stem} not found in {root}")
+    raise FileNotFoundError(stem)
 
 
-def ensure_runtime(force: bool = False) -> tuple[Path, Path, str]:
+def ensure_runtime() -> tuple[Path, Path, str]:
     ensure_home()
     meta_file = RUNTIME_DIR / "current.json"
-    if meta_file.exists() and not force:
+    if meta_file.exists():
         try:
             meta = json.loads(meta_file.read_text(encoding="utf-8"))
             server = Path(meta["server"])
@@ -189,13 +155,15 @@ def ensure_runtime(force: bool = False) -> tuple[Path, Path, str]:
                 return server, rpc, meta.get("tag", "cached")
         except Exception:
             pass
-    print("WQPU: downloading an official llama.cpp build...")
-    release = api_get_json("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest")
+
+    print("WQPU: downloading llama.cpp...")
+    release = api_json("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest")
     tag = release["tag_name"]
     suffix = asset_suffix()
-    asset = next((a for a in release.get("assets", []) if a.get("name", "").endswith(suffix)), None)
+    asset = next((item for item in release.get("assets", []) if item.get("name", "").endswith(suffix)), None)
     if not asset:
-        raise RuntimeError(f"llama.cpp release {tag} has no asset matching {suffix}")
+        raise RuntimeError(f"no llama.cpp asset for {suffix}")
+
     target = RUNTIME_DIR / tag
     if target.exists():
         shutil.rmtree(target)
@@ -207,431 +175,427 @@ def ensure_runtime(force: bool = False) -> tuple[Path, Path, str]:
             zf.extractall(target)
     else:
         with tarfile.open(archive, "r:gz") as tf:
-            try:
-                tf.extractall(target, filter="data")
-            except TypeError:
-                tf.extractall(target)
+            tf.extractall(target)
     try:
         archive.unlink()
     except OSError:
         pass
+
     server = find_binary(target, "llama-server")
     rpc = find_binary(target, "ggml-rpc-server")
-    meta = {"tag": tag, "server": str(server), "rpc": str(rpc)}
-    meta_file.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
+    meta_file.write_text(json.dumps({"tag": tag, "server": str(server), "rpc": str(rpc)}, indent=2) + "\n", encoding="utf-8")
     return server, rpc, tag
 
 
-def low_priority_kwargs() -> dict:
+def parse_token(token: str) -> dict:
+    if not token.startswith("WQPU1."):
+        raise ValueError("bad WQPU join token")
+    raw = token.split(".", 1)[1]
+    raw += "=" * ((4 - len(raw) % 4) % 4)
+    data = json.loads(base64.urlsafe_b64decode(raw.encode()).decode())
+    for key in ("host", "port", "secret", "fingerprint"):
+        if key not in data:
+            raise ValueError(f"join token missing {key}")
+    data["port"] = int(data["port"])
+    data["fingerprint"] = data["fingerprint"].lower().replace(":", "")
+    return data
+
+
+def save_network(token: str) -> dict:
+    ensure_home()
+    data = parse_token(token)
+    data["token"] = token
+    NET_FILE.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    return data
+
+
+def load_network() -> dict:
+    if not NET_FILE.exists():
+        raise RuntimeError("not joined; run: wqpu join <TOKEN>")
+    return json.loads(NET_FILE.read_text(encoding="utf-8"))
+
+
+async def tls_connect(net: dict):
+    context = ssl.create_default_context()
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    reader, writer = await asyncio.open_connection(
+        net["host"], int(net["port"]), ssl=context, server_hostname=net["host"]
+    )
+    ssl_object = writer.get_extra_info("ssl_object")
+    cert = ssl_object.getpeercert(binary_form=True) if ssl_object else None
+    fingerprint = hashlib.sha256(cert or b"").hexdigest()
+    if fingerprint.lower() != str(net["fingerprint"]).lower():
+        writer.close()
+        await writer.wait_closed()
+        raise RuntimeError("relay certificate fingerprint mismatch")
+    return reader, writer
+
+
+def hello(net: dict, role: str, **extra) -> bytes:
+    data = {"role": role, "secret": net["secret"], "node_id": node_id()}
+    data.update(extra)
+    return (json.dumps(data, separators=(",", ":")) + "\n").encode()
+
+
+async def relay_stream(net: dict, role: str, **extra):
+    reader, writer = await tls_connect(net)
+    writer.write(hello(net, role, **extra))
+    await writer.drain()
+    line = await asyncio.wait_for(reader.readline(), 15)
+    if line != b"WQPU-READY\n":
+        try:
+            error = json.loads(line.decode()).get("error", line.decode(errors="ignore"))
+        except Exception:
+            error = line.decode(errors="ignore")
+        writer.close()
+        await writer.wait_closed()
+        raise RuntimeError(f"relay stream failed: {error}")
+    return reader, writer
+
+
+async def copy_stream(reader, writer) -> None:
+    try:
+        while True:
+            block = await reader.read(65536)
+            if not block:
+                break
+            writer.write(block)
+            await writer.drain()
+    except Exception:
+        pass
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except Exception:
+        pass
+
+
+async def bridge(a_reader, a_writer, b_reader, b_writer) -> None:
+    await asyncio.gather(copy_stream(a_reader, b_writer), copy_stream(b_reader, a_writer))
+
+
+def process_kwargs() -> dict:
     if os.name == "nt":
-        return {"creationflags": getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x00004000)}
-    return {}
+        return {"creationflags": getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0x4000)}
+    return {"preexec_fn": lambda: os.nice(7)}
 
 
-def start_process(cmd: list[str], log_name: str) -> subprocess.Popen:
+def start_process(command: list[str], log_name: str) -> subprocess.Popen:
     ensure_home()
     log = (LOG_DIR / log_name).open("a", encoding="utf-8")
-    kwargs = low_priority_kwargs()
-    if os.name != "nt":
-        kwargs["preexec_fn"] = lambda: os.nice(7)
-    return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, **kwargs)
+    return subprocess.Popen(command, stdout=log, stderr=subprocess.STDOUT, **process_kwargs())
 
 
-def terminate(proc: subprocess.Popen | None) -> None:
-    if not proc or proc.poll() is not None:
+def stop_process(process: subprocess.Popen | None) -> None:
+    if not process or process.poll() is not None:
         return
     try:
-        proc.terminate()
-        proc.wait(timeout=5)
+        process.terminate()
+        process.wait(5)
     except Exception:
         try:
-            proc.kill()
+            process.kill()
         except Exception:
             pass
 
 
-def local_ip() -> str:
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+class State:
+    def __init__(self) -> None:
+        self.nodes: list[dict] = []
+
+    def update(self, message: dict) -> None:
+        self.nodes = list(message.get("nodes") or [])
+        write_status(self.nodes)
+
+    def touch(self) -> None:
+        write_status(self.nodes)
+
+
+def write_status(nodes: list[dict]) -> None:
+    ensure_home()
+    STATUS_FILE.write_text(
+        json.dumps(
+            {
+                "version": VERSION,
+                "updated": time.time(),
+                "node_id": node_id(),
+                "nodes": nodes,
+                "role": "peer",
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+async def handle_open(net: dict, message: dict) -> None:
+    if message.get("service") != "rpc":
+        return
     try:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
+        relay_reader, relay_writer = await relay_stream(net, "accept", stream=message.get("stream"))
+        local_reader, local_writer = await asyncio.open_connection("127.0.0.1", RPC_PORT)
+        await bridge(relay_reader, relay_writer, local_reader, local_writer)
     except Exception:
-        return "127.0.0.1"
-    finally:
-        s.close()
+        pass
 
 
-def is_private_lan(ip: str) -> bool:
+async def control_loop(net: dict, state: State, stop: asyncio.Event) -> None:
+    info = {
+        "hostname": socket.gethostname(),
+        "ram_mb": total_ram_mb(),
+        "threads": threads_for(),
+        "version": VERSION,
+    }
+    delay = 1
+    while not stop.is_set():
+        try:
+            reader, writer = await tls_connect(net)
+            writer.write(hello(net, "control", info=info))
+            await writer.drain()
+            delay = 1
+
+            async def pinger() -> None:
+                while not stop.is_set():
+                    await asyncio.sleep(10)
+                    writer.write(b'{"type":"ping"}\n')
+                    await writer.drain()
+                    state.touch()
+
+            ping_task = asyncio.create_task(pinger())
+            try:
+                while not stop.is_set():
+                    line = await reader.readline()
+                    if not line:
+                        break
+                    message = json.loads(line.decode())
+                    if message.get("type") == "nodes":
+                        state.update(message)
+                    elif message.get("type") == "pong":
+                        state.touch()
+                    elif message.get("type") == "open":
+                        asyncio.create_task(handle_open(net, message))
+            finally:
+                ping_task.cancel()
+                writer.close()
+                try:
+                    await writer.wait_closed()
+                except Exception:
+                    pass
+        except Exception as exc:
+            print(f"WQPU relay reconnect: {exc}")
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 15)
+
+
+async def dial_proxy(net: dict, target: str, client_reader, client_writer) -> None:
     try:
-        addr = ipaddress.ip_address(ip)
-        return addr.is_loopback or addr.is_private or addr.is_link_local
-    except ValueError:
-        return False
-
-
-def tailscale_cli() -> str | None:
-    found = shutil.which("tailscale")
-    if found:
-        return found
-    if platform.system() == "Darwin":
-        app_cli = Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
-        if app_cli.exists():
-            return str(app_cli)
-    return None
-
-
-def tailscale_status() -> tuple[str | None, list[str]]:
-    cli = tailscale_cli()
-    if not cli:
-        return None, []
-    env = os.environ.copy()
-    env["TAILSCALE_BE_CLI"] = "1"
-    try:
-        raw = subprocess.check_output([cli, "status", "--json"], text=True, stderr=subprocess.DEVNULL, env=env, timeout=8)
-        data = json.loads(raw)
-        if data.get("BackendState") != "Running":
-            return None, []
-        self_ips = data.get("Self", {}).get("TailscaleIPs", [])
-        own = next((ip for ip in self_ips if ":" not in ip), None)
-        peers: list[str] = []
-        peer_map = data.get("Peer", {}) or {}
-        values = peer_map.values() if isinstance(peer_map, dict) else peer_map
-        for peer in values:
-            for ip in peer.get("TailscaleIPs", []) or []:
-                if ":" not in ip and ip != own:
-                    peers.append(ip)
-        return own, sorted(set(peers))
+        relay_reader, relay_writer = await relay_stream(net, "dial", target=target, service="rpc")
+        await bridge(client_reader, client_writer, relay_reader, relay_writer)
     except Exception:
-        return None, []
+        try:
+            client_writer.close()
+            await client_writer.wait_closed()
+        except Exception:
+            pass
 
 
-def network_state() -> tuple[str, str, list[str]]:
-    ts_ip, ts_peers = tailscale_status()
-    if ts_ip:
-        return "tailscale", ts_ip, ts_peers
-    ip = local_ip()
-    if is_private_lan(ip):
-        return "lan", ip, []
-    return "blocked", "127.0.0.1", []
+async def run_node() -> int:
+    net = load_network()
+    _, rpc_bin, tag = ensure_runtime()
+    print(f"WQPU {VERSION} | equal peer | llama.cpp {tag}")
+    print(
+        f"Node: {socket.gethostname()} | RAM {total_ram_mb()} MiB | "
+        f"contributes {threads_for()}/{os.cpu_count() or '?'} CPU threads"
+    )
+    rpc = start_process(
+        [
+            str(rpc_bin),
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(RPC_PORT),
+            "--threads",
+            str(threads_for()),
+            "--device",
+            "CPU",
+            "--cache",
+        ],
+        "rpc.log",
+    )
 
+    stop = asyncio.Event()
+    state = State()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+        except (NotImplementedError, RuntimeError):
+            pass
 
-class Discovery:
-    def __init__(self, cfg: dict):
-        self.cfg = cfg
-        self.node = node_id()
-        self.hostname = socket.gethostname()
-        self.ram = total_ram_mb()
-        self.threads = threads_for(cfg)
-        self.peers: dict[str, dict] = {}
-        self.lock = threading.Lock()
-        self.stop_event = threading.Event()
-        self.sock: socket.socket | None = None
-        self.mode, self.bind_ip, self.mesh_targets = network_state()
-
-    def payload(self) -> bytes:
-        data = {
-            "magic": "WQPU2", "version": VERSION, "cluster": self.cfg["cluster"],
-            "node": self.node, "hostname": self.hostname, "ram_mb": self.ram,
-            "threads": self.threads, "model": self.cfg["model"],
-            "rpc_port": int(self.cfg["rpc_port"]), "api_port": int(self.cfg["api_port"]),
-            "network": self.mode,
-        }
-        return json.dumps(data, separators=(",", ":")).encode("utf-8")
-
-    def refresh_mesh(self) -> None:
-        if self.mode != "tailscale":
-            return
-        own, peers = tailscale_status()
-        if own:
-            self.bind_ip = own
-            self.mesh_targets = peers
-
-    def run(self) -> None:
-        if self.mode == "blocked":
-            return
-        port = int(self.cfg["discovery_port"])
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if self.mode == "lan":
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.bind(("" if self.mode == "lan" else self.bind_ip, port))
-        sock.settimeout(0.4)
-        self.sock = sock
-        last_send = 0.0
-        last_mesh_refresh = 0.0
-        while not self.stop_event.is_set():
-            now = time.time()
-            if self.mode == "tailscale" and now - last_mesh_refresh >= 5.0:
-                self.refresh_mesh()
-                last_mesh_refresh = now
-            if now - last_send >= DISCOVERY_EVERY:
-                targets = ["255.255.255.255"] if self.mode == "lan" else list(self.mesh_targets)
-                for target in targets:
-                    try:
-                        sock.sendto(self.payload(), (target, port))
-                    except OSError:
-                        pass
-                last_send = now
-            try:
-                raw, addr = sock.recvfrom(8192)
-                data = json.loads(raw.decode("utf-8"))
-                if data.get("magic") != "WQPU2" or data.get("cluster") != self.cfg["cluster"]:
-                    continue
-                if data.get("node") == self.node:
-                    continue
-                data["ip"] = addr[0]
-                data["last_seen"] = time.time()
-                with self.lock:
-                    self.peers[data["node"]] = data
-            except socket.timeout:
-                pass
-            except (OSError, ValueError, UnicodeDecodeError):
-                pass
-            with self.lock:
-                cutoff = time.time() - PEER_TTL
-                self.peers = {k: v for k, v in self.peers.items() if v.get("last_seen", 0) >= cutoff}
-        sock.close()
-
-    def snapshot(self) -> list[dict]:
-        with self.lock:
-            return [dict(v) for v in self.peers.values()]
-
-    def stop(self) -> None:
-        self.stop_event.set()
-
-
-def elect_coordinator(disc: Discovery, peers: list[dict]) -> str:
-    candidates = [{"node": disc.node, "ram_mb": disc.ram, "threads": disc.threads}] + peers
-    best = max(candidates, key=lambda x: (int(x.get("ram_mb", 0)), int(x.get("threads", 0)), str(x.get("node", ""))))
-    return str(best["node"])
-
-
-def write_status(cfg: dict, role: str, peers: list[dict], coordinator: str, child: subprocess.Popen | None, disc: Discovery) -> None:
-    self_info = {
-        "node": node_id(), "hostname": socket.gethostname(), "ip": disc.bind_ip,
-        "ram_mb": total_ram_mb(), "threads": threads_for(cfg), "model": cfg["model"], "network": disc.mode,
-    }
-    data = {
-        "version": VERSION, "updated": time.time(), "role": role, "coordinator": coordinator,
-        "self": self_info, "peers": peers,
-        "api_url": f"http://{disc.bind_ip}:{cfg['api_port']}" if role == "coordinator" else None,
-        "child_pid": child.pid if child and child.poll() is None else None,
-    }
-    tmp = STATUS_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
-    tmp.replace(STATUS_FILE)
-
-
-def run_cluster(cfg: dict) -> int:
-    if STOP_FILE.exists():
-        STOP_FILE.unlink()
-    server_bin, rpc_bin, tag = ensure_runtime()
-    disc = Discovery(cfg)
-    print(f"WQPU {VERSION} | llama.cpp {tag}")
-    print(f"Node: {socket.gethostname()} | RAM {disc.ram} MiB | CPU threads for WQPU: {disc.threads}/{os.cpu_count() or '?'}")
-    if disc.mode == "blocked":
-        print("Network: PUBLIC address detected. WQPU will not expose RPC/API without Tailscale.")
-        print("Install/connect Tailscale, then run WQPU again.")
-    elif disc.mode == "tailscale":
-        print(f"Network: TAILSCALE {disc.bind_ip} | secure remote discovery enabled")
-    else:
-        print(f"Network: LAN {disc.bind_ip} | local discovery enabled")
-    thread = threading.Thread(target=disc.run, daemon=True)
-    thread.start()
-    child: subprocess.Popen | None = None
-    signature = None
-    stopping = False
-    restart_after = 0.0
-
-    def on_signal(_sig, _frame):
-        nonlocal stopping
-        stopping = True
-
-    signal.signal(signal.SIGINT, on_signal)
-    if hasattr(signal, "SIGTERM"):
-        signal.signal(signal.SIGTERM, on_signal)
-    time.sleep(2.0)
+    control = asyncio.create_task(control_loop(net, state, stop))
+    write_status([])
     try:
-        while not stopping and not STOP_FILE.exists():
-            peers = disc.snapshot()
-            coordinator = elect_coordinator(disc, peers)
-            if disc.mode == "blocked":
-                role = "waiting"
-            elif coordinator == disc.node:
-                role = "coordinator"
-            else:
-                role = "worker"
-            if role == "coordinator" and not peers and disc.ram < int(cfg.get("min_coordinator_ram_mb", 3072)):
-                role = "waiting"
-            peer_endpoints = sorted(f"{p['ip']}:{p.get('rpc_port', cfg['rpc_port'])}" for p in peers)
-            model_mismatch = [p for p in peers if p.get("model") != cfg["model"]]
-            current = (role, tuple(peer_endpoints), cfg["model"], disc.bind_ip)
-            dead = child is not None and child.poll() is not None
-            now = time.time()
-            needs_child = role in {"worker", "coordinator"}
-            should_change = current != signature or (needs_child and child is None)
-            if dead and now >= restart_after:
-                should_change = True
-            if should_change:
-                terminate(child)
-                child = None
-                signature = current
-                if role == "worker":
-                    cmd = [str(rpc_bin), "--host", disc.bind_ip, "--port", str(cfg["rpc_port"]),
-                           "--threads", str(threads_for(cfg)), "--device", "CPU", "--cache"]
-                    child = start_process(cmd, "rpc.log")
-                    restart_after = now + 5.0
-                    print(f"Role: WORKER | {disc.bind_ip}:{cfg['rpc_port']} | coordinator {coordinator[:8]}")
-                elif role == "coordinator":
-                    cmd = [str(server_bin), "--hf-repo", str(cfg["model"]),
-                           "--threads", str(threads_for(cfg)), "--threads-batch", str(threads_for(cfg)),
-                           "--ctx-size", str(cfg["context"]), "--host", disc.bind_ip, "--port", str(cfg["api_port"]),
-                           "--prio", "-1", "--poll", "0", "--fit", "on", "--fit-target", str(reserve_mb(cfg))]
-                    if peer_endpoints:
-                        cmd += ["--rpc", ",".join(peer_endpoints)]
-                    child = start_process(cmd, "server.log")
-                    restart_after = now + 8.0
-                    print(f"Role: COORDINATOR | {len(peers) + 1} node(s) | UI/API: http://{disc.bind_ip}:{cfg['api_port']}")
-                    if peer_endpoints:
-                        print("RPC workers: " + ", ".join(peer_endpoints))
-                else:
-                    print("Role: WAITING | this node is too small to coordinate alone, waiting for a stronger peer")
-                if model_mismatch:
-                    print("Warning: some nodes use a different model setting; coordinator setting wins.")
-            write_status(cfg, role, peers, coordinator, child, disc)
-            time.sleep(1.0)
+        while not stop.is_set():
+            if rpc.poll() is not None:
+                raise RuntimeError("llama.cpp RPC worker exited; see ~/.wqpu/logs/rpc.log")
+            await asyncio.sleep(1)
     finally:
-        disc.stop()
-        terminate(child)
-        if STOP_FILE.exists():
-            try:
-                STOP_FILE.unlink()
-            except OSError:
-                pass
-        print("WQPU stopped.")
+        control.cancel()
+        stop_process(rpc)
     return 0
 
 
-def cmd_status(_args) -> int:
+def current_peers() -> list[dict]:
     if not STATUS_FILE.exists():
-        print("WQPU is not running (no status file yet).")
-        return 1
+        raise RuntimeError("WQPU node is not running")
+    status = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    if time.time() - status.get("updated", 0) > STATUS_MAX_AGE:
+        raise RuntimeError("WQPU node status is stale; start wqpu first")
+    return [item for item in status.get("nodes", []) if item.get("node_id") != node_id()]
+
+
+async def wait_http(port: int, process: subprocess.Popen) -> None:
+    for _ in range(180):
+        if process.poll() is not None:
+            raise RuntimeError("local llama-server exited; see ~/.wqpu/logs/request.log")
+        try:
+            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            writer.close()
+            await writer.wait_closed()
+            return
+        except Exception:
+            await asyncio.sleep(0.5)
+    raise RuntimeError("local llama-server did not become ready")
+
+
+async def request_once(text: str) -> int:
+    net = load_network()
+    server_bin, _, _ = ensure_runtime()
+    peers = current_peers()
+    proxy_servers = []
+    endpoints = []
+    process = None
+
     try:
-        data = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
-    except Exception as exc:
-        print(f"Cannot read status: {exc}")
+        for target in [item.get("node_id") for item in peers if item.get("node_id")]:
+            async def handler(reader, writer, peer_id=target):
+                await dial_proxy(net, peer_id, reader, writer)
+
+            server = await asyncio.start_server(handler, "127.0.0.1", 0)
+            proxy_servers.append(server)
+            port = server.sockets[0].getsockname()[1]
+            endpoints.append(f"127.0.0.1:{port}")
+
+        api_server = socket.socket()
+        api_server.bind(("127.0.0.1", 0))
+        api_port = api_server.getsockname()[1]
+        api_server.close()
+
+        command = [
+            str(server_bin),
+            "--hf-repo",
+            model_name(),
+            "--threads",
+            str(threads_for()),
+            "--threads-batch",
+            str(threads_for()),
+            "--ctx-size",
+            "4096",
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(api_port),
+            "--prio",
+            "-1",
+            "--poll",
+            "0",
+            "--parallel",
+            "1",
+            "--fit",
+            "on",
+            "--fit-target",
+            str(reserve_mb()),
+        ]
+        if endpoints:
+            command += ["--rpc", ",".join(endpoints)]
+
+        process = start_process(command, "request.log")
+        print(f"Using this computer + {len(peers)} other online node(s)...")
+        await wait_http(api_port, process)
+
+        payload = json.dumps(
+            {
+                "model": model_name(),
+                "messages": [{"role": "user", "content": text}],
+                "stream": False,
+            }
+        ).encode()
+
+        def call_api():
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{api_port}/v1/chat/completions",
+                data=payload,
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=1200) as response:
+                return json.load(response)
+
+        result = await asyncio.to_thread(call_api)
+        print(result["choices"][0]["message"]["content"])
+    finally:
+        stop_process(process)
+        for server in proxy_servers:
+            server.close()
+        for server in proxy_servers:
+            try:
+                await server.wait_closed()
+            except Exception:
+                pass
+    return 0
+
+
+def cmd_status() -> int:
+    if not STATUS_FILE.exists():
+        print("WQPU: no status yet")
         return 1
-    age = time.time() - data.get("updated", 0)
-    live = age < 5
-    print(f"WQPU: {'RUNNING' if live else 'STALE'} | role={data.get('role')} | nodes={1 + len(data.get('peers', []))}")
-    me = data.get("self", {})
-    print(f"Self: {me.get('hostname')} {me.get('ip')} | {me.get('network')} | RAM {me.get('ram_mb')} MiB | threads {me.get('threads')}")
-    for p in data.get("peers", []):
-        print(f"Peer: {p.get('hostname')} {p.get('ip')} | RAM {p.get('ram_mb')} MiB | threads {p.get('threads')}")
-    if data.get("api_url"):
-        print("UI/API: " + data["api_url"])
+    status = json.loads(STATUS_FILE.read_text(encoding="utf-8"))
+    live = time.time() - status.get("updated", 0) < STATUS_MAX_AGE
+    print(f"WQPU: {'RUNNING' if live else 'STALE'} | equal peer | nodes={len(status.get('nodes', []))}")
+    for item in status.get("nodes", []):
+        print(f"- {item.get('hostname')} | RAM {item.get('ram_mb')} MiB | threads {item.get('threads')}")
+    print("The computer that asks a question coordinates only that request.")
     return 0 if live else 1
 
 
-def cmd_doctor(_args) -> int:
-    cfg = load_config()
-    mode, bind_ip, mesh = network_state()
-    print(f"WQPU {VERSION}")
-    print(f"OS: {platform.system()} {platform.release()} | arch={platform.machine()}")
-    print(f"CPU logical threads: {os.cpu_count()} | WQPU target: {threads_for(cfg)}")
-    ram = total_ram_mb()
-    print(f"RAM: {ram} MiB | planned reserve: {reserve_mb(cfg, ram)} MiB")
-    print(f"Network: {mode} | bind={bind_ip} | mesh peers visible={len(mesh)}")
-    print(f"Model: {cfg['model']}")
-    print(f"Cluster: {cfg['cluster']}")
-    print(f"Home: {HOME}")
-    try:
-        server, rpc, tag = ensure_runtime()
-        print(f"llama.cpp: {tag}")
-        print(f"llama-server: {server}")
-        print(f"ggml-rpc-server: {rpc}")
-    except Exception as exc:
-        print(f"Runtime: ERROR: {exc}")
-        return 1
-    return 0
-
-
-def cmd_mesh(_args) -> int:
-    cli = tailscale_cli()
-    own, peers = tailscale_status()
-    if not cli:
-        print("Tailscale: not installed")
-        return 1
-    if not own:
-        print(f"Tailscale CLI: {cli}")
-        print("Tailscale: installed but not connected. Run: tailscale up")
-        return 1
-    print(f"Tailscale: connected | IP {own} | visible peers {len(peers)}")
-    return 0
-
-
-def cmd_model(args) -> int:
-    cfg = load_config()
-    if args.spec:
-        cfg["model"] = args.spec
-        save_config(cfg)
-        print(f"Model set to: {args.spec}")
-        print("Restart WQPU if it is currently running.")
-    else:
-        print(cfg["model"])
-    return 0
-
-
-def cmd_stop(_args) -> int:
-    ensure_home()
-    STOP_FILE.write_text("stop\n", encoding="utf-8")
-    print("Stop signal written. Any WQPU process on this computer will exit.")
-    return 0
-
-
-def cmd_update(_args) -> int:
-    server, rpc, tag = ensure_runtime(force=True)
-    print(f"Updated llama.cpp runtime to {tag}")
-    print(server)
-    print(rpc)
-    return 0
-
-
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="wqpu", description="Run one llama.cpp model across trusted LAN/Tailscale computers.")
+    parser = argparse.ArgumentParser(prog="wqpu")
     parser.add_argument("--version", action="version", version=f"WQPU {VERSION}")
     sub = parser.add_subparsers(dest="command")
-    sub.add_parser("start", help="join the cluster in the foreground")
-    sub.add_parser("status", help="show the last local cluster status")
-    sub.add_parser("doctor", help="show hardware/runtime/network information")
-    sub.add_parser("mesh", help="check secure Tailscale remote networking")
-    p_model = sub.add_parser("model", help="show or set Hugging Face GGUF repo[:quant]")
-    p_model.add_argument("spec", nargs="?")
-    sub.add_parser("stop", help="stop WQPU on this computer")
-    sub.add_parser("update", help="download the latest llama.cpp runtime")
+    join = sub.add_parser("join")
+    join.add_argument("token")
+    sub.add_parser("start")
+    sub.add_parser("status")
+    ask = sub.add_parser("ask")
+    ask.add_argument("text", nargs="+")
     args = parser.parse_args()
+
     try:
-        if args.command in (None, "start"):
-            return run_cluster(load_config())
+        if args.command == "join":
+            data = save_network(args.token)
+            print(f"Joined WQPU relay {data['host']}:{data['port']}")
+            return 0
         if args.command == "status":
-            return cmd_status(args)
-        if args.command == "doctor":
-            return cmd_doctor(args)
-        if args.command == "mesh":
-            return cmd_mesh(args)
-        if args.command == "model":
-            return cmd_model(args)
-        if args.command == "stop":
-            return cmd_stop(args)
-        if args.command == "update":
-            return cmd_update(args)
+            return cmd_status()
+        if args.command == "ask":
+            return asyncio.run(request_once(" ".join(args.text)))
+        return asyncio.run(run_node())
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
         print(f"WQPU error: {exc}", file=sys.stderr)
-        print(f"Logs/config live in: {HOME}", file=sys.stderr)
         return 1
-    return 0
 
 
 if __name__ == "__main__":
