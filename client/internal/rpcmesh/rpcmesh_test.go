@@ -24,11 +24,7 @@ func (f fakeRegistry) ResolvePeer(_ context.Context, id common.Hash) (chainregis
 	return peer, nil
 }
 
-func meshPeerID(last byte) common.Hash {
-	var id common.Hash
-	id[31] = last
-	return id
-}
+func meshPeerID(last byte) common.Hash { var id common.Hash; id[31] = last; return id }
 
 func meshPeer(id common.Hash, session, endpoint string) chainregistry.Peer {
 	return chainregistry.Peer{Provider: chainregistry.Provider{
@@ -81,14 +77,11 @@ func TestProviderAndForwarderCarryAuthenticatedRPCBytes(t *testing.T) {
 	backend, closeBackend := startEchoBackend(t)
 	defer closeBackend()
 
-	requesterKey, err := sessionkey.Generate()
-	if err != nil { t.Fatal(err) }
-	providerKey, err := sessionkey.Generate()
-	if err != nil { t.Fatal(err) }
+	requesterKey, err := sessionkey.Generate(); if err != nil { t.Fatal(err) }
+	providerKey, err := sessionkey.Generate(); if err != nil { t.Fatal(err) }
 	requesterID, providerID := meshPeerID(1), meshPeerID(2)
 
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil { t.Fatal(err) }
+	listener, err := net.Listen("tcp", "127.0.0.1:0"); if err != nil { t.Fatal(err) }
 	providerRegistry := fakeRegistry{requesterID: meshPeer(requesterID, requesterKey.Address(), "wqpu://127.0.0.1:1")}
 	provider, err := StartProviderOnListener(ctx, listener, ProviderConfig{
 		Signer: providerKey, ChainID: "wqpu-rpcmesh-test", LocalPeerID: providerID,
@@ -106,8 +99,7 @@ func TestProviderAndForwarderCarryAuthenticatedRPCBytes(t *testing.T) {
 	if err != nil { t.Fatal(err) }
 	defer forwarder.Close()
 
-	local, err := net.DialTimeout("tcp", forwarder.Address(), time.Second)
-	if err != nil { t.Fatal(err) }
+	local, err := net.DialTimeout("tcp", forwarder.Address(), time.Second); if err != nil { t.Fatal(err) }
 	defer local.Close()
 	payload := []byte("real llama rpc bytes")
 	if _, err := local.Write(payload); err != nil { t.Fatal(err) }
@@ -120,13 +112,10 @@ func TestProviderAndForwarderCarryAuthenticatedRPCBytes(t *testing.T) {
 func TestProviderConnectionLimitRejectsExtraUnauthenticatedCarrier(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	backend, closeBackend := startEchoBackend(t)
-	defer closeBackend()
-	providerKey, err := sessionkey.Generate()
-	if err != nil { t.Fatal(err) }
+	backend, closeBackend := startEchoBackend(t); defer closeBackend()
+	providerKey, err := sessionkey.Generate(); if err != nil { t.Fatal(err) }
 	providerID := meshPeerID(2)
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil { t.Fatal(err) }
+	listener, err := net.Listen("tcp", "127.0.0.1:0"); if err != nil { t.Fatal(err) }
 	service, err := StartProviderOnListener(ctx, listener, ProviderConfig{
 		Signer: providerKey, ChainID: "wqpu-rpcmesh-limit", LocalPeerID: providerID,
 		Registry: fakeRegistry{}, RPCTarget: backend, MaxConnections: 1,
@@ -134,13 +123,11 @@ func TestProviderConnectionLimitRejectsExtraUnauthenticatedCarrier(t *testing.T)
 	if err != nil { t.Fatal(err) }
 	defer service.Close()
 
-	first, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
-	if err != nil { t.Fatal(err) }
+	first, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second); if err != nil { t.Fatal(err) }
 	defer first.Close()
 	waitActive(t, service, 1)
 
-	second, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
-	if err != nil { t.Fatal(err) }
+	second, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second); if err != nil { t.Fatal(err) }
 	defer second.Close()
 	_ = second.SetReadDeadline(time.Now().Add(2 * time.Second))
 	buffer := make([]byte, 1)
@@ -155,20 +142,15 @@ func TestProviderConnectionLimitRejectsExtraUnauthenticatedCarrier(t *testing.T)
 }
 
 func TestProviderCloseTerminatesStalledHandshake(t *testing.T) {
-	ctx := context.Background()
-	backend, closeBackend := startEchoBackend(t)
-	defer closeBackend()
-	providerKey, err := sessionkey.Generate()
-	if err != nil { t.Fatal(err) }
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil { t.Fatal(err) }
-	service, err := StartProviderOnListener(ctx, listener, ProviderConfig{
+	backend, closeBackend := startEchoBackend(t); defer closeBackend()
+	providerKey, err := sessionkey.Generate(); if err != nil { t.Fatal(err) }
+	listener, err := net.Listen("tcp", "127.0.0.1:0"); if err != nil { t.Fatal(err) }
+	service, err := StartProviderOnListener(context.Background(), listener, ProviderConfig{
 		Signer: providerKey, ChainID: "wqpu-rpcmesh-close", LocalPeerID: meshPeerID(2),
 		Registry: fakeRegistry{}, RPCTarget: backend, MaxConnections: 1,
 	})
 	if err != nil { t.Fatal(err) }
-	stalled, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second)
-	if err != nil { t.Fatal(err) }
+	stalled, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second); if err != nil { t.Fatal(err) }
 	defer stalled.Close()
 	waitActive(t, service, 1)
 
@@ -183,13 +165,35 @@ func TestProviderCloseTerminatesStalledHandshake(t *testing.T) {
 	if service.ActiveConnections() != 0 { t.Fatalf("active after close=%d", service.ActiveConnections()) }
 }
 
+func TestProviderStopsWhenParentContextIsCanceled(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	backend, closeBackend := startEchoBackend(t); defer closeBackend()
+	providerKey, err := sessionkey.Generate(); if err != nil { t.Fatal(err) }
+	listener, err := net.Listen("tcp", "127.0.0.1:0"); if err != nil { t.Fatal(err) }
+	service, err := StartProviderOnListener(ctx, listener, ProviderConfig{
+		Signer: providerKey, ChainID: "wqpu-rpcmesh-context", LocalPeerID: meshPeerID(2),
+		Registry: fakeRegistry{}, RPCTarget: backend, MaxConnections: 1,
+	})
+	if err != nil { t.Fatal(err) }
+	stalled, err := net.DialTimeout("tcp", listener.Addr().String(), time.Second); if err != nil { t.Fatal(err) }
+	defer stalled.Close()
+	waitActive(t, service, 1)
+
+	cancel()
+	select {
+	case <-service.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("parent cancellation did not stop RPC provider")
+	}
+	if service.ActiveConnections() != 0 { t.Fatalf("active after parent cancellation=%d", service.ActiveConnections()) }
+	if err := service.Close(); err != nil { t.Fatal(err) }
+}
+
 func TestMeshRejectsUnsafeConfiguration(t *testing.T) {
-	key, err := sessionkey.Generate()
-	if err != nil { t.Fatal(err) }
-	id1, id2 := meshPeerID(1), meshPeerID(2)
+	key, err := sessionkey.Generate(); if err != nil { t.Fatal(err) }
+	id1 := meshPeerID(1)
 	if _, err := StartProviderOnListener(context.Background(), nil, ProviderConfig{}); err == nil { t.Fatal("nil listener should fail") }
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil { t.Fatal(err) }
+	listener, err := net.Listen("tcp", "127.0.0.1:0"); if err != nil { t.Fatal(err) }
 	defer listener.Close()
 	if _, err := StartProviderOnListener(context.Background(), listener, ProviderConfig{Signer: key, ChainID: "x", LocalPeerID: id1, Registry: fakeRegistry{}, RPCTarget: "192.168.1.1:50052"}); err == nil {
 		t.Fatal("non-loopback RPC target should fail")
@@ -197,5 +201,4 @@ func TestMeshRejectsUnsafeConfiguration(t *testing.T) {
 	if _, err := OpenForwarder(context.Background(), ForwarderConfig{Signer: key, ChainID: "x", LocalPeerID: id1, RemotePeerID: id1, Registry: fakeRegistry{}, Dialer: carrier.TCPDialer{}}); err == nil {
 		t.Fatal("self-forwarding should fail")
 	}
-	_ = id2
 }
