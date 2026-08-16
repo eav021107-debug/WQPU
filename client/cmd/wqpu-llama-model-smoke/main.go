@@ -121,12 +121,14 @@ func completion(ctx context.Context, endpoint string) (string, error) {
 	if response.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("completion HTTP %d: %s", response.StatusCode, body)
 	}
-	var decoded struct {
-		Content string `json:"content"`
-	}
+	var decoded struct { Content string `json:"content"` }
 	if err := json.Unmarshal(body, &decoded); err != nil { return "", fmt.Errorf("decode completion: %w: %s", err, body) }
 	if strings.TrimSpace(decoded.Content) == "" { return "", fmt.Errorf("empty completion: %s", body) }
 	return decoded.Content, nil
+}
+
+func restoreEnv(name, previous string, existed bool) {
+	if existed { _ = os.Setenv(name, previous) } else { _ = os.Unsetenv(name) }
 }
 
 func run(baseDir string) error {
@@ -139,8 +141,11 @@ func run(baseDir string) error {
 	backendLogPath := filepath.Join(baseDir, "model-smoke-rpc.log")
 	backendLog, err := os.OpenFile(backendLogPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil { return err }
-	backend, err := llamaruntime.StartRPCServer(ctx, installed, rpcPort, 1, nil, false, backendLog, 30*time.Second)
-	if err != nil { _ = backendLog.Close(); return err }
+	previousDebug, hadDebug := os.LookupEnv("GGML_RPC_DEBUG")
+	if err := os.Setenv("GGML_RPC_DEBUG", "1"); err != nil { _ = backendLog.Close(); return err }
+	backend, startErr := llamaruntime.StartRPCServer(ctx, installed, rpcPort, 1, nil, false, backendLog, 30*time.Second)
+	restoreEnv("GGML_RPC_DEBUG", previousDebug, hadDebug)
+	if startErr != nil { _ = backendLog.Close(); return startErr }
 	defer func() { _ = backend.Close(); _ = backendLog.Close() }()
 
 	requesterKey, err := sessionkey.Generate()
@@ -196,18 +201,18 @@ func run(baseDir string) error {
 		return fmt.Errorf("llama-server completion: %w\n%s", err, log)
 	}
 
-	_ = serverLog.Sync()
-	log, err := os.ReadFile(serverLogPath)
+	if err := backendLog.Sync(); err != nil { return err }
+	rpcLog, err := os.ReadFile(backendLogPath)
 	if err != nil { return err }
-	if !strings.Contains(string(log), "RPC0") {
-		return fmt.Errorf("llama-server log contains no RPC0 evidence:\n%s", log)
+	if !strings.Contains(string(rpcLog), "[alloc_buffer]") {
+		return fmt.Errorf("remote RPC backend never allocated model memory:\n%s", rpcLog)
 	}
 	select {
 	case err := <-errCh:
 		return err
 	default:
 	}
-	fmt.Printf("tiny model inference crossed remote WQPU RPC0: %q\n", text)
+	fmt.Printf("tiny model inference crossed remote WQPU RPC0 with remote allocation: %q\n", text)
 	return nil
 }
 
