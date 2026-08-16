@@ -31,7 +31,7 @@ func receipt(peer, wallet string, sequence, delta, cumulative uint64) WorkReceip
 		Sequence:               sequence,
 		ComputeUnits:           delta,
 		CumulativeComputeUnits: cumulative,
-		CumulativePaymentUnits: cumulative, // price is 1 WQPU unit per compute unit in this vector
+		CumulativePaymentUnits: cumulative,
 		ResultCommitment:       "sha256:result",
 	}
 }
@@ -93,6 +93,32 @@ func TestSettlementRequiresAllReservedProviders(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("missing provider receipt should fail final settlement")
+	}
+}
+
+func TestTimeoutSettlementPaysOnlyProvidersWithAcceptedReceipts(t *testing.T) {
+	job := receiptJob()
+	settlement, err := BuildTimeoutSettlement(job, map[string]WorkReceipt{
+		"peer-a": receipt("peer-a", "wallet-a", 1, 125, 125),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settlement.TotalCharge != 125 || settlement.Payouts["wallet-a"] != 125 {
+		t.Fatalf("timeout settlement=%+v", settlement)
+	}
+	if _, exists := settlement.Payouts["wallet-b"]; exists {
+		t.Fatal("provider without accepted receipt must not be paid")
+	}
+}
+
+func TestTimeoutSettlementRejectsInjectedProvider(t *testing.T) {
+	job := receiptJob()
+	_, err := BuildTimeoutSettlement(job, map[string]WorkReceipt{
+		"peer-x": receipt("peer-x", "wallet-x", 1, 10, 10),
+	})
+	if err == nil {
+		t.Fatal("timeout settlement must reject unreserved provider")
 	}
 }
 
