@@ -1,4 +1,4 @@
-# WQPU 0.5.1
+# WQPU 0.5.2
 
 WQPU is an experimental **equal-peer distributed LLM network** built around `llama.cpp` RPC.
 
@@ -29,16 +29,14 @@ Several computers can originate requests at the same time. There is no permanent
 ### macOS / Linux
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh?v=0.5.1" | sh
+curl -fsSL "https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh?v=0.5.2" | sh
 ```
 
 ### Windows PowerShell
 
 ```powershell
-irm 'https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1?v=0.5.1' | iex
+irm 'https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1?v=0.5.2' | iex
 ```
-
-The version query prevents an old cached installer from being reused.
 
 The installer immediately starts the interactive CLI in the **same terminal**:
 
@@ -51,37 +49,37 @@ wqpu> /exit
 
 ## Python compatibility
 
-WQPU 0.5.1 is compatible with Python 3.6+.
+WQPU is compatible with Python 3.6+.
 
-The installer does not depend on one exact Python version. It:
-
-1. uses an already installed compatible Python if available;
-2. tries the operating system package manager if Python is too old or missing;
-3. on macOS/Linux, as a last fallback, installs a private Python runtime only for WQPU without replacing the system Python;
-4. on Windows, installs a private WQPU Python runtime if needed;
-5. runs a Python compile check before starting WQPU.
+The installer does not depend on one exact Python version. It uses an already installed compatible Python when possible, tries the operating system package manager, and can prepare a private Python runtime for WQPU without replacing the system Python.
 
 ## Creating and joining a network
 
 The first node can start with no join code. It creates a private network secret locally.
 
-To invite another computer, the first reachable node types:
+To invite another computer, a reachable node types:
 
 ```text
 /invite PUBLIC_HOST:7443
 ```
 
-WQPU prints a private `WQPU1...` join code. On macOS/Linux the other computer can join with:
+WQPU prints a private `WQPU1...` join code.
+
+On macOS/Linux, pass the join code as an argument to the installer:
 
 ```bash
-WQPU_JOIN='WQPU1...' curl -fsSL "https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh?v=0.5.1" | sh
+curl -fsSL "https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh?v=0.5.2" | sh -s -- 'WQPU1...'
 ```
+
+Do **not** use `WQPU_JOIN='...' curl ... | sh`: that environment variable belongs to `curl`, not to the `sh` process on the right side of the pipe.
 
 On Windows:
 
 ```powershell
-$env:WQPU_JOIN='WQPU1...'; irm 'https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1?v=0.5.1' | iex
+$env:WQPU_JOIN='WQPU1...'; irm 'https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1?v=0.5.2' | iex
 ```
+
+Supplying a join code always switches the local node to that WQPU network and clears stale peer-cache entries from any previous test network. This makes repeat/recovery joins safe.
 
 The first address is only an introduction. After connection, nodes exchange peer information and cache other reachable peers. Any reachable WQPU node can perform the same introduction/relay function; there is no special VPS role in the protocol.
 
