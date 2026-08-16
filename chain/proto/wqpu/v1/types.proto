@@ -4,11 +4,11 @@ package wqpu.v1;
 
 option go_package = "github.com/eav021107-debug/WQPU/chain/x/wqpu/types";
 
-// Wallet-authorized local session. Wallet secrets never enter WQPU.
+// Wallet-authorized local EVM session. Wallet secrets never enter WQPU.
 message SessionDelegation {
   string chain_id = 1;
   string wallet = 2;
-  bytes session_pubkey = 3;
+  string session_address = 3;
   uint64 issued_height = 4;
   uint64 expires_height = 5;
   uint64 max_spend_units = 6;
@@ -18,7 +18,6 @@ message SessionDelegation {
   uint32 protocol_version = 10;
 }
 
-// Active compute advertisement stored in WQPU chain state.
 message ProviderRecord {
   string wallet = 1;
   bytes peer_pubkey = 2;
@@ -41,11 +40,10 @@ message ProviderReservation {
   uint64 assigned_model_bytes = 4;
 }
 
-// Consensus-visible reservation accepted before paid compute starts.
 message JobReservation {
   bytes job_id = 1;
   string requester_wallet = 2;
-  bytes requester_session_pubkey = 3;
+  string requester_session_address = 3;
   bytes model_hash = 4;
   bytes prompt_commitment = 5;
   uint64 price_epoch = 6;
@@ -57,7 +55,6 @@ message JobReservation {
   repeated ProviderReservation providers = 12;
 }
 
-// Monotonic cumulative work/payment receipt.
 message WorkReceipt {
   bytes job_id = 1;
   string provider_wallet = 2;
