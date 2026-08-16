@@ -34,7 +34,7 @@ message QueryProviderResponse { ProviderRecord provider = 1; }
 
 message QuerySessionRequest {
   string wallet = 1;
-  bytes session_pubkey = 2;
+  string session_address = 2;
 }
 message QuerySessionResponse { SessionDelegation delegation = 1; }
 
