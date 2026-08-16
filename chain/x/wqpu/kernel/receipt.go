@@ -99,15 +99,20 @@ type Settlement struct {
 	Payouts     map[string]uint64
 }
 
-// BuildSettlement requires one latest co-signed receipt from every reserved worker.
-// The chain module can then atomically transfer TotalCharge from requester escrow
-// to these provider wallets and release the job reservation.
-func BuildSettlement(job JobReservation, latestByPeer map[string]WorkReceipt) (Settlement, error) {
+func buildSettlement(job JobReservation, latestByPeer map[string]WorkReceipt, requireAll bool) (Settlement, error) {
 	if err := job.Validate(); err != nil {
 		return Settlement{}, err
 	}
-	if len(latestByPeer) != len(job.Providers) {
+	if requireAll && len(latestByPeer) != len(job.Providers) {
 		return Settlement{}, errors.New("final settlement requires a receipt from every reserved provider")
+	}
+	if len(latestByPeer) > len(job.Providers) {
+		return Settlement{}, errors.New("settlement contains an unreserved provider")
+	}
+	for peerID := range latestByPeer {
+		if _, ok := reservationForPeer(job, peerID); !ok {
+			return Settlement{}, errors.New("settlement contains an unreserved provider")
+		}
 	}
 
 	out := Settlement{JobID: job.JobID, Payouts: map[string]uint64{}}
@@ -115,7 +120,10 @@ func BuildSettlement(job JobReservation, latestByPeer map[string]WorkReceipt) (S
 	for _, reservation := range job.Providers {
 		receipt, ok := latestByPeer[reservation.ProviderPeerID]
 		if !ok {
-			return Settlement{}, errors.New("missing provider receipt")
+			if requireAll {
+				return Settlement{}, errors.New("missing provider receipt")
+			}
+			continue
 		}
 		if err := validateReceiptSnapshot(job, receipt); err != nil {
 			return Settlement{}, err
@@ -141,4 +149,16 @@ func BuildSettlement(job JobReservation, latestByPeer map[string]WorkReceipt) (S
 		return Settlement{}, errors.New("settlement exceeds job charge maximum")
 	}
 	return out, nil
+}
+
+// BuildSettlement requires one latest co-signed receipt from every reserved worker.
+func BuildSettlement(job JobReservation, latestByPeer map[string]WorkReceipt) (Settlement, error) {
+	return buildSettlement(job, latestByPeer, true)
+}
+
+// BuildTimeoutSettlement pays every already accepted co-signed receipt and
+// releases the unused remainder. Missing providers receive no payment because
+// no requester-approved receipt exists for them.
+func BuildTimeoutSettlement(job JobReservation, latestByPeer map[string]WorkReceipt) (Settlement, error) {
+	return buildSettlement(job, latestByPeer, false)
 }
