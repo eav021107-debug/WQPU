@@ -188,18 +188,8 @@ fi
 
 echo "WQPU installed with $($PYTHON --version 2>&1). Starting this computer as an equal peer..."
 
-# When install.sh is read from `curl | sh`, the shell itself still needs the
-# pipe as stdin. Redirect only the final WQPU process to the real terminal.
-if [ -r /dev/tty ]; then
-  if [ -n "$JOIN" ]; then
-    exec "$BIN/wqpu" --join "$JOIN" </dev/tty
-  else
-    exec "$BIN/wqpu" </dev/tty
-  fi
+if [ -n "$JOIN" ]; then
+  exec "$BIN/wqpu" --join "$JOIN"
 else
-  if [ -n "$JOIN" ]; then
-    exec "$BIN/wqpu" --join "$JOIN"
-  else
-    exec "$BIN/wqpu"
-  fi
+  exec "$BIN/wqpu"
 fi
