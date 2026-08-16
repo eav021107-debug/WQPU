@@ -10,6 +10,7 @@ import (
 	"html/template"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -29,15 +30,15 @@ type ConnectConfig struct {
 }
 
 type ConnectResult struct {
-	Wallet    string
-	Signature string
+	Wallet    string `json:"wallet"`
+	Signature string `json:"signature"`
 }
 
 type Connector struct {
-	URL     string
-	Results <-chan ConnectResult
-	server  *http.Server
-	listener net.Listener
+	URL       string
+	Results   <-chan ConnectResult
+	server    *http.Server
+	listener  net.Listener
 }
 
 func (c *Connector) Close(ctx context.Context) error {
@@ -53,6 +54,22 @@ func randomToken() (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(buf), nil
+}
+
+func validateLocalRPC(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") || u.User != nil {
+		return errors.New("WQPU wallet RPC URL must be a local HTTP(S) URL")
+	}
+	host := u.Hostname()
+	if strings.EqualFold(host, "localhost") {
+		return nil
+	}
+	ip := net.ParseIP(host)
+	if ip == nil || !ip.IsLoopback() {
+		return errors.New("wallet RPC must point to the local WQPU client")
+	}
+	return nil
 }
 
 func (cfg ConnectConfig) request(wallet string) SessionRequest {
@@ -71,8 +88,8 @@ func (cfg ConnectConfig) request(wallet string) SessionRequest {
 }
 
 func (cfg ConnectConfig) validate() error {
-	if cfg.RPCURL == "" {
-		return errors.New("local WQPU chain RPC URL is required")
+	if err := validateLocalRPC(cfg.RPCURL); err != nil {
+		return err
 	}
 	return cfg.request("0x0000000000000000000000000000000000000001").Validate()
 }
@@ -243,6 +260,6 @@ button.onclick=async()=>{button.disabled=true;try{
  catch(e){await window.ethereum.request({method:'wallet_addEthereumChain',params:[{chainId,chainName:'WQPU',nativeCurrency:{name:'WQPU',symbol:'WQPU',decimals:18},rpcUrls:[rpcUrl]}]}); await window.ethereum.request({method:'wallet_switchEthereumChain',params:[{chainId}]});}
  const wallet=accounts[0]; const typed=await post('prepare',{wallet});
  const signature=await window.ethereum.request({method:'eth_signTypedData_v4',params:[wallet,JSON.stringify(typed)]});
- await post('complete',{Wallet:wallet,Signature:signature}); status.textContent='Wallet connected. You can return to WQPU.';
+ await post('complete',{wallet,signature}); status.textContent='Wallet connected. You can return to WQPU.';
 }catch(e){status.textContent='Error: '+(e&&e.message?e.message:String(e));button.disabled=false;}};
 </script></body></html>`))
