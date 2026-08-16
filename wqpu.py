@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""WQPU: a tiny LAN launcher for one llama.cpp model across several computers."""
+"""WQPU: one llama.cpp model across several trusted computers."""
 from __future__ import annotations
 
 import argparse
 import ctypes
+import ipaddress
 import json
 import os
 import platform
@@ -20,7 +21,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 HOME = Path(os.environ.get("WQPU_HOME", str(Path.home() / ".wqpu"))).expanduser()
 CONFIG_FILE = HOME / "config.json"
 NODE_FILE = HOME / "node-id"
@@ -31,14 +32,15 @@ LOG_DIR = HOME / "logs"
 DISCOVERY_PORT = 51111
 RPC_PORT = 50052
 API_PORT = 8080
-PEER_TTL = 6.0
-BROADCAST_EVERY = 1.0
+PEER_TTL = 8.0
+DISCOVERY_EVERY = 1.5
 DEFAULTS = {
     "cluster": "home",
     "model": "ggml-org/gemma-3-1b-it-GGUF:Q4_K_M",
     "cpu_fraction": 0.50,
     "ram_reserve_fraction": 0.30,
-    "min_ram_reserve_mb": 4096,
+    "min_ram_reserve_mb": 512,
+    "min_coordinator_ram_mb": 3072,
     "context": 4096,
     "discovery_port": DISCOVERY_PORT,
     "rpc_port": RPC_PORT,
@@ -93,14 +95,10 @@ def total_ram_mb() -> int:
         if system == "Windows":
             class MEMORYSTATUSEX(ctypes.Structure):
                 _fields_ = [
-                    ("dwLength", ctypes.c_ulong),
-                    ("dwMemoryLoad", ctypes.c_ulong),
-                    ("ullTotalPhys", ctypes.c_ulonglong),
-                    ("ullAvailPhys", ctypes.c_ulonglong),
-                    ("ullTotalPageFile", ctypes.c_ulonglong),
-                    ("ullAvailPageFile", ctypes.c_ulonglong),
-                    ("ullTotalVirtual", ctypes.c_ulonglong),
-                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
                     ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
                 ]
             state = MEMORYSTATUSEX()
@@ -126,9 +124,13 @@ def threads_for(cfg: dict) -> int:
 
 def reserve_mb(cfg: dict, ram_mb: int | None = None) -> int:
     ram_mb = ram_mb if ram_mb is not None else total_ram_mb()
-    minimum = int(cfg.get("min_ram_reserve_mb", 4096))
+    if not ram_mb:
+        return int(cfg.get("min_ram_reserve_mb", 512))
+    minimum = max(256, int(cfg.get("min_ram_reserve_mb", 512)))
     fraction = max(0.10, min(float(cfg.get("ram_reserve_fraction", 0.3)), 0.8))
-    return max(minimum, int(ram_mb * fraction)) if ram_mb else minimum
+    wanted = max(minimum, int(ram_mb * fraction))
+    cap = max(256, ram_mb - 512)
+    return min(wanted, cap)
 
 
 def api_get_json(url: str) -> dict:
@@ -187,7 +189,6 @@ def ensure_runtime(force: bool = False) -> tuple[Path, Path, str]:
                 return server, rpc, meta.get("tag", "cached")
         except Exception:
             pass
-
     print("WQPU: downloading an official llama.cpp build...")
     release = api_get_json("https://api.github.com/repos/ggml-org/llama.cpp/releases/latest")
     tag = release["tag_name"]
@@ -195,7 +196,6 @@ def ensure_runtime(force: bool = False) -> tuple[Path, Path, str]:
     asset = next((a for a in release.get("assets", []) if a.get("name", "").endswith(suffix)), None)
     if not asset:
         raise RuntimeError(f"llama.cpp release {tag} has no asset matching {suffix}")
-
     target = RUNTIME_DIR / tag
     if target.exists():
         shutil.rmtree(target)
@@ -207,12 +207,14 @@ def ensure_runtime(force: bool = False) -> tuple[Path, Path, str]:
             zf.extractall(target)
     else:
         with tarfile.open(archive, "r:gz") as tf:
-            tf.extractall(target)
+            try:
+                tf.extractall(target, filter="data")
+            except TypeError:
+                tf.extractall(target)
     try:
         archive.unlink()
     except OSError:
         pass
-
     server = find_binary(target, "llama-server")
     rpc = find_binary(target, "ggml-rpc-server")
     meta = {"tag": tag, "server": str(server), "rpc": str(rpc)}
@@ -232,8 +234,7 @@ def start_process(cmd: list[str], log_name: str) -> subprocess.Popen:
     kwargs = low_priority_kwargs()
     if os.name != "nt":
         kwargs["preexec_fn"] = lambda: os.nice(7)
-    proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, **kwargs)
-    return proc
+    return subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT, **kwargs)
 
 
 def terminate(proc: subprocess.Popen | None) -> None:
@@ -260,6 +261,60 @@ def local_ip() -> str:
         s.close()
 
 
+def is_private_lan(ip: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip)
+        return addr.is_loopback or addr.is_private or addr.is_link_local
+    except ValueError:
+        return False
+
+
+def tailscale_cli() -> str | None:
+    found = shutil.which("tailscale")
+    if found:
+        return found
+    if platform.system() == "Darwin":
+        app_cli = Path("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+        if app_cli.exists():
+            return str(app_cli)
+    return None
+
+
+def tailscale_status() -> tuple[str | None, list[str]]:
+    cli = tailscale_cli()
+    if not cli:
+        return None, []
+    env = os.environ.copy()
+    env["TAILSCALE_BE_CLI"] = "1"
+    try:
+        raw = subprocess.check_output([cli, "status", "--json"], text=True, stderr=subprocess.DEVNULL, env=env, timeout=8)
+        data = json.loads(raw)
+        if data.get("BackendState") != "Running":
+            return None, []
+        self_ips = data.get("Self", {}).get("TailscaleIPs", [])
+        own = next((ip for ip in self_ips if ":" not in ip), None)
+        peers: list[str] = []
+        peer_map = data.get("Peer", {}) or {}
+        values = peer_map.values() if isinstance(peer_map, dict) else peer_map
+        for peer in values:
+            for ip in peer.get("TailscaleIPs", []) or []:
+                if ":" not in ip and ip != own:
+                    peers.append(ip)
+        return own, sorted(set(peers))
+    except Exception:
+        return None, []
+
+
+def network_state() -> tuple[str, str, list[str]]:
+    ts_ip, ts_peers = tailscale_status()
+    if ts_ip:
+        return "tailscale", ts_ip, ts_peers
+    ip = local_ip()
+    if is_private_lan(ip):
+        return "lan", ip, []
+    return "blocked", "127.0.0.1", []
+
+
 class Discovery:
     def __init__(self, cfg: dict):
         self.cfg = cfg
@@ -271,43 +326,56 @@ class Discovery:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.sock: socket.socket | None = None
+        self.mode, self.bind_ip, self.mesh_targets = network_state()
 
     def payload(self) -> bytes:
         data = {
-            "magic": "WQPU1",
-            "version": VERSION,
-            "cluster": self.cfg["cluster"],
-            "node": self.node,
-            "hostname": self.hostname,
-            "ram_mb": self.ram,
-            "threads": self.threads,
-            "model": self.cfg["model"],
-            "rpc_port": int(self.cfg["rpc_port"]),
-            "api_port": int(self.cfg["api_port"]),
+            "magic": "WQPU2", "version": VERSION, "cluster": self.cfg["cluster"],
+            "node": self.node, "hostname": self.hostname, "ram_mb": self.ram,
+            "threads": self.threads, "model": self.cfg["model"],
+            "rpc_port": int(self.cfg["rpc_port"]), "api_port": int(self.cfg["api_port"]),
+            "network": self.mode,
         }
         return json.dumps(data, separators=(",", ":")).encode("utf-8")
 
+    def refresh_mesh(self) -> None:
+        if self.mode != "tailscale":
+            return
+        own, peers = tailscale_status()
+        if own:
+            self.bind_ip = own
+            self.mesh_targets = peers
+
     def run(self) -> None:
+        if self.mode == "blocked":
+            return
         port = int(self.cfg["discovery_port"])
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.bind(("", port))
+        if self.mode == "lan":
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        sock.bind(("" if self.mode == "lan" else self.bind_ip, port))
         sock.settimeout(0.4)
         self.sock = sock
         last_send = 0.0
+        last_mesh_refresh = 0.0
         while not self.stop_event.is_set():
             now = time.time()
-            if now - last_send >= BROADCAST_EVERY:
-                try:
-                    sock.sendto(self.payload(), ("255.255.255.255", port))
-                except OSError:
-                    pass
+            if self.mode == "tailscale" and now - last_mesh_refresh >= 5.0:
+                self.refresh_mesh()
+                last_mesh_refresh = now
+            if now - last_send >= DISCOVERY_EVERY:
+                targets = ["255.255.255.255"] if self.mode == "lan" else list(self.mesh_targets)
+                for target in targets:
+                    try:
+                        sock.sendto(self.payload(), (target, port))
+                    except OSError:
+                        pass
                 last_send = now
             try:
                 raw, addr = sock.recvfrom(8192)
                 data = json.loads(raw.decode("utf-8"))
-                if data.get("magic") != "WQPU1" or data.get("cluster") != self.cfg["cluster"]:
+                if data.get("magic") != "WQPU2" or data.get("cluster") != self.cfg["cluster"]:
                     continue
                 if data.get("node") == self.node:
                     continue
@@ -332,23 +400,21 @@ class Discovery:
         self.stop_event.set()
 
 
-def write_status(cfg: dict, role: str, peers: list[dict], coordinator: str, child: subprocess.Popen | None) -> None:
+def elect_coordinator(disc: Discovery, peers: list[dict]) -> str:
+    candidates = [{"node": disc.node, "ram_mb": disc.ram, "threads": disc.threads}] + peers
+    best = max(candidates, key=lambda x: (int(x.get("ram_mb", 0)), int(x.get("threads", 0)), str(x.get("node", ""))))
+    return str(best["node"])
+
+
+def write_status(cfg: dict, role: str, peers: list[dict], coordinator: str, child: subprocess.Popen | None, disc: Discovery) -> None:
     self_info = {
-        "node": node_id(),
-        "hostname": socket.gethostname(),
-        "ip": local_ip(),
-        "ram_mb": total_ram_mb(),
-        "threads": threads_for(cfg),
-        "model": cfg["model"],
+        "node": node_id(), "hostname": socket.gethostname(), "ip": disc.bind_ip,
+        "ram_mb": total_ram_mb(), "threads": threads_for(cfg), "model": cfg["model"], "network": disc.mode,
     }
     data = {
-        "version": VERSION,
-        "updated": time.time(),
-        "role": role,
-        "coordinator": coordinator,
-        "self": self_info,
-        "peers": peers,
-        "api_url": f"http://{local_ip()}:{cfg['api_port']}" if role == "coordinator" else None,
+        "version": VERSION, "updated": time.time(), "role": role, "coordinator": coordinator,
+        "self": self_info, "peers": peers,
+        "api_url": f"http://{disc.bind_ip}:{cfg['api_port']}" if role == "coordinator" else None,
         "child_pid": child.pid if child and child.poll() is None else None,
     }
     tmp = STATUS_FILE.with_suffix(".tmp")
@@ -361,15 +427,21 @@ def run_cluster(cfg: dict) -> int:
         STOP_FILE.unlink()
     server_bin, rpc_bin, tag = ensure_runtime()
     disc = Discovery(cfg)
+    print(f"WQPU {VERSION} | llama.cpp {tag}")
+    print(f"Node: {socket.gethostname()} | RAM {disc.ram} MiB | CPU threads for WQPU: {disc.threads}/{os.cpu_count() or '?'}")
+    if disc.mode == "blocked":
+        print("Network: PUBLIC address detected. WQPU will not expose RPC/API without Tailscale.")
+        print("Install/connect Tailscale, then run WQPU again.")
+    elif disc.mode == "tailscale":
+        print(f"Network: TAILSCALE {disc.bind_ip} | secure remote discovery enabled")
+    else:
+        print(f"Network: LAN {disc.bind_ip} | local discovery enabled")
     thread = threading.Thread(target=disc.run, daemon=True)
     thread.start()
-    print(f"WQPU {VERSION} | llama.cpp {tag}")
-    print(f"Node: {socket.gethostname()} | RAM {total_ram_mb()} MiB | CPU threads reserved for WQPU: {threads_for(cfg)}/{os.cpu_count() or '?'}")
-    print("Searching for WQPU nodes on the local network...")
-
     child: subprocess.Popen | None = None
     signature = None
     stopping = False
+    restart_after = 0.0
 
     def on_signal(_sig, _frame):
         nonlocal stopping
@@ -378,50 +450,55 @@ def run_cluster(cfg: dict) -> int:
     signal.signal(signal.SIGINT, on_signal)
     if hasattr(signal, "SIGTERM"):
         signal.signal(signal.SIGTERM, on_signal)
-
-    time.sleep(2.5)
+    time.sleep(2.0)
     try:
         while not stopping and not STOP_FILE.exists():
             peers = disc.snapshot()
-            all_nodes = [disc.node] + [p["node"] for p in peers]
-            coordinator = min(all_nodes)
-            role = "coordinator" if coordinator == disc.node else "worker"
-            peer_endpoints = sorted(f"{p['ip']}:{p.get('rpc_port', cfg['rpc_port'])}" for p in peers if p["node"] != coordinator)
-            if role == "coordinator":
-                peer_endpoints = sorted(f"{p['ip']}:{p.get('rpc_port', cfg['rpc_port'])}" for p in peers)
+            coordinator = elect_coordinator(disc, peers)
+            if disc.mode == "blocked":
+                role = "waiting"
+            elif coordinator == disc.node:
+                role = "coordinator"
+            else:
+                role = "worker"
+            if role == "coordinator" and not peers and disc.ram < int(cfg.get("min_coordinator_ram_mb", 3072)):
+                role = "waiting"
+            peer_endpoints = sorted(f"{p['ip']}:{p.get('rpc_port', cfg['rpc_port'])}" for p in peers)
             model_mismatch = [p for p in peers if p.get("model") != cfg["model"]]
-            current = (role, tuple(peer_endpoints), cfg["model"])
+            current = (role, tuple(peer_endpoints), cfg["model"], disc.bind_ip)
             dead = child is not None and child.poll() is not None
-
-            if current != signature or child is None or dead:
+            now = time.time()
+            needs_child = role in {"worker", "coordinator"}
+            should_change = current != signature or (needs_child and child is None)
+            if dead and now >= restart_after:
+                should_change = True
+            if should_change:
                 terminate(child)
                 child = None
                 signature = current
-                time.sleep(1.2)
                 if role == "worker":
-                    cmd = [
-                        str(rpc_bin), "--host", "0.0.0.0", "--port", str(cfg["rpc_port"]),
-                        "--threads", str(threads_for(cfg)), "--device", "CPU", "--cache",
-                    ]
+                    cmd = [str(rpc_bin), "--host", disc.bind_ip, "--port", str(cfg["rpc_port"]),
+                           "--threads", str(threads_for(cfg)), "--device", "CPU", "--cache"]
                     child = start_process(cmd, "rpc.log")
-                    print(f"Role: WORKER | coordinator node {coordinator[:8]} | RPC :{cfg['rpc_port']}")
-                else:
-                    cmd = [
-                        str(server_bin), "--hf-repo", str(cfg["model"]),
-                        "--threads", str(threads_for(cfg)), "--threads-batch", str(threads_for(cfg)),
-                        "--ctx-size", str(cfg["context"]), "--host", "0.0.0.0", "--port", str(cfg["api_port"]),
-                        "--prio", "-1", "--poll", "0", "--fit", "on", "--fit-target", str(reserve_mb(cfg)),
-                    ]
+                    restart_after = now + 5.0
+                    print(f"Role: WORKER | {disc.bind_ip}:{cfg['rpc_port']} | coordinator {coordinator[:8]}")
+                elif role == "coordinator":
+                    cmd = [str(server_bin), "--hf-repo", str(cfg["model"]),
+                           "--threads", str(threads_for(cfg)), "--threads-batch", str(threads_for(cfg)),
+                           "--ctx-size", str(cfg["context"]), "--host", disc.bind_ip, "--port", str(cfg["api_port"]),
+                           "--prio", "-1", "--poll", "0", "--fit", "on", "--fit-target", str(reserve_mb(cfg))]
                     if peer_endpoints:
                         cmd += ["--rpc", ",".join(peer_endpoints)]
                     child = start_process(cmd, "server.log")
-                    print(f"Role: COORDINATOR | {len(peers) + 1} node(s) | UI/API: http://{local_ip()}:{cfg['api_port']}")
+                    restart_after = now + 8.0
+                    print(f"Role: COORDINATOR | {len(peers) + 1} node(s) | UI/API: http://{disc.bind_ip}:{cfg['api_port']}")
                     if peer_endpoints:
                         print("RPC workers: " + ", ".join(peer_endpoints))
+                else:
+                    print("Role: WAITING | this node is too small to coordinate alone, waiting for a stronger peer")
                 if model_mismatch:
-                    print("Warning: some nodes have a different model setting; coordinator setting wins.")
-
-            write_status(cfg, role, peers, coordinator, child)
+                    print("Warning: some nodes use a different model setting; coordinator setting wins.")
+            write_status(cfg, role, peers, coordinator, child, disc)
             time.sleep(1.0)
     finally:
         disc.stop()
@@ -448,7 +525,7 @@ def cmd_status(_args) -> int:
     live = age < 5
     print(f"WQPU: {'RUNNING' if live else 'STALE'} | role={data.get('role')} | nodes={1 + len(data.get('peers', []))}")
     me = data.get("self", {})
-    print(f"Self: {me.get('hostname')} {me.get('ip')} | RAM {me.get('ram_mb')} MiB | threads {me.get('threads')}")
+    print(f"Self: {me.get('hostname')} {me.get('ip')} | {me.get('network')} | RAM {me.get('ram_mb')} MiB | threads {me.get('threads')}")
     for p in data.get("peers", []):
         print(f"Peer: {p.get('hostname')} {p.get('ip')} | RAM {p.get('ram_mb')} MiB | threads {p.get('threads')}")
     if data.get("api_url"):
@@ -458,11 +535,13 @@ def cmd_status(_args) -> int:
 
 def cmd_doctor(_args) -> int:
     cfg = load_config()
+    mode, bind_ip, mesh = network_state()
     print(f"WQPU {VERSION}")
     print(f"OS: {platform.system()} {platform.release()} | arch={platform.machine()}")
     print(f"CPU logical threads: {os.cpu_count()} | WQPU target: {threads_for(cfg)}")
     ram = total_ram_mb()
     print(f"RAM: {ram} MiB | planned reserve: {reserve_mb(cfg, ram)} MiB")
+    print(f"Network: {mode} | bind={bind_ip} | mesh peers visible={len(mesh)}")
     print(f"Model: {cfg['model']}")
     print(f"Cluster: {cfg['cluster']}")
     print(f"Home: {HOME}")
@@ -477,13 +556,27 @@ def cmd_doctor(_args) -> int:
     return 0
 
 
+def cmd_mesh(_args) -> int:
+    cli = tailscale_cli()
+    own, peers = tailscale_status()
+    if not cli:
+        print("Tailscale: not installed")
+        return 1
+    if not own:
+        print(f"Tailscale CLI: {cli}")
+        print("Tailscale: installed but not connected. Run: tailscale up")
+        return 1
+    print(f"Tailscale: connected | IP {own} | visible peers {len(peers)}")
+    return 0
+
+
 def cmd_model(args) -> int:
     cfg = load_config()
     if args.spec:
         cfg["model"] = args.spec
         save_config(cfg)
         print(f"Model set to: {args.spec}")
-        print("Restart WQPU on the coordinator if it is currently running.")
+        print("Restart WQPU if it is currently running.")
     else:
         print(cfg["model"])
     return 0
@@ -505,18 +598,18 @@ def cmd_update(_args) -> int:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(prog="wqpu", description="Run one llama.cpp model across several computers on a trusted LAN.")
+    parser = argparse.ArgumentParser(prog="wqpu", description="Run one llama.cpp model across trusted LAN/Tailscale computers.")
     parser.add_argument("--version", action="version", version=f"WQPU {VERSION}")
     sub = parser.add_subparsers(dest="command")
-    sub.add_parser("start", help="join the LAN cluster in the foreground")
+    sub.add_parser("start", help="join the cluster in the foreground")
     sub.add_parser("status", help="show the last local cluster status")
-    sub.add_parser("doctor", help="show hardware/runtime information")
+    sub.add_parser("doctor", help="show hardware/runtime/network information")
+    sub.add_parser("mesh", help="check secure Tailscale remote networking")
     p_model = sub.add_parser("model", help="show or set Hugging Face GGUF repo[:quant]")
     p_model.add_argument("spec", nargs="?")
     sub.add_parser("stop", help="stop WQPU on this computer")
     sub.add_parser("update", help="download the latest llama.cpp runtime")
     args = parser.parse_args()
-
     try:
         if args.command in (None, "start"):
             return run_cluster(load_config())
@@ -524,6 +617,8 @@ def main() -> int:
             return cmd_status(args)
         if args.command == "doctor":
             return cmd_doctor(args)
+        if args.command == "mesh":
+            return cmd_mesh(args)
         if args.command == "model":
             return cmd_model(args)
         if args.command == "stop":
