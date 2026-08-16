@@ -119,9 +119,11 @@ if [ ! -f "$CHAIN_HOME/config/genesis.json" ]; then
     --home "$CHAIN_HOME" >/dev/null
 
   # Optional deterministic test-only EVM address for CI/live RPC smoke tests.
-  # The address is public test infrastructure and must never be used for real funds.
+  # add-genesis-account resolves literal hex as a keyring name in this SDK,
+  # therefore the same 20 bytes are rendered with the pinned `cosmos` bech32 prefix.
   if [ -n "$DEV_TEST_ADDRESS" ]; then
-    "$BIN" genesis add-genesis-account "$DEV_TEST_ADDRESS" \
+    DEV_TEST_BECH32="$(python3 "$HERE/devnet_config.py" bech32 "$DEV_TEST_ADDRESS" --prefix cosmos)"
+    "$BIN" genesis add-genesis-account "$DEV_TEST_BECH32" \
       "1000000000000000000000${BASE_DENOM}" \
       --home "$CHAIN_HOME" >/dev/null
   fi
