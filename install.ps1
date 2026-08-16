@@ -3,6 +3,8 @@ $raw = 'https://raw.githubusercontent.com/eav021107-debug/WQPU/main'
 $root = Join-Path $env:LOCALAPPDATA 'WQPU'
 $bin = Join-Path $root 'bin'
 $join = $env:WQPU_JOIN
+$expectedWqpu = 'WQPU 0.5.3'
+$coreCacheBuster = 'ttyfix-0.5.3-r2'
 
 New-Item -ItemType Directory -Force -Path $root,$bin | Out-Null
 
@@ -66,12 +68,18 @@ if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
 }
 
 $script = Join-Path $root 'wqpu.py'
-Invoke-WebRequest -UseBasicParsing "$raw/wqpu.py?version=0.5.3" -OutFile $script
+Write-Host 'WQPU: downloading fresh core...'
+Invoke-WebRequest -UseBasicParsing "$raw/wqpu.py?installer=$coreCacheBuster" -OutFile $script
 
 $exe=$py.Exe; $extra=$py.Extra
 if ($extra) { & $exe $extra -m py_compile $script }
 else { & $exe -m py_compile $script }
 if ($LASTEXITCODE -ne 0) { throw 'Downloaded WQPU core did not pass the Python compatibility check.' }
+
+$coreVersion = if ($extra) { (& $exe $extra $script --version 2>&1 | Out-String).Trim() } else { (& $exe $script --version 2>&1 | Out-String).Trim() }
+if ($coreVersion -ne $expectedWqpu) {
+  throw "WQPU core version mismatch: expected '$expectedWqpu', got '$coreVersion'. Refusing to start a stale cached core."
+}
 
 $launcher = Join-Path $bin 'wqpu.cmd'
 if ($extra) {
@@ -87,7 +95,7 @@ if (-not (($userPath -split ';') -contains $bin)) {
 $env:Path="$bin;$env:Path"
 
 $ver = if ($extra) { (& $exe $extra --version 2>&1) } else { (& $exe --version 2>&1) }
-Write-Host "WQPU installed with $ver. Starting this computer as an equal peer..." -ForegroundColor Green
+Write-Host "WQPU installed: $coreVersion with $ver. Starting this computer as an equal peer..." -ForegroundColor Green
 if ([string]::IsNullOrWhiteSpace($join)) {
   & $launcher
 } else {
