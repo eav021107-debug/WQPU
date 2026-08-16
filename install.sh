@@ -188,6 +188,13 @@ if [ -n "$rc" ]; then
 fi
 
 echo "WQPU installed with $($PYTHON --version 2>&1). Starting this computer as an equal peer..."
+
+# When install.sh itself is run as `curl | sh`, stdin belongs to the curl pipe.
+# Reattach stdin to the real terminal before starting the interactive WQPU CLI.
+if [ -r /dev/tty ]; then
+  exec </dev/tty
+fi
+
 if [ -n "$JOIN" ]; then
   exec "$BIN/wqpu" --join "$JOIN"
 else
