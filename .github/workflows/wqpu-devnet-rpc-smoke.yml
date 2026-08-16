@@ -10,6 +10,7 @@ on:
       - 'chain/runtime_patch.py'
       - 'chain/runtime_patch_settlement.py'
       - 'chain/cmd/wqpu-selector/**'
+      - 'chain/cmd/wqpu-rpc-write-smoke/**'
       - 'chain/x/wqpu/precompile/**'
       - '.github/workflows/wqpu-devnet-rpc-smoke.yml'
   workflow_dispatch:
@@ -26,7 +27,7 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25.9'
-      - name: Boot sovereign WQPU devnet and call native precompile
+      - name: Boot sovereign WQPU devnet and exercise native precompile
         shell: bash
         env:
           WQPU_CHAIN_SRC: ${{ runner.temp }}/cosmos-evm
@@ -43,6 +44,11 @@ jobs:
           PRICE_SELECTOR="$(selector 'globalPrice()')"
           EPOCH_SELECTOR="$(selector 'priceEpoch()')"
           BONDED_SELECTOR="$(selector 'bondedPriceCapacity()')"
+
+          # The write-smoke command contains an explicitly public devnet-only key.
+          # Only its derived address is passed into genesis funding.
+          WQPU_DEVNET_TEST_ADDRESS="$(cd chain && go run ./cmd/wqpu-rpc-write-smoke address)"
+          export WQPU_DEVNET_TEST_ADDRESS
 
           LOG="${RUNNER_TEMP}/wqpu-devnet.log"
           bash chain/devnet.sh --reset >"$LOG" 2>&1 &
@@ -99,10 +105,15 @@ jobs:
           PY
           }
 
+          # Read-only path before any application state has been written.
           assert_uint "$(rpc_call "$PROTOCOL_SELECTOR")" 1
           assert_uint "$(rpc_call "$PRICE_SELECTOR")" 1000
           assert_uint "$(rpc_call "$EPOCH_SELECTOR")" 0
           assert_uint "$(rpc_call "$BONDED_SELECTOR")" 0
 
+          # Signed write path: authorize session -> publish peer -> native bond ->
+          # close bonded price epoch -> native unbond/refund.
+          (cd chain && go run ./cmd/wqpu-rpc-write-smoke run http://127.0.0.1:8545)
+
           grep -F 'precompile:    0x0000000000000000000000000000000000000900' "$LOG"
-          echo 'Live WQPU 0x0900 JSON-RPC smoke passed.'
+          echo 'Live WQPU 0x0900 read/write JSON-RPC smoke passed.'
