@@ -11,7 +11,7 @@ func validRequest() SessionRequest {
 		WQPUChainID:     "wqpu-dev-1",
 		EVMChainID:      711711,
 		Wallet:          "0x1111111111111111111111111111111111111111",
-		SessionPubkey:   "0x" + strings.Repeat("22", 32),
+		SessionAddress:  "0x2222222222222222222222222222222222222222",
 		IssuedHeight:    100,
 		ExpiresHeight:   200,
 		MaxSpendUnits:   1_000_000,
@@ -36,8 +36,8 @@ func TestTypedDataBindsWalletSessionAndBothChainIDs(t *testing.T) {
 	if typed.Message["wqpuChainId"] != r.WQPUChainID {
 		t.Fatalf("WQPU chain id=%v", typed.Message["wqpuChainId"])
 	}
-	if typed.Message["sessionPubkey"] != r.SessionPubkey {
-		t.Fatal("session key not bound into wallet authorization")
+	if typed.Message["sessionAddress"] != r.SessionAddress {
+		t.Fatal("session address not bound into wallet authorization")
 	}
 }
 
@@ -61,16 +61,21 @@ func TestSignRequestContainsNoWalletSecretFields(t *testing.T) {
 	}
 }
 
-func TestInvalidWalletOrSessionKeyRejected(t *testing.T) {
+func TestInvalidWalletOrSessionAddressRejected(t *testing.T) {
 	r := validRequest()
 	r.Wallet = "bad"
 	if _, err := BuildSessionTypedData(r); err == nil {
 		t.Fatal("bad wallet should fail")
 	}
 	r = validRequest()
-	r.SessionPubkey = "0x12"
+	r.SessionAddress = "0x12"
 	if _, err := BuildSessionTypedData(r); err == nil {
-		t.Fatal("bad session pubkey should fail")
+		t.Fatal("bad session address should fail")
+	}
+	r = validRequest()
+	r.SessionAddress = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+	if _, err := BuildSessionTypedData(r); err == nil {
+		t.Fatal("non-canonical session address should fail")
 	}
 }
 
