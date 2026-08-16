@@ -27,14 +27,40 @@ func TestSessionEnforcesPermissionAndLimits(t *testing.T) {
 	if err := s.CanAuthorize(120, SessionPermJob, 401); err == nil {
 		t.Fatal("per-job limit should be enforced")
 	}
-	if err := s.Consume(120, SessionPermJob, 400); err != nil {
+	if err := s.Reserve(120, SessionPermJob, 400); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Consume(121, SessionPermJob, 400); err != nil {
+	if err := s.Reserve(121, SessionPermJob, 400); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Consume(122, SessionPermJob, 201); err == nil {
-		t.Fatal("total spend limit should be enforced")
+	if err := s.Reserve(122, SessionPermJob, 201); err == nil {
+		t.Fatal("total spend limit should include reserved jobs")
+	}
+}
+
+func TestSettlementConsumesOnlyActualSpend(t *testing.T) {
+	s := validSession()
+	if err := s.Reserve(120, SessionPermJob, 400); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Settle(400, 250); err != nil {
+		t.Fatal(err)
+	}
+	if s.SpentUnits != 250 || s.ReservedUnits != 0 {
+		t.Fatalf("spent=%d reserved=%d", s.SpentUnits, s.ReservedUnits)
+	}
+}
+
+func TestReleaseReturnsUnusedReservation(t *testing.T) {
+	s := validSession()
+	if err := s.Reserve(120, SessionPermJob, 300); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Release(300); err != nil {
+		t.Fatal(err)
+	}
+	if s.SpentUnits != 0 || s.ReservedUnits != 0 {
+		t.Fatal("release must not turn unused reservation into spend")
 	}
 }
 
