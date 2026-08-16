@@ -11,7 +11,6 @@ Every node runs the same code:
 
 No permanent coordinator or dedicated relay role exists.
 """
-from __future__ import annotations
 
 import argparse
 import asyncio
@@ -33,10 +32,9 @@ import time
 import urllib.request
 import uuid
 import zipfile
-from dataclasses import dataclass, field
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.5.1"
 PORT = int(os.environ.get("WQPU_PORT", "7443"))
 RPC_PORT = 50052
 DEFAULT_MODEL = "ggml-org/gemma-3-1b-it-GGUF:Q4_K_M"
@@ -74,7 +72,10 @@ def total_ram_mb():
                 if line.startswith("MemTotal:"):
                     return int(line.split()[1]) // 1024
         if s == "Darwin":
-            return int(subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True).strip()) // 1048576
+            out = subprocess.check_output(
+                ["sysctl", "-n", "hw.memsize"], universal_newlines=True
+            ).strip()
+            return int(out) // 1048576
         if s == "Windows":
             class M(ctypes.Structure):
                 _fields_ = [
@@ -132,6 +133,41 @@ def stop_proc(p):
             pass
 
 
+async def close_writer(writer):
+    if not writer:
+        return
+    try:
+        writer.close()
+    except Exception:
+        return
+    wait_closed = getattr(writer, "wait_closed", None)
+    if wait_closed:
+        try:
+            await wait_closed()
+        except Exception:
+            pass
+
+
+async def close_server(server):
+    if not server:
+        return
+    try:
+        server.close()
+    except Exception:
+        return
+    wait_closed = getattr(server, "wait_closed", None)
+    if wait_closed:
+        try:
+            await wait_closed()
+        except Exception:
+            pass
+
+
+async def to_thread(func, *args):
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, lambda: func(*args))
+
+
 def ensure_cert():
     ensure_home()
     if CERT.exists() and KEY.exists():
@@ -156,8 +192,9 @@ def cert_fingerprint():
 
 def server_ssl():
     ensure_cert()
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-    ctx.load_cert_chain(CERT, KEY)
+    proto = getattr(ssl, "PROTOCOL_TLS_SERVER", ssl.PROTOCOL_TLS)
+    ctx = ssl.SSLContext(proto)
+    ctx.load_cert_chain(str(CERT), str(KEY))
     return ctx
 
 
@@ -207,7 +244,7 @@ def make_network(join_token=None):
 
 
 def peer_key(host, port):
-    return f"{host}:{int(port)}"
+    return "{}:{}".format(host, int(port))
 
 
 def load_peer_cache():
@@ -223,13 +260,13 @@ def save_peer_cache(peers):
 
 
 def download(url, dest):
-    req = urllib.request.Request(url, headers={"User-Agent": f"WQPU/{VERSION}"})
+    req = urllib.request.Request(url, headers={"User-Agent": "WQPU/{}".format(VERSION)})
     with urllib.request.urlopen(req, timeout=120) as r, dest.open("wb") as f:
         shutil.copyfileobj(r, f, 1024 * 1024)
 
 
 def api_json(url):
-    req = urllib.request.Request(url, headers={"User-Agent": f"WQPU/{VERSION}"})
+    req = urllib.request.Request(url, headers={"User-Agent": "WQPU/{}".format(VERSION)})
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.load(r)
 
@@ -239,13 +276,19 @@ def asset_suffix():
     m = platform.machine().lower()
     x = m in {"x86_64", "amd64", "x64"}
     a = m in {"arm64", "aarch64"}
-    if s == "Windows" and x: return "-bin-win-cpu-x64.zip"
-    if s == "Windows" and a: return "-bin-win-cpu-arm64.zip"
-    if s == "Linux" and x: return "-bin-ubuntu-x64.tar.gz"
-    if s == "Linux" and a: return "-bin-ubuntu-arm64.tar.gz"
-    if s == "Darwin" and a: return "-bin-macos-arm64.tar.gz"
-    if s == "Darwin" and x: return "-bin-macos-x64.tar.gz"
-    raise RuntimeError(f"unsupported platform: {s} {m}")
+    if s == "Windows" and x:
+        return "-bin-win-cpu-x64.zip"
+    if s == "Windows" and a:
+        return "-bin-win-cpu-arm64.zip"
+    if s == "Linux" and x:
+        return "-bin-ubuntu-x64.tar.gz"
+    if s == "Linux" and a:
+        return "-bin-ubuntu-arm64.tar.gz"
+    if s == "Darwin" and a:
+        return "-bin-macos-arm64.tar.gz"
+    if s == "Darwin" and x:
+        return "-bin-macos-x64.tar.gz"
+    raise RuntimeError("unsupported platform: {} {}".format(s, m))
 
 
 def find_binary(root, stem):
@@ -274,26 +317,28 @@ def ensure_runtime():
     suf = asset_suffix()
     asset = next((x for x in rel["assets"] if x["name"].endswith(suf)), None)
     if not asset:
-        raise RuntimeError(f"no llama.cpp asset for {suf}")
+        raise RuntimeError("no llama.cpp asset for {}".format(suf))
     target = RUNTIME / tag
     if target.exists():
-        shutil.rmtree(target)
+        shutil.rmtree(str(target))
     target.mkdir(parents=True)
     arc = RUNTIME / asset["name"]
     download(asset["browser_download_url"], arc)
     if arc.suffix == ".zip":
-        with zipfile.ZipFile(arc) as z:
-            z.extractall(target)
+        with zipfile.ZipFile(str(arc)) as z:
+            z.extractall(str(target))
     else:
-        with tarfile.open(arc, "r:gz") as t:
-            t.extractall(target)
+        with tarfile.open(str(arc), "r:gz") as t:
+            t.extractall(str(target))
     try:
         arc.unlink()
     except OSError:
         pass
     server = find_binary(target, "llama-server")
     rpc = find_binary(target, "ggml-rpc-server")
-    meta.write_text(json.dumps({"tag": tag, "server": str(server), "rpc": str(rpc)}, indent=2) + "\n")
+    meta.write_text(json.dumps(
+        {"tag": tag, "server": str(server), "rpc": str(rpc)}, indent=2
+    ) + "\n")
     return server, rpc, tag
 
 
@@ -307,47 +352,43 @@ async def copy_stream(reader, writer):
             await writer.drain()
     except Exception:
         pass
-    try:
-        writer.close()
-        await writer.wait_closed()
-    except Exception:
-        pass
+    await close_writer(writer)
 
 
 async def bridge(ar, aw, br, bw):
     await asyncio.gather(copy_stream(ar, bw), copy_stream(br, aw))
 
 
-@dataclass
-class Control:
-    node: str
-    info: dict
-    reader: asyncio.StreamReader
-    writer: asyncio.StreamWriter
-    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+class Control(object):
+    def __init__(self, node, info, reader, writer):
+        self.node = node
+        self.info = info
+        self.reader = reader
+        self.writer = writer
+        self.lock = asyncio.Lock()
 
 
-@dataclass
-class Pair:
-    dial_r: asyncio.StreamReader | None = None
-    dial_w: asyncio.StreamWriter | None = None
-    accept_r: asyncio.StreamReader | None = None
-    accept_w: asyncio.StreamWriter | None = None
-    done: asyncio.Event = field(default_factory=asyncio.Event)
-    started: bool = False
+class Pair(object):
+    def __init__(self, dial_r=None, dial_w=None, accept_r=None, accept_w=None):
+        self.dial_r = dial_r
+        self.dial_w = dial_w
+        self.accept_r = accept_r
+        self.accept_w = accept_w
+        self.done = asyncio.Event()
+        self.started = False
 
 
-class Mesh:
+class Mesh(object):
     def __init__(self, cfg):
         self.cfg = cfg
         self.secret = cfg["secret"]
         self.me = node_id()
         self.fp = cert_fingerprint()
-        self.controls: dict[str, Control] = {}
-        self.outbound: dict[str, Control] = {}
-        self.routes: dict[str, set[str]] = {}
-        self.peer_info: dict[str, dict] = {}
-        self.pairs: dict[str, Pair] = {}
+        self.controls = {}
+        self.outbound = {}
+        self.routes = {}
+        self.peer_info = {}
+        self.pairs = {}
         self.stop = asyncio.Event()
         self.server = None
 
@@ -397,12 +438,12 @@ class Mesh:
         await p.dial_w.drain()
         await p.accept_w.drain()
 
-        async def run():
+        async def run_pair():
             await bridge(p.dial_r, p.dial_w, p.accept_r, p.accept_w)
             p.done.set()
             self.pairs.pop(sid, None)
 
-        asyncio.create_task(run())
+        asyncio.ensure_future(run_pair())
 
     async def handle_inbound(self, reader, writer):
         peername = writer.get_extra_info("peername")
@@ -423,7 +464,7 @@ class Mesh:
                 ctrl = Control(src, info, reader, writer)
                 old = self.controls.get(src)
                 if old:
-                    old.writer.close()
+                    await close_writer(old.writer)
                 self.controls[src] = ctrl
                 self.peer_info[src] = info
                 await self.broadcast_nodes()
@@ -483,29 +524,28 @@ class Mesh:
                 await writer.drain()
             except Exception:
                 pass
-            try:
-                writer.close()
-                await writer.wait_closed()
-            except Exception:
-                pass
+            await close_writer(writer)
 
     async def start_listener(self):
-        self.server = await asyncio.start_server(self.handle_inbound, "0.0.0.0", PORT, ssl=server_ssl())
+        self.server = await asyncio.start_server(
+            self.handle_inbound, "0.0.0.0", PORT, ssl=server_ssl()
+        )
 
     async def connect_control(self, peer):
         host, port = peer["host"], int(peer.get("port", PORT))
         key = peer_key(host, port)
         if key in self.outbound:
             return
-        r, w = await asyncio.open_connection(host, port, ssl=client_ssl(), server_hostname=host)
+        r, w = await asyncio.open_connection(
+            host, port, ssl=client_ssl(), server_hostname=host
+        )
         sslobj = w.get_extra_info("ssl_object")
         cert = sslobj.getpeercert(binary_form=True) if sslobj else b""
         fp = hashlib.sha256(cert).hexdigest()
         expected = str(peer.get("fingerprint") or "").lower()
         if expected and fp.lower() != expected:
-            w.close()
-            await w.wait_closed()
-            raise RuntimeError(f"fingerprint mismatch for {key}")
+            await close_writer(w)
+            raise RuntimeError("fingerprint mismatch for {}".format(key))
         hello = {
             "role": "control", "secret": self.secret, "node_id": self.me,
             "info": self.my_info()
@@ -515,7 +555,7 @@ class Mesh:
         ctrl = Control(key, peer, r, w)
         self.outbound[key] = ctrl
 
-        async def loop():
+        async def read_loop():
             try:
                 while not self.stop.is_set():
                     line = await r.readline()
@@ -532,13 +572,9 @@ class Mesh:
                 self.outbound.pop(key, None)
                 for routes in self.routes.values():
                     routes.discard(key)
-                try:
-                    w.close()
-                    await w.wait_closed()
-                except Exception:
-                    pass
+                await close_writer(w)
 
-        asyncio.create_task(loop())
+        asyncio.ensure_future(read_loop())
 
     def merge_nodes(self, route_key, nodes):
         cache = load_peer_cache()
@@ -552,7 +588,9 @@ class Mesh:
             port = int(n.get("port", PORT))
             fp = n.get("fingerprint")
             if host and fp:
-                cache[peer_key(host, port)] = {"host": host, "port": port, "fingerprint": fp}
+                cache[peer_key(host, port)] = {
+                    "host": host, "port": port, "fingerprint": fp
+                }
         save_peer_cache(cache)
 
     async def connector_loop(self):
@@ -593,12 +631,19 @@ class Mesh:
             pass
 
     async def open_accept(self, hub, sid):
-        r, w = await asyncio.open_connection(hub["host"], int(hub.get("port", PORT)), ssl=client_ssl(), server_hostname=hub["host"])
-        hello = {"role": "accept", "secret": self.secret, "node_id": self.me, "stream": sid}
+        r, w = await asyncio.open_connection(
+            hub["host"], int(hub.get("port", PORT)),
+            ssl=client_ssl(), server_hostname=hub["host"]
+        )
+        hello = {
+            "role": "accept", "secret": self.secret,
+            "node_id": self.me, "stream": sid
+        }
         w.write((json.dumps(hello, separators=(",", ":")) + "\n").encode())
         await w.drain()
         line = await asyncio.wait_for(r.readline(), 15)
         if line != b"WQPU-READY\n":
+            await close_writer(w)
             raise RuntimeError("relay accept failed")
         return r, w
 
@@ -606,21 +651,28 @@ class Mesh:
         routes = list(self.routes.get(target) or [])
         for route_key in routes:
             hub = None
-            for p in list(self.cfg.get("peers") or []) + list(load_peer_cache().values()):
+            all_peers = list(self.cfg.get("peers") or []) + list(load_peer_cache().values())
+            for p in all_peers:
                 if peer_key(p["host"], p.get("port", PORT)) == route_key:
                     hub = p
                     break
             if not hub:
                 continue
             try:
-                r, w = await asyncio.open_connection(hub["host"], int(hub.get("port", PORT)), ssl=client_ssl(), server_hostname=hub["host"])
-                hello = {"role": "dial", "secret": self.secret, "node_id": self.me, "target": target}
+                r, w = await asyncio.open_connection(
+                    hub["host"], int(hub.get("port", PORT)),
+                    ssl=client_ssl(), server_hostname=hub["host"]
+                )
+                hello = {
+                    "role": "dial", "secret": self.secret,
+                    "node_id": self.me, "target": target
+                }
                 w.write((json.dumps(hello, separators=(",", ":")) + "\n").encode())
                 await w.drain()
                 line = await asyncio.wait_for(r.readline(), 15)
                 if line == b"WQPU-READY\n":
                     return r, w
-                w.close()
+                await close_writer(w)
             except Exception:
                 pass
         raise RuntimeError("no route to peer")
@@ -630,11 +682,7 @@ class Mesh:
             rr, rw = await self.open_rpc(target)
             await bridge(cr, cw, rr, rw)
         except Exception:
-            try:
-                cw.close()
-                await cw.wait_closed()
-            except Exception:
-                pass
+            await close_writer(cw)
 
     def peers(self):
         out = []
@@ -652,8 +700,7 @@ async def wait_http(port, proc):
             raise RuntimeError("llama-server exited; see ~/.wqpu/logs/request.log")
         try:
             r, w = await asyncio.open_connection("127.0.0.1", port)
-            w.close()
-            await w.wait_closed()
+            await close_writer(w)
             return
         except Exception:
             await asyncio.sleep(.5)
@@ -678,7 +725,9 @@ async def ask(mesh, server_bin, text):
                 await mesh.proxy_handler(target, r, w)
             srv = await asyncio.start_server(h, "127.0.0.1", 0)
             proxy_servers.append(srv)
-            endpoints.append(f"127.0.0.1:{srv.sockets[0].getsockname()[1]}")
+            endpoints.append("127.0.0.1:{}".format(
+                srv.sockets[0].getsockname()[1]
+            ))
 
         api_port = free_port()
         cmd = [
@@ -692,7 +741,7 @@ async def ask(mesh, server_bin, text):
             cmd += ["--rpc", ",".join(endpoints)]
         proc = start_proc(cmd, "request.log")
         try:
-            print(f"[using this computer + {len(peers)} peer(s)]")
+            print("[using this computer + {} peer(s)]".format(len(peers)))
             await wait_http(api_port, proc)
             payload = json.dumps({
                 "model": model_name(),
@@ -702,24 +751,19 @@ async def ask(mesh, server_bin, text):
 
             def call():
                 req = urllib.request.Request(
-                    f"http://127.0.0.1:{api_port}/v1/chat/completions",
+                    "http://127.0.0.1:{}/v1/chat/completions".format(api_port),
                     data=payload, headers={"Content-Type": "application/json"}
                 )
                 with urllib.request.urlopen(req, timeout=1200) as r:
                     return json.load(r)
 
-            d = await asyncio.to_thread(call)
+            d = await to_thread(call)
             print(d["choices"][0]["message"]["content"])
         finally:
             stop_proc(proc)
     finally:
         for s in proxy_servers:
-            s.close()
-        for s in proxy_servers:
-            try:
-                await s.wait_closed()
-            except Exception:
-                pass
+            await close_server(s)
 
 
 def parse_hostport(text):
@@ -734,7 +778,7 @@ async def interactive(mesh, server_bin):
     print("Commands: /status  /peers  /invite HOST[:PORT]  /exit\n")
     while not mesh.stop.is_set():
         try:
-            line = (await asyncio.to_thread(input, "wqpu> ")).strip()
+            line = (await to_thread(input, "wqpu> ")).strip()
         except (EOFError, KeyboardInterrupt):
             line = "/exit"
         if not line:
@@ -743,14 +787,21 @@ async def interactive(mesh, server_bin):
             mesh.stop.set()
             break
         if line == "/status":
-            print(f"WQPU {VERSION} | equal peer | reachable peers: {len(mesh.peers())}")
+            print("WQPU {} | equal peer | reachable peers: {}".format(
+                VERSION, len(mesh.peers())
+            ))
             continue
         if line == "/peers":
             peers = mesh.peers()
             if not peers:
                 print("No reachable peers yet.")
             for nid, info in peers:
-                print(f"- {info.get('hostname','peer')} | RAM {info.get('ram_mb','?')} MiB | CPU {info.get('threads','?')} | {nid[:8]}")
+                print("- {} | RAM {} MiB | CPU {} | {}".format(
+                    info.get("hostname", "peer"),
+                    info.get("ram_mb", "?"),
+                    info.get("threads", "?"),
+                    nid[:8],
+                ))
             continue
         if line.startswith("/invite"):
             parts = line.split(maxsplit=1)
@@ -764,7 +815,7 @@ async def interactive(mesh, server_bin):
         try:
             await ask(mesh, server_bin, line)
         except Exception as exc:
-            print(f"WQPU error: {exc}")
+            print("WQPU error: {}".format(exc))
 
 
 async def run(join_token=None):
@@ -781,39 +832,63 @@ async def run(join_token=None):
         str(rpc_bin), "--host", "127.0.0.1", "--port", str(RPC_PORT),
         "--threads", str(threads_for()), "--device", "CPU", "--cache"
     ], "rpc.log")
-    print(f"WQPU {VERSION} | llama.cpp {tag}")
-    print(f"Node {socket.gethostname()} | RAM {total_ram_mb()} MiB | contributes {threads_for()}/{os.cpu_count() or '?'} CPU threads")
-    print(f"P2P listen: TCP {PORT}")
-    loop = asyncio.get_running_loop()
+    print("WQPU {} | llama.cpp {}".format(VERSION, tag))
+    print("Node {} | RAM {} MiB | contributes {}/{} CPU threads".format(
+        socket.gethostname(), total_ram_mb(), threads_for(), os.cpu_count() or "?"
+    ))
+    print("P2P listen: TCP {}".format(PORT))
+    loop = asyncio.get_event_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, mesh.stop.set)
-        except (NotImplementedError, RuntimeError):
+        except (NotImplementedError, RuntimeError, ValueError):
             pass
-    connector = asyncio.create_task(mesh.connector_loop())
+    connector = asyncio.ensure_future(mesh.connector_loop())
     try:
         await interactive(mesh, server_bin)
     finally:
         mesh.stop.set()
         connector.cancel()
-        if mesh.server:
-            mesh.server.close()
-            await mesh.server.wait_closed()
+        await close_server(mesh.server)
         stop_proc(rpc)
+
+
+def run_async(coro):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        all_tasks = getattr(asyncio, "all_tasks", None)
+        if all_tasks:
+            try:
+                pending = all_tasks(loop=loop)
+            except TypeError:
+                pending = all_tasks()
+        else:
+            pending = asyncio.Task.all_tasks(loop=loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            try:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
+        loop.close()
 
 
 def main():
     ap = argparse.ArgumentParser(prog="wqpu")
-    ap.add_argument("--version", action="version", version=f"WQPU {VERSION}")
+    ap.add_argument("--version", action="version", version="WQPU {}".format(VERSION))
     ap.add_argument("--join", help="WQPU1 join code")
     args = ap.parse_args()
     try:
-        asyncio.run(run(args.join or os.environ.get("WQPU_JOIN")))
+        run_async(run(args.join or os.environ.get("WQPU_JOIN")))
         return 0
     except KeyboardInterrupt:
         return 130
     except Exception as exc:
-        print(f"WQPU error: {exc}", file=sys.stderr)
+        print("WQPU error: {}".format(exc), file=sys.stderr)
         return 1
 
 
