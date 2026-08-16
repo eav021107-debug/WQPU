@@ -14,8 +14,9 @@ import (
 	"github.com/ethereum/go-ethereum/signer/core/apitypes"
 )
 
+const sessionCodecVersion byte = 1
+
 const (
-	sessionCodecVersion byte = 1
 	SessionPermProvider uint64 = 1 << iota
 	SessionPermJob
 	SessionPermSettle
