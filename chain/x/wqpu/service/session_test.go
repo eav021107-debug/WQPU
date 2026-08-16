@@ -2,6 +2,7 @@ package service
 
 import (
 	"encoding/hex"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/crypto"
@@ -16,12 +17,14 @@ func signedSession(t *testing.T, chainID string) (kernel.SessionDelegation, stri
 	if err != nil {
 		t.Fatal(err)
 	}
-	var session [32]byte
-	session[0] = 7
+	sessionKey, err := crypto.HexToECDSA("8f2a559490e4f2fda090c1121e52d1d02235d61cf511bfd5baf0f68c19d0f4f3")
+	if err != nil {
+		t.Fatal(err)
+	}
 	d := kernel.SessionDelegation{
 		ChainID:         chainID,
 		Wallet:          crypto.PubkeyToAddress(key.PublicKey).Hex(),
-		SessionPubkey:   session,
+		SessionAddress:  strings.ToLower(crypto.PubkeyToAddress(sessionKey.PublicKey).Hex()),
 		IssuedHeight:    0,
 		ExpiresHeight:   100,
 		MaxSpendUnits:   1000,
