@@ -30,10 +30,13 @@ func jobRequestFor(t *testing.T, state *memoryState, wallet common.Address, mode
 	t.Helper()
 	epoch, price, err := CurrentPriceState(state)
 	if err != nil { t.Fatal(err) }
-	var compute uint64
-	for _, provider := range providers { compute += provider.ReservedComputeUnits }
-	charge, err := ChargeForUnits(price, compute)
-	if err != nil { t.Fatal(err) }
+	var compute, charge uint64
+	for _, provider := range providers {
+		compute += provider.ReservedComputeUnits
+		part, err := ChargeForUnits(price, provider.ReservedComputeUnits)
+		if err != nil { t.Fatal(err) }
+		charge += part
+	}
 	return JobRequest{
 		JobID: crypto.Keccak256Hash([]byte("job-" + string(rune(len(providers)+'0')))),
 		RequesterWallet: wallet,

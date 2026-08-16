@@ -70,14 +70,7 @@ func (r JobRequest) Validate() error {
 	if len(r.Providers) == 0 || len(r.Providers) > MaxJobProviders {
 		return errors.New("WQPU job provider count is outside protocol bounds")
 	}
-	expectedCharge, err := ChargeForUnits(r.PricePerMillionUnits, r.MaxComputeUnits)
-	if err != nil {
-		return err
-	}
-	if r.MaxChargeUnits != expectedCharge {
-		return errors.New("WQPU job max charge must exactly match global price")
-	}
-	var totalCompute, totalModel uint64
+	var totalCompute, totalModel, expectedCharge uint64
 	seen := map[common.Hash]struct{}{}
 	for _, provider := range r.Providers {
 		if provider.ProviderWallet == (common.Address{}) || provider.ProviderPeerID == (common.Hash{}) {
@@ -95,12 +88,23 @@ func (r JobRequest) Validate() error {
 		}
 		totalCompute += provider.ReservedComputeUnits
 		totalModel += provider.AssignedModelBytes
+		providerCharge, err := ChargeForUnits(r.PricePerMillionUnits, provider.ReservedComputeUnits)
+		if err != nil {
+			return err
+		}
+		if providerCharge > ^uint64(0)-expectedCharge {
+			return errors.New("WQPU job charge overflow")
+		}
+		expectedCharge += providerCharge
 	}
 	if totalCompute != r.MaxComputeUnits {
 		return errors.New("WQPU provider compute reservations must equal job maximum")
 	}
 	if totalModel != r.ModelBytes {
 		return errors.New("WQPU model bytes must be fully assigned across providers")
+	}
+	if r.MaxChargeUnits != expectedCharge {
+		return errors.New("WQPU job max charge must equal the sum of per-provider charges at the global price")
 	}
 	return nil
 }
