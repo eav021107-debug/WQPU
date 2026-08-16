@@ -6,6 +6,7 @@ on:
   pull_request:
     paths:
       - 'wqpu_next/**'
+      - 'client/**'
       - 'chain/**'
       - 'tests/**'
       - 'ARCHITECTURE_V1.md'
@@ -44,4 +45,16 @@ jobs:
           cache-dependency-path: chain/go.mod
       - name: Go consensus tests
         working-directory: chain
+        run: go test ./...
+
+  go-client-foundation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache-dependency-path: client/go.mod
+      - name: Go client tests
+        working-directory: client
         run: go test ./...
