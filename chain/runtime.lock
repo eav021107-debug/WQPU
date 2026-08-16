@@ -1,0 +1,10 @@
+# WQPU sovereign devnet runtime lock
+# Update only through an explicit reviewed change.
+COSMOS_EVM_TAG=v0.7.1
+COSMOS_EVM_COMMIT=fb82a3f865d500ac33c635b0694d35738be323b7
+CHAIN_ID=wqpu-dev-1
+EVM_CHAIN_ID=711711
+BASE_DENOM=awqpu
+DISPLAY_DENOM=WQPU
+DISPLAY_EXPONENT=18
+PROTOCOL_VERSION=1
