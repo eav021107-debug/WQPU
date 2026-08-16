@@ -24,11 +24,11 @@ const (
 )
 
 type Runtime struct {
-	Root       string
-	RPCServer  string
+	Root        string
+	RPCServer   string
 	LlamaServer string
-	LlamaCLI   string
-	Tag        string
+	LlamaCLI    string
+	Tag         string
 }
 
 type Installer struct {
@@ -88,6 +88,80 @@ func copyBounded(dst io.Writer, src io.Reader, remaining *int64) error {
 	return nil
 }
 
+type deferredTarLink struct {
+	destination string
+	target      string
+}
+
+func tarLinkTarget(root, headerName, linkName string, hardLink bool) (string, error) {
+	if linkName == "" || strings.ContainsRune(linkName, '\x00') {
+		return "", errors.New("empty llama.cpp archive link target")
+	}
+	source := path.Clean(strings.ReplaceAll(headerName, "\\", "/"))
+	link := strings.ReplaceAll(linkName, "\\", "/")
+	if path.IsAbs(link) || strings.HasPrefix(link, "//") {
+		return "", errors.New("absolute llama.cpp archive link target")
+	}
+	first := link
+	if slash := strings.IndexByte(first, '/'); slash >= 0 { first = first[:slash] }
+	if strings.Contains(first, ":") {
+		return "", errors.New("unsafe llama.cpp archive link volume")
+	}
+	var targetName string
+	if hardLink {
+		targetName = path.Clean(link)
+	} else {
+		targetName = path.Clean(path.Join(path.Dir(source), link))
+	}
+	if targetName == "." || targetName == ".." || strings.HasPrefix(targetName, "../") || path.IsAbs(targetName) {
+		return "", errors.New("llama.cpp archive link escapes runtime directory")
+	}
+	return destination(root, targetName)
+}
+
+func materializeTarLinks(links []deferredTarLink, remaining *int64) error {
+	pending := append([]deferredTarLink(nil), links...)
+	for len(pending) > 0 {
+		progress := false
+		next := pending[:0]
+		for _, link := range pending {
+			info, err := os.Stat(link.target)
+			if errors.Is(err, os.ErrNotExist) {
+				next = append(next, link)
+				continue
+			}
+			if err != nil { return err }
+			if !info.Mode().IsRegular() {
+				return errors.New("llama.cpp archive link target is not a regular file")
+			}
+			if _, err := os.Lstat(link.destination); err == nil {
+				return errors.New("duplicate llama.cpp archive link destination")
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Dir(link.destination), 0o755); err != nil { return err }
+			in, err := os.Open(link.target)
+			if err != nil { return err }
+			mode := os.FileMode(0o644)
+			if info.Mode()&0o111 != 0 { mode = 0o755 }
+			out, err := os.OpenFile(link.destination, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode)
+			if err != nil { _ = in.Close(); return err }
+			copyErr := copyBounded(out, in, remaining)
+			inCloseErr := in.Close()
+			outCloseErr := out.Close()
+			if copyErr != nil { return copyErr }
+			if inCloseErr != nil { return inCloseErr }
+			if outCloseErr != nil { return outCloseErr }
+			progress = true
+		}
+		if !progress {
+			return errors.New("llama.cpp archive contains a missing or cyclic internal link")
+		}
+		pending = append([]deferredTarLink(nil), next...)
+	}
+	return nil
+}
+
 func extractTarGz(archivePath, root string) error {
 	file, err := os.Open(archivePath)
 	if err != nil { return err }
@@ -98,6 +172,8 @@ func extractTarGz(archivePath, root string) error {
 	tr := tar.NewReader(gz)
 	remaining := MaxExtractedBytes
 	files := 0
+	links := make([]deferredTarLink, 0)
+	seenLinks := make(map[string]struct{})
 	for {
 		header, err := tr.Next()
 		if errors.Is(err, io.EOF) { break }
@@ -120,11 +196,21 @@ func extractTarGz(archivePath, root string) error {
 			closeErr := out.Close()
 			if copyErr != nil { return copyErr }
 			if closeErr != nil { return closeErr }
+		case tar.TypeSymlink, tar.TypeLink:
+			if _, duplicate := seenLinks[dst]; duplicate { return errors.New("duplicate llama.cpp archive link") }
+			if _, err := os.Lstat(dst); err == nil {
+				return errors.New("llama.cpp archive link collides with existing entry")
+			} else if !errors.Is(err, os.ErrNotExist) { return err }
+			target, err := tarLinkTarget(root, header.Name, header.Linkname, header.Typeflag == tar.TypeLink)
+			if err != nil { return err }
+			if target == dst { return errors.New("self-referential llama.cpp archive link") }
+			seenLinks[dst] = struct{}{}
+			links = append(links, deferredTarLink{destination: dst, target: target})
 		default:
 			return fmt.Errorf("unsafe llama.cpp tar entry type %d", header.Typeflag)
 		}
 	}
-	return nil
+	return materializeTarLinks(links, &remaining)
 }
 
 func extractZip(archivePath, root string) error {
@@ -237,9 +323,10 @@ func extractAsset(asset Asset, archivePath, root string) error {
 }
 
 // InstallCPU downloads the exact pinned official llama.cpp archive, verifies its
-// SHA-256 before extraction, rejects archive escapes/symlinks/special files, and
-// atomically publishes a complete runtime directory. Existing complete installs
-// are reused without a network request.
+// SHA-256 before extraction, rejects archive escapes and unsafe special files,
+// materializes verified internal tar links as ordinary files, and atomically
+// publishes a complete runtime directory. Existing complete installs are reused
+// without a network request.
 func (i Installer) InstallCPU(ctx context.Context, baseDir, goos, goarch string) (Runtime, error) {
 	if baseDir == "" || strings.ContainsRune(baseDir, '\x00') { return Runtime{}, errors.New("valid WQPU runtime base directory is required") }
 	asset, err := CPUAsset(goos, goarch)
