@@ -9,17 +9,24 @@ import (
 
 const ProtocolVersion uint32 = 1
 
+const (
+	SessionPermProvider uint64 = 1 << iota
+	SessionPermJob
+	SessionPermSettle
+	SessionAllPermissions = SessionPermProvider | SessionPermJob | SessionPermSettle
+)
+
 type SessionRequest struct {
-	WQPUChainID    string
-	EVMChainID     uint64
-	Wallet         string
-	SessionPubkey  string
-	IssuedHeight   uint64
-	ExpiresHeight  uint64
-	MaxSpendUnits  uint64
-	MaxJobUnits    uint64
+	WQPUChainID     string
+	EVMChainID      uint64
+	Wallet          string
+	SessionPubkey   string
+	IssuedHeight    uint64
+	ExpiresHeight   uint64
+	MaxSpendUnits   uint64
+	MaxJobUnits     uint64
 	RevocationNonce uint64
-	Permissions    uint64
+	Permissions     uint64
 }
 
 type TypeField struct {
@@ -55,6 +62,9 @@ func (r SessionRequest) Validate() error {
 	if r.ExpiresHeight <= r.IssuedHeight {
 		return errors.New("session expiry must follow issue height")
 	}
+	if r.Permissions&^SessionAllPermissions != 0 {
+		return errors.New("unknown WQPU session permission bit")
+	}
 	return nil
 }
 
@@ -64,12 +74,12 @@ func BuildSessionTypedData(r SessionRequest) (TypedData, error) {
 	}
 	return TypedData{
 		Types: map[string][]TypeField{
-			"EIP712Domain": {
+			"EIP712Domain": []TypeField{
 				{Name: "name", Type: "string"},
 				{Name: "version", Type: "string"},
 				{Name: "chainId", Type: "uint256"},
 			},
-			"WQPUSession": {
+			"WQPUSession": []TypeField{
 				{Name: "wallet", Type: "address"},
 				{Name: "sessionPubkey", Type: "bytes32"},
 				{Name: "wqpuChainId", Type: "string"},
@@ -89,16 +99,16 @@ func BuildSessionTypedData(r SessionRequest) (TypedData, error) {
 			"chainId": r.EVMChainID,
 		},
 		Message: map[string]any{
-			"wallet":           r.Wallet,
-			"sessionPubkey":    r.SessionPubkey,
-			"wqpuChainId":      r.WQPUChainID,
-			"issuedHeight":     r.IssuedHeight,
-			"expiresHeight":    r.ExpiresHeight,
-			"maxSpendUnits":    r.MaxSpendUnits,
-			"maxJobUnits":      r.MaxJobUnits,
-			"revocationNonce":  r.RevocationNonce,
-			"permissions":      r.Permissions,
-			"protocolVersion":  ProtocolVersion,
+			"wallet":          r.Wallet,
+			"sessionPubkey":   r.SessionPubkey,
+			"wqpuChainId":     r.WQPUChainID,
+			"issuedHeight":    r.IssuedHeight,
+			"expiresHeight":   r.ExpiresHeight,
+			"maxSpendUnits":   r.MaxSpendUnits,
+			"maxJobUnits":     r.MaxJobUnits,
+			"revocationNonce": r.RevocationNonce,
+			"permissions":     r.Permissions,
+			"protocolVersion": ProtocolVersion,
 		},
 	}, nil
 }
