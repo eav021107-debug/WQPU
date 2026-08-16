@@ -10,25 +10,29 @@ The WQPU chain is authoritative only after normal consensus verification. A boot
 
 ## Wallet rules
 
-- Never request, receive, log, transmit or store a wallet seed phrase or private key.
-- Wallet ownership is proven by an explicit signed challenge containing chain ID, protocol version, origin, nonce and expiration.
-- Long-running compute uses a local ephemeral session key only after the wallet signs a narrowly scoped delegation.
-- A delegation must include wallet address, session public key, chain ID, expiry, maximum spend, maximum job value and a revocation nonce.
+- Never request, receive, log, transmit or store a wallet seed phrase or wallet private key.
+- Wallet ownership is proven by an explicit EIP-712 signature bound to the WQPU chain ID and protocol version.
+- Long-running compute uses a local temporary secp256k1 session key only after the wallet signs a narrowly scoped delegation.
+- A delegation binds the wallet, temporary EVM session address, issue/expiry heights, maximum lifetime spend, maximum job value, permission mask, revocation nonce and protocol version.
+- Session action signatures include an action kind, monotonically increasing nonce and payload hash, so a signature for one action cannot be replayed or moved to another action.
 - Session authorization must not authorize arbitrary token transfer or arbitrary wallet messages.
 
 ## Peer identity
 
+A wallet may own multiple computers. Wallet identity is therefore not provider identity.
+
 A provider registry entry binds:
 
-- wallet address;
-- WQPU peer public key / peer ID;
+- owner wallet address;
+- WQPU `peer_id` for the concrete machine;
+- exact temporary control-session address for that peer;
 - transport endpoints;
 - capability commitment;
 - current capacity/busy counters;
 - heartbeat height/expiry;
 - protocol version.
 
-Endpoint changes require a fresh signed update. Old presence records expire automatically.
+Endpoint/capability updates require a fresh session-signed provider envelope. Old presence records expire automatically. Another wallet cannot take over an already owned `peer_id`.
 
 ## Transport
 
@@ -38,6 +42,8 @@ Endpoint changes require a fresh signed update. Old presence records expire auto
 - Every control message carries protocol version, session ID, monotonic sequence/nonce and bounded length.
 - Reject replays, stale sessions, oversized frames and unknown critical fields.
 - Relays forward opaque encrypted streams and do not gain permission to inspect prompts or model data solely by relaying.
+
+The authenticated P2P transport is still a release gate on `next-foundation`; chain registration alone must never be treated as transport authentication.
 
 ## Compute containment
 
@@ -51,53 +57,88 @@ Endpoint changes require a fresh signed update. Old presence records expire auto
 
 Every job gets a unique cryptographic job ID and immutable request manifest containing at least:
 
-- requester wallet/session key;
+- requester wallet/session address;
 - model hash/version;
 - prompt commitment where privacy permits;
-- selected provider set;
-- assigned compute units/shards;
-- global price epoch;
+- selected provider/peer set;
+- assigned compute units/model bytes;
+- global price epoch and exact global price;
 - maximum charge;
 - creation/expiry heights.
 
-Work receipts are bound to that job ID and provider identity. A receipt cannot be replayed into another job or another price epoch.
+Money and every selected peer's compute capacity are reserved before useful work starts. If any validation or reservation fails, the EVM snapshot is reverted so partial state is not left behind.
 
-## Accounting
+Work receipts are bound to the job ID, concrete `peer_id`, provider wallet and result commitment. A receipt cannot be replayed into another job or another price epoch.
+
+## Accounting and settlement
 
 - Prompt count is never proof of work.
 - Self-requesting cannot mint new supply.
-- Settlement uses monotonic cumulative amounts or uniquely numbered receipts so an old receipt cannot reduce or duplicate payment.
-- Arithmetic uses deterministic integers; no floating-point consensus math.
-- Global price updates are bounded per epoch to prevent one sudden demand spike from multiplying price without limit.
+- Requester spend must be backed by actually funded native WQPU session escrow before a job can reserve it.
+- Settlement uses monotonic cumulative receipts so an old/reordered receipt cannot reduce or duplicate payment.
+- Accepted payment requires both provider/control-session and requester/session signatures.
+- Only accepted work is paid; unused requester reservation is released.
+- Timeout settlement is permissionless after the deadline so a vanished requester cannot permanently lock provider capacity or escrow.
+- Arithmetic uses deterministic checked integers; no floating-point consensus math.
+
+## Global-price attack model
+
+Provider-reported `busy` is not price demand. Demand is chain-reserved compute from active jobs.
+
+Raw advertised capacity is not price supply. For each active peer:
+
+```text
+price supply = min(advertised capacity, bonded capacity)
+```
+
+The provider bond is native WQPU and is keyed to the exact `peer_id`. One wallet cannot reuse the same bond to give many Sybil peers free downward price pressure. Bond cannot be removed while the peer has reserved work.
+
+Global price movement is bounded per epoch. Protocol v1 targets 70% utilization, caps one price move at 5%, and uses 20-block epochs.
+
+The bond makes fake supply economically costly, but it does **not** prove that the advertised hardware exists or that a capability benchmark is honest. Capability verification, slashing/reputation policy and bond calibration remain release gates.
+
+The demand side also remains adversarial: funded self-jobs/wash demand may spend real fees to push utilization upward. Before public-value deployment, the protocol needs explicit analysis and mitigation for economically rational demand manipulation rather than assuming every paid job represents independent demand.
 
 ## Abuse resistance
 
 - Per-session and per-wallet request limits exist even if a wallet has funds.
 - Peers can disconnect malformed or abusive senders without global permission.
 - Scheduler distrusts self-reported availability over time and compares it with observed completion/timeout history.
-- Reputation is advisory for scheduling, not a source of consensus authority.
-- Future anti-Sybil economics may require refundable job/provider collateral, but the initial network must not pretend wallet count equals independent humans.
+- Reputation may assist scheduling but is never consensus authority by itself.
+- Wallet count, peer count and IP count must never be treated as counts of independent humans or independent physical machines.
 
 ## Failure behavior
 
 - A worker disappearing must not corrupt the chain or permanently lock a requester's funds.
-- Request coordinators retry on a replacement worker from the same model-compatible pool.
+- Request coordinators retry on a replacement worker from the same model-compatible pool where protocol state permits it.
 - Partial work is paid only according to protocol-defined accepted receipts.
 - Chain reorg/finality rules determine when a payment/provider update is considered irreversible.
-- Local state writes use atomic replace/journaling where loss would affect keys, accounting or peer identity.
+- Local state writes use atomic replace/journaling where loss would affect session keys, accounting or peer identity.
+
+## Native-balance invariants
+
+Native bond, escrow and provider payout mutate the Cosmos EVM `StateDB`. The pinned runtime commits dirty EVM account balances through the Cosmos EVM keeper into bank state. Any future runtime upgrade must re-prove this integration before release; WQPU must not assume ordinary upstream geth balance semantics are sufficient for a Cosmos EVM fork.
 
 ## Secrets and logs
 
 Never log:
 
 - seed phrases/private keys;
-- wallet session secrets;
+- temporary session private keys;
 - raw authentication tokens;
 - full prompts by default;
 - decrypted peer traffic.
 
-Logs may contain job IDs, peer IDs, timing, resource counters and sanitized error classes.
+Logs may contain job IDs, peer IDs, timing, resource counters, public wallet/session addresses and sanitized error classes.
 
 ## Release gates
 
 A feature cannot move to `main` until it has tests for malformed input, replay, timeout, peer disconnect, duplicated receipt, stale registry entry, resource exhaustion boundary and safe recovery after process restart.
+
+The `next-foundation` branch additionally remains non-production until these end-to-end gates are green:
+
+- pinned patched `wqpud` starts with the sovereign WQPU genesis;
+- native `0x0900` read and signed-write JSON-RPC transactions execute on the live devnet;
+- `fundSession -> reserveJob -> receipt -> finalize -> native payout/refund` succeeds and its failure paths remain atomic;
+- authenticated P2P transport and multi-peer `llama.cpp` inference work under peer loss/retry;
+- capability/Sybil/wash-demand economics have an explicit adversarial policy.
