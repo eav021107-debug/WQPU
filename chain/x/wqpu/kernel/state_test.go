@@ -76,6 +76,24 @@ func jobFor(s *State, requester SessionDelegation, id string, reserve, charge, e
 	}
 }
 
+func verifiedReceipt(t *testing.T, job JobReservation, sequence, delta, cumulative uint64) WorkReceipt {
+	t.Helper()
+	payment, err := ChargeForUnits(job.PricePerMillionUnits, cumulative)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return WorkReceipt{
+		JobID:                 job.JobID,
+		ProviderWallet:         "provider",
+		ProviderPeerID:         "peer-1",
+		Sequence:               sequence,
+		ComputeUnits:           delta,
+		CumulativeComputeUnits: cumulative,
+		CumulativePaymentUnits: payment,
+		ResultCommitment:       "sha256:accepted-result",
+	}
+}
+
 func TestStateReservesComputeAndSpendBeforeWork(t *testing.T) {
 	s, requester, _ := preparedState(t)
 	j := jobFor(s, requester, "job-1", 70, 500, 10)
@@ -110,26 +128,51 @@ func TestFailedSecondJobDoesNotPartiallyReserveAnything(t *testing.T) {
 	}
 }
 
-func TestCloseJobPaysActualAndReturnsUnusedReservation(t *testing.T) {
+func TestJobCannotFinalizeWithoutVerifiedReceipt(t *testing.T) {
 	s, requester, _ := preparedState(t)
-	if err := s.ReserveJob(jobFor(s, requester, "job-1", 70, 500, 10)); err != nil {
+	job := jobFor(s, requester, "job-1", 70, 500, 10)
+	if err := s.ReserveJob(job); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.CloseJob("job-1", 320); err != nil {
+	if _, err := s.FinalizeJob(job.JobID); err == nil {
+		t.Fatal("job without a verified receipt must not settle")
+	}
+	session, _ := s.session(requester.Wallet, requester.SessionPubkey)
+	if session.SpentUnits != 0 || session.ReservedUnits != 500 {
+		t.Fatal("failed finalization changed payment accounting")
+	}
+}
+
+func TestFinalizeJobPaysOnlyReceiptAmountAndReturnsRemainder(t *testing.T) {
+	s, requester, _ := preparedState(t)
+	job := jobFor(s, requester, "job-1", 70, 500, 10)
+	if err := s.ReserveJob(job); err != nil {
+		t.Fatal(err)
+	}
+	receipt := verifiedReceipt(t, job, 1, 50, 50)
+	if err := s.RecordVerifiedReceipt(receipt); err != nil {
+		t.Fatal(err)
+	}
+	settlement, err := s.FinalizeJob(job.JobID)
+	if err != nil {
 		t.Fatal(err)
 	}
 	session, _ := s.session(requester.Wallet, requester.SessionPubkey)
-	if session.ReservedUnits != 0 || session.SpentUnits != 320 {
+	if session.ReservedUnits != 0 || session.SpentUnits != receipt.CumulativePaymentUnits {
 		t.Fatalf("session reserved=%d spent=%d", session.ReservedUnits, session.SpentUnits)
+	}
+	if settlement.TotalCharge != receipt.CumulativePaymentUnits || settlement.Payouts["provider"] != receipt.CumulativePaymentUnits {
+		t.Fatalf("settlement=%+v", settlement)
 	}
 	if s.ReservedByPeer["peer-1"] != 0 {
 		t.Fatal("compute reservation was not released")
 	}
 }
 
-func TestExpiredJobReleasesSpendAndComputeWithoutCharging(t *testing.T) {
+func TestExpiredUnusedJobRefundsEverything(t *testing.T) {
 	s, requester, _ := preparedState(t)
-	if err := s.ReserveJob(jobFor(s, requester, "job-1", 70, 500, 2)); err != nil {
+	job := jobFor(s, requester, "job-1", 70, 500, 2)
+	if err := s.ReserveJob(job); err != nil {
 		t.Fatal(err)
 	}
 	if err := s.AdvanceHeight(2); err != nil {
@@ -141,6 +184,50 @@ func TestExpiredJobReleasesSpendAndComputeWithoutCharging(t *testing.T) {
 	}
 	if len(s.Jobs) != 0 || len(s.ReservedByPeer) != 0 {
 		t.Fatal("expired job resources were not cleared")
+	}
+	if settlement, ok := s.CompletedSettlements[job.JobID]; !ok || settlement.TotalCharge != 0 {
+		t.Fatalf("timeout settlement=%+v exists=%v", settlement, ok)
+	}
+}
+
+func TestTimeoutPaysAlreadyVerifiedWorkAndRefundsRemainder(t *testing.T) {
+	s, requester, _ := preparedState(t)
+	job := jobFor(s, requester, "job-1", 70, 500, 2)
+	if err := s.ReserveJob(job); err != nil {
+		t.Fatal(err)
+	}
+	receipt := verifiedReceipt(t, job, 1, 40, 40)
+	if err := s.RecordVerifiedReceipt(receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.AdvanceHeight(2); err != nil {
+		t.Fatal(err)
+	}
+	session, _ := s.session(requester.Wallet, requester.SessionPubkey)
+	if session.ReservedUnits != 0 || session.SpentUnits != receipt.CumulativePaymentUnits {
+		t.Fatalf("session reserved=%d spent=%d", session.ReservedUnits, session.SpentUnits)
+	}
+	settlement := s.CompletedSettlements[job.JobID]
+	if settlement.TotalCharge != receipt.CumulativePaymentUnits || settlement.Payouts["provider"] != receipt.CumulativePaymentUnits {
+		t.Fatalf("timeout settlement=%+v", settlement)
+	}
+}
+
+func TestReceiptReplayCannotIncreaseState(t *testing.T) {
+	s, requester, _ := preparedState(t)
+	job := jobFor(s, requester, "job-1", 70, 500, 10)
+	if err := s.ReserveJob(job); err != nil {
+		t.Fatal(err)
+	}
+	receipt := verifiedReceipt(t, job, 1, 20, 20)
+	if err := s.RecordVerifiedReceipt(receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RecordVerifiedReceipt(receipt); err == nil {
+		t.Fatal("replayed receipt should be rejected")
+	}
+	if s.LatestReceipts[job.JobID]["peer-1"].Sequence != 1 {
+		t.Fatal("replay changed latest receipt")
 	}
 }
 
