@@ -118,12 +118,8 @@ func startProvider(ctx context.Context, baseDir string, installed llamaruntime.R
 	if err != nil { _ = backend.Close(); _ = logFile.Close(); return nil, err }
 	providerRegistry := registry{requesterID: registryPeer(requesterID, requesterKey.Address(), "wqpu://127.0.0.1:1")}
 	mesh, err := rpcmesh.StartProviderOnListener(ctx, listener, rpcmesh.ProviderConfig{
-		Signer: key,
-		ChainID: chainID,
-		LocalPeerID: id,
-		Registry: providerRegistry,
-		RPCTarget: fmt.Sprintf("127.0.0.1:%d", rpcPort),
-		MaxConnections: 8,
+		Signer: key, ChainID: chainID, LocalPeerID: id, Registry: providerRegistry,
+		RPCTarget: fmt.Sprintf("127.0.0.1:%d", rpcPort), MaxConnections: 8,
 	})
 	if err != nil { _ = listener.Close(); _ = backend.Close(); _ = logFile.Close(); return nil, err }
 	return &providerRuntime{id: id, key: key, mesh: mesh, backend: backend, logFile: logFile, logPath: logPath}, nil
@@ -167,17 +163,12 @@ func run(baseDir string) error {
 		provider0.id: registryPeer(provider0.id, provider0.key.Address(), provider0.mesh.Endpoint()),
 		provider1.id: registryPeer(provider1.id, provider1.key.Address(), provider1.mesh.Endpoint()),
 	}
-	openForwarder := func(remote common.Hash) (*rpcmeshForwarder, error) {
-		forwarder, err := rpcmesh.OpenForwarder(ctx, rpcmesh.ForwarderConfig{
-			Signer: requesterKey,
-			ChainID: chainID,
-			LocalPeerID: requesterID,
-			RemotePeerID: remote,
-			Registry: requesterRegistry,
+	openForwarder := func(remote common.Hash) (*rpcmesh.Forwarder, error) {
+		return rpcmesh.OpenForwarder(ctx, rpcmesh.ForwarderConfig{
+			Signer: requesterKey, ChainID: chainID, LocalPeerID: requesterID,
+			RemotePeerID: remote, Registry: requesterRegistry,
 			Dialer: carrier.TCPDialer{Timeout: 5 * time.Second},
 		})
-		if err != nil { return nil, err }
-		return &rpcmeshForwarder{forwarder: forwarder}, nil
 	}
 	forwarder0, err := openForwarder(provider0.id)
 	if err != nil { return err }
@@ -215,16 +206,6 @@ func run(baseDir string) error {
 	fmt.Printf("two-peer production rpcmesh model inference allocated on RPC0 and RPC1: %q\n", text)
 	return nil
 }
-
-// Keep the smoke independent of rpctunnel's concrete type while exposing only
-// the lifecycle and loopback address the llama runtime needs.
-type rpcmeshForwarder struct { forwarder interface {
-	Address() string
-	Close() error
-} }
-
-func (f *rpcmeshForwarder) Address() string { return f.forwarder.Address() }
-func (f *rpcmeshForwarder) Close() error { return f.forwarder.Close() }
 
 func main() {
 	if len(os.Args) != 3 || os.Args[1] != "--runtime-base" {
