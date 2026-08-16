@@ -21,6 +21,7 @@ class ChainState:
     epoch: int = 0
     price_per_million_units: int = 1_000
     providers: Dict[str, ProviderRecord] = field(default_factory=dict)
+    reserved_units_by_peer: Dict[str, int] = field(default_factory=dict)
 
     def validate(self) -> None:
         if not self.chain_id:
@@ -29,6 +30,9 @@ class ChainState:
             raise ValueError("height/epoch cannot be negative")
         if self.price_per_million_units <= 0:
             raise ValueError("global price must be positive")
+        for peer_id, units in self.reserved_units_by_peer.items():
+            if not peer_id or units < 0:
+                raise ValueError("invalid reservation state")
 
     def advance_height(self, blocks: int = 1) -> int:
         if blocks <= 0:
@@ -53,14 +57,46 @@ class ChainState:
             raise ValueError("cannot publish an already expired provider record")
         self.providers[record.wallet] = record
 
+    def _provider_by_peer(self, peer_id: str) -> ProviderRecord:
+        for record in self.active_providers():
+            if record.peer_id == peer_id:
+                return record
+        raise ValueError("unknown or expired provider peer")
+
+    def reserve_compute(self, peer_id: str, units: int) -> None:
+        """Reserve capacity after a job reservation transaction is accepted."""
+        if units <= 0:
+            raise ValueError("reservation units must be positive")
+        provider = self._provider_by_peer(peer_id)
+        current = self.reserved_units_by_peer.get(peer_id, 0)
+        if current + units > provider.capacity_units:
+            raise ValueError("reservation exceeds provider capacity")
+        self.reserved_units_by_peer[peer_id] = current + units
+
+    def release_compute(self, peer_id: str, units: int) -> None:
+        """Release reservation after completion, timeout or cancellation."""
+        if units <= 0:
+            raise ValueError("release units must be positive")
+        current = self.reserved_units_by_peer.get(peer_id, 0)
+        if units > current:
+            raise ValueError("cannot release more than reserved")
+        remaining = current - units
+        if remaining:
+            self.reserved_units_by_peer[peer_id] = remaining
+        else:
+            self.reserved_units_by_peer.pop(peer_id, None)
+
     def expire_providers(self) -> None:
         stale = [
             wallet
             for wallet, record in self.providers.items()
             if record.expires_height <= self.height
         ]
+        stale_peer_ids = [self.providers[wallet].peer_id for wallet in stale]
         for wallet in stale:
             self.providers.pop(wallet, None)
+        for peer_id in stale_peer_ids:
+            self.reserved_units_by_peer.pop(peer_id, None)
 
     def active_providers(self) -> List[ProviderRecord]:
         self.expire_providers()
@@ -70,12 +106,23 @@ class ChainState:
             if self.providers[wallet].expires_height > self.height
         ]
 
+    def active_capacity_units(self) -> int:
+        return sum(record.capacity_units for record in self.active_providers())
+
+    def active_reserved_units(self) -> int:
+        active_peers = {record.peer_id for record in self.active_providers()}
+        return sum(
+            units
+            for peer_id, units in self.reserved_units_by_peer.items()
+            if peer_id in active_peers
+        )
+
     def close_price_epoch(self) -> GlobalPriceState:
-        """Advance the single network-wide price using current active capacity."""
-        self.expire_providers()
+        """Advance the one global price from chain-confirmed reservations."""
         next_epoch = self.epoch + 1
         state = aggregate_price_state(
-            self.active_providers(),
+            network_capacity_units=self.active_capacity_units(),
+            reserved_demand_units=self.active_reserved_units(),
             previous_price_per_million=self.price_per_million_units,
             next_epoch=next_epoch,
         )
