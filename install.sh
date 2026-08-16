@@ -8,6 +8,8 @@ JOIN="${WQPU_JOIN:-${1:-}}"
 MIN_MAJOR=3
 MIN_MINOR=6
 FALLBACK_PY="3.8.20"
+EXPECTED_WQPU="WQPU 0.5.3"
+CORE_CACHE_BUSTER="ttyfix-0.5.3-r2"
 
 need() { command -v "$1" >/dev/null 2>&1; }
 
@@ -39,15 +41,23 @@ find_python() {
 }
 
 install_base_tools() {
+  if need curl && need openssl; then
+    return 0
+  fi
+
   if need apt-get; then
     $SUDO apt-get update
-    $SUDO apt-get install -y curl ca-certificates openssl >/dev/null 2>&1 || true
+    need curl || $SUDO apt-get install -y curl ca-certificates >/dev/null 2>&1 || true
+    need openssl || $SUDO apt-get install -y openssl >/dev/null 2>&1 || true
   elif need dnf; then
-    $SUDO dnf install -y curl ca-certificates openssl >/dev/null 2>&1 || true
+    need curl || $SUDO dnf install -y curl ca-certificates >/dev/null 2>&1 || true
+    need openssl || $SUDO dnf install -y openssl >/dev/null 2>&1 || true
   elif need yum; then
-    $SUDO yum install -y curl ca-certificates openssl >/dev/null 2>&1 || true
+    need curl || $SUDO yum install -y curl ca-certificates >/dev/null 2>&1 || true
+    need openssl || $SUDO yum install -y openssl >/dev/null 2>&1 || true
   elif need brew; then
-    brew install curl openssl >/dev/null 2>&1 || true
+    need curl || brew install curl >/dev/null 2>&1 || true
+    need openssl || brew install openssl >/dev/null 2>&1 || true
   fi
 }
 
@@ -160,8 +170,9 @@ fi
 
 mkdir -p "$ROOT" "$BIN"
 
+echo "WQPU: downloading fresh core..."
 curl -fsSL --retry 3 \
-  "${RAW}/wqpu.py?installer=0.5.3" \
+  "${RAW}/wqpu.py?installer=${CORE_CACHE_BUSTER}" \
   -o "$ROOT/wqpu.py"
 chmod 755 "$ROOT/wqpu.py"
 
@@ -169,6 +180,13 @@ chmod 755 "$ROOT/wqpu.py"
   echo "WQPU downloaded correctly, but this Python cannot run it: $($PYTHON --version 2>&1)" >&2
   exit 1
 }
+
+CORE_VERSION="$("$PYTHON" "$ROOT/wqpu.py" --version 2>&1 || true)"
+if [ "$CORE_VERSION" != "$EXPECTED_WQPU" ]; then
+  echo "WQPU core version mismatch: expected '$EXPECTED_WQPU', got '${CORE_VERSION:-unknown}'." >&2
+  echo "Refusing to start a stale cached core." >&2
+  exit 1
+fi
 
 cat > "$BIN/wqpu" <<EOF
 #!/usr/bin/env sh
@@ -186,7 +204,7 @@ if [ -n "$rc" ]; then
   grep -F '$HOME/.local/bin' "$rc" >/dev/null 2>&1 || printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$rc"
 fi
 
-echo "WQPU installed with $($PYTHON --version 2>&1). Starting this computer as an equal peer..."
+echo "WQPU installed: $CORE_VERSION with $($PYTHON --version 2>&1). Starting this computer as an equal peer..."
 
 if [ -n "$JOIN" ]; then
   exec "$BIN/wqpu" --join "$JOIN"
