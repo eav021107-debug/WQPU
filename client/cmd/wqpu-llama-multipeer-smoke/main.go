@@ -20,8 +20,7 @@ import (
 	"github.com/eav021107-debug/WQPU/client/internal/carrier"
 	"github.com/eav021107-debug/WQPU/client/internal/chainregistry"
 	"github.com/eav021107-debug/WQPU/client/internal/llamaruntime"
-	"github.com/eav021107-debug/WQPU/client/internal/peertransport"
-	"github.com/eav021107-debug/WQPU/client/internal/rpctunnel"
+	"github.com/eav021107-debug/WQPU/client/internal/rpcmesh"
 	"github.com/eav021107-debug/WQPU/client/internal/sessionkey"
 )
 
@@ -40,38 +39,13 @@ func (r registry) ResolvePeer(_ context.Context, id common.Hash) (chainregistry.
 	return peer, nil
 }
 
-func peerID(last byte) common.Hash {
-	var id common.Hash
-	id[31] = last
-	return id
-}
+func peerID(last byte) common.Hash { var id common.Hash; id[31] = last; return id }
 
 func registryPeer(id common.Hash, session, endpoint string) chainregistry.Peer {
 	return chainregistry.Peer{Provider: chainregistry.Provider{
 		Wallet: common.HexToAddress("0x1000000000000000000000000000000000000001"),
 		PeerID: id, Endpoints: []string{endpoint}, ProtocolVersion: chainregistry.ProtocolVersion,
 	}, ControlSession: common.HexToAddress(session)}
-}
-
-func serveProvider(ctx context.Context, listener net.Listener, signer *sessionkey.Key, localID common.Hash, peers registry, rpcTarget string, errCh chan<- error) {
-	for {
-		raw, err := listener.Accept()
-		if err != nil {
-			if ctx.Err() != nil || errors.Is(err, net.ErrClosed) { return }
-			select { case errCh <- err: default: }
-			return
-		}
-		go func(conn net.Conn) {
-			secure, err := peertransport.Accept(ctx, conn, signer, chainID, localID, peers)
-			if err != nil {
-				select { case errCh <- fmt.Errorf("secure provider accept: %w", err): default: }
-				return
-			}
-			if err := rpctunnel.BridgeToLoopback(ctx, secure.Stream, rpcTarget); err != nil && ctx.Err() == nil {
-				select { case errCh <- fmt.Errorf("provider RPC bridge: %w", err): default: }
-			}
-		}(raw)
-	}
 }
 
 func waitHealth(ctx context.Context, process *llamaruntime.ManagedProcess, url string) error {
@@ -115,33 +89,55 @@ func completion(ctx context.Context, endpoint string) (string, error) {
 }
 
 type providerRuntime struct {
-	id       common.Hash
-	key      *sessionkey.Key
-	listener net.Listener
-	backend  *llamaruntime.ManagedProcess
-	logFile  *os.File
-	logPath  string
-	port     int
+	id      common.Hash
+	key     *sessionkey.Key
+	mesh    *rpcmesh.ProviderService
+	backend *llamaruntime.ManagedProcess
+	logFile *os.File
+	logPath string
 }
 
 func closeProvider(p *providerRuntime) {
 	if p == nil { return }
-	if p.listener != nil { _ = p.listener.Close() }
+	if p.mesh != nil { _ = p.mesh.Close() }
 	if p.backend != nil { _ = p.backend.Close() }
 	if p.logFile != nil { _ = p.logFile.Close() }
 }
 
-func startProvider(ctx context.Context, baseDir string, installed llamaruntime.Runtime, index, port int) (*providerRuntime, error) {
+func startProvider(ctx context.Context, baseDir string, installed llamaruntime.Runtime, index, rpcPort int, requesterID common.Hash, requesterKey *sessionkey.Key) (*providerRuntime, error) {
 	key, err := sessionkey.Generate()
 	if err != nil { return nil, err }
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil { return nil, err }
+	id := peerID(byte(index + 2))
 	logPath := filepath.Join(baseDir, fmt.Sprintf("multipeer-rpc-%d.log", index))
 	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil { _ = listener.Close(); return nil, err }
-	backend, err := llamaruntime.StartRPCServer(ctx, installed, port, 1, nil, false, logFile, 30*time.Second)
-	if err != nil { _ = listener.Close(); _ = logFile.Close(); return nil, err }
-	return &providerRuntime{id: peerID(byte(index + 2)), key: key, listener: listener, backend: backend, logFile: logFile, logPath: logPath, port: port}, nil
+	if err != nil { return nil, err }
+	backend, err := llamaruntime.StartRPCServer(ctx, installed, rpcPort, 1, nil, false, logFile, 30*time.Second)
+	if err != nil { _ = logFile.Close(); return nil, err }
+
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil { _ = backend.Close(); _ = logFile.Close(); return nil, err }
+	providerRegistry := registry{requesterID: registryPeer(requesterID, requesterKey.Address(), "wqpu://127.0.0.1:1")}
+	mesh, err := rpcmesh.StartProviderOnListener(ctx, listener, rpcmesh.ProviderConfig{
+		Signer: key,
+		ChainID: chainID,
+		LocalPeerID: id,
+		Registry: providerRegistry,
+		RPCTarget: fmt.Sprintf("127.0.0.1:%d", rpcPort),
+		MaxConnections: 8,
+	})
+	if err != nil { _ = listener.Close(); _ = backend.Close(); _ = logFile.Close(); return nil, err }
+	return &providerRuntime{id: id, key: key, mesh: mesh, backend: backend, logFile: logFile, logPath: logPath}, nil
+}
+
+func providerError(p *providerRuntime) error {
+	if p == nil || p.mesh == nil { return nil }
+	select {
+	case err, ok := <-p.mesh.Errors():
+		if ok { return err }
+		return nil
+	default:
+		return nil
+	}
 }
 
 func run(baseDir string) error {
@@ -150,39 +146,43 @@ func run(baseDir string) error {
 	installed, err := (llamaruntime.Installer{}).InstallCPU(ctx, baseDir, goruntime.GOOS, goruntime.GOARCH)
 	if err != nil { return err }
 
+	requesterKey, err := sessionkey.Generate()
+	if err != nil { return err }
+	requesterID := peerID(1)
+
 	previousDebug, hadDebug := os.LookupEnv("GGML_RPC_DEBUG")
 	if err := os.Setenv("GGML_RPC_DEBUG", "1"); err != nil { return err }
-	provider0, err := startProvider(ctx, baseDir, installed, 0, 50053)
-	if err != nil { if hadDebug { _ = os.Setenv("GGML_RPC_DEBUG", previousDebug) } else { _ = os.Unsetenv("GGML_RPC_DEBUG") }; return err }
-	provider1, err := startProvider(ctx, baseDir, installed, 1, 50054)
+	provider0, err := startProvider(ctx, baseDir, installed, 0, 50053, requesterID, requesterKey)
+	if err != nil {
+		if hadDebug { _ = os.Setenv("GGML_RPC_DEBUG", previousDebug) } else { _ = os.Unsetenv("GGML_RPC_DEBUG") }
+		return err
+	}
+	provider1, err := startProvider(ctx, baseDir, installed, 1, 50054, requesterID, requesterKey)
 	if hadDebug { _ = os.Setenv("GGML_RPC_DEBUG", previousDebug) } else { _ = os.Unsetenv("GGML_RPC_DEBUG") }
 	if err != nil { closeProvider(provider0); return err }
 	defer closeProvider(provider0)
 	defer closeProvider(provider1)
 
-	requesterKey, err := sessionkey.Generate()
-	if err != nil { return err }
-	requesterID := peerID(1)
 	requesterRegistry := registry{
-		provider0.id: registryPeer(provider0.id, provider0.key.Address(), "wqpu://"+provider0.listener.Addr().String()),
-		provider1.id: registryPeer(provider1.id, provider1.key.Address(), "wqpu://"+provider1.listener.Addr().String()),
+		provider0.id: registryPeer(provider0.id, provider0.key.Address(), provider0.mesh.Endpoint()),
+		provider1.id: registryPeer(provider1.id, provider1.key.Address(), provider1.mesh.Endpoint()),
 	}
-	providerRegistry := registry{requesterID: registryPeer(requesterID, requesterKey.Address(), "wqpu://127.0.0.1:1")}
-	errCh := make(chan error, 32)
-	go serveProvider(ctx, provider0.listener, provider0.key, provider0.id, providerRegistry, fmt.Sprintf("127.0.0.1:%d", provider0.port), errCh)
-	go serveProvider(ctx, provider1.listener, provider1.key, provider1.id, providerRegistry, fmt.Sprintf("127.0.0.1:%d", provider1.port), errCh)
-
-	startForwarder := func(remote common.Hash) (*rpctunnel.LocalForwarder, error) {
-		return rpctunnel.StartLocalForwarder(ctx, func(ctx context.Context) (io.ReadWriteCloser, error) {
-			connection, err := peertransport.DialRegistered(ctx, carrier.TCPDialer{Timeout: 5 * time.Second}, requesterKey, chainID, requesterID, remote, requesterRegistry)
-			if err != nil { return nil, err }
-			return connection.Stream, nil
+	openForwarder := func(remote common.Hash) (*rpcmeshForwarder, error) {
+		forwarder, err := rpcmesh.OpenForwarder(ctx, rpcmesh.ForwarderConfig{
+			Signer: requesterKey,
+			ChainID: chainID,
+			LocalPeerID: requesterID,
+			RemotePeerID: remote,
+			Registry: requesterRegistry,
+			Dialer: carrier.TCPDialer{Timeout: 5 * time.Second},
 		})
+		if err != nil { return nil, err }
+		return &rpcmeshForwarder{forwarder: forwarder}, nil
 	}
-	forwarder0, err := startForwarder(provider0.id)
+	forwarder0, err := openForwarder(provider0.id)
 	if err != nil { return err }
 	defer forwarder0.Close()
-	forwarder1, err := startForwarder(provider1.id)
+	forwarder1, err := openForwarder(provider1.id)
 	if err != nil { return err }
 	defer forwarder1.Close()
 
@@ -210,11 +210,21 @@ func run(baseDir string) error {
 		if !strings.Contains(string(log), "[alloc_buffer]") {
 			return fmt.Errorf("RPC%d never received remote model allocation:\n%s", index, log)
 		}
+		if err := providerError(p); err != nil { return fmt.Errorf("RPC%d mesh error: %w", index, err) }
 	}
-	select { case err := <-errCh: return err; default: }
-	fmt.Printf("two-peer WQPU model inference allocated on RPC0 and RPC1: %q\n", text)
+	fmt.Printf("two-peer production rpcmesh model inference allocated on RPC0 and RPC1: %q\n", text)
 	return nil
 }
+
+// Keep the smoke independent of rpctunnel's concrete type while exposing only
+// the lifecycle and loopback address the llama runtime needs.
+type rpcmeshForwarder struct { forwarder interface {
+	Address() string
+	Close() error
+} }
+
+func (f *rpcmeshForwarder) Address() string { return f.forwarder.Address() }
+func (f *rpcmeshForwarder) Close() error { return f.forwarder.Close() }
 
 func main() {
 	if len(os.Args) != 3 || os.Args[1] != "--runtime-base" {
