@@ -10,6 +10,9 @@ on:
       - 'chain/cmd/wqpu-rpc-write-smoke/**'
       - 'chain/cmd/wqpu-registry-smoke/**'
       - 'chain/x/wqpu/precompile/**'
+      - 'client/internal/chainclient/**'
+      - 'client/internal/chainregistry/**'
+      - 'client/cmd/wqpu-chainclient-smoke/**'
       - '.github/workflows/wqpu-registry-live-smoke.yml'
   workflow_dispatch:
 
@@ -29,10 +32,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25.9'
-      - name: Resolve Go module checksums
+      - name: Resolve chain Go module checksums
         working-directory: chain
         run: go mod tidy
-      - name: Boot WQPU and verify peer control-session registry
+      - name: Resolve client Go module checksums
+        working-directory: client
+        run: go mod tidy
+      - name: Boot WQPU and verify production client registry
         shell: bash
         env:
           WQPU_CHAIN_SRC: ${{ runner.temp }}/cosmos-evm
@@ -40,6 +46,7 @@ jobs:
           WQPU_CHAIN_HOME: ${{ runner.temp }}/wqpu-home
         run: |
           set -euo pipefail
+          RPC='http://127.0.0.1:8545'
           WQPU_DEVNET_TEST_ADDRESS="$(cd chain && go run ./cmd/wqpu-rpc-write-smoke address)"
           export WQPU_DEVNET_TEST_ADDRESS
           LOG="${RUNNER_TEMP}/wqpu-registry-devnet.log"
@@ -53,7 +60,7 @@ jobs:
               cat "$LOG"
               exit 1
             fi
-            RESPONSE="$(curl -fsS -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' http://127.0.0.1:8545 2>/dev/null || true)"
+            RESPONSE="$(curl -fsS -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' "$RPC" 2>/dev/null || true)"
             if python3 - "$RESPONSE" <<'PY'
           import json, sys
           try:
@@ -73,6 +80,14 @@ jobs:
             exit 1
           fi
 
-          (cd chain && go run ./cmd/wqpu-rpc-write-smoke run http://127.0.0.1:8545)
-          (cd chain && go run ./cmd/wqpu-registry-smoke run http://127.0.0.1:8545)
-          echo 'Live WQPU chain-authorized peer registry passed.'
+          # Before any provider state exists, the production client must still
+          # prove it is connected to the exact WQPU chain and active 0x0900.
+          (cd client && go run ./cmd/wqpu-chainclient-smoke "$RPC" identity)
+
+          # Publish the deterministic CI-only provider through the production
+          # native write path, then compare both chain-side and client-side reads.
+          (cd chain && go run ./cmd/wqpu-rpc-write-smoke run "$RPC")
+          (cd chain && go run ./cmd/wqpu-registry-smoke run "$RPC")
+          (cd client && go run ./cmd/wqpu-chainclient-smoke "$RPC" published)
+
+          echo 'Live WQPU chain identity + production chainclient registry passed.'
