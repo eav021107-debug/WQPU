@@ -20,7 +20,7 @@ type ConnectConfig struct {
 	WQPUChainID     string
 	EVMChainID      uint64
 	RPCURL          string
-	SessionPubkey   string
+	SessionAddress  string
 	IssuedHeight    uint64
 	ExpiresHeight   uint64
 	MaxSpendUnits   uint64
@@ -35,10 +35,10 @@ type ConnectResult struct {
 }
 
 type Connector struct {
-	URL       string
-	Results   <-chan ConnectResult
-	server    *http.Server
-	listener  net.Listener
+	URL      string
+	Results  <-chan ConnectResult
+	server   *http.Server
+	listener net.Listener
 }
 
 func (c *Connector) Close(ctx context.Context) error {
@@ -77,7 +77,7 @@ func (cfg ConnectConfig) request(wallet string) SessionRequest {
 		WQPUChainID:     cfg.WQPUChainID,
 		EVMChainID:      cfg.EVMChainID,
 		Wallet:          wallet,
-		SessionPubkey:   cfg.SessionPubkey,
+		SessionAddress:  cfg.SessionAddress,
 		IssuedHeight:    cfg.IssuedHeight,
 		ExpiresHeight:   cfg.ExpiresHeight,
 		MaxSpendUnits:   cfg.MaxSpendUnits,
@@ -121,9 +121,7 @@ func StartConnector(ctx context.Context, cfg ConnectConfig) (*Connector, error) 
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 	}
-	checkHost := func(r *http.Request) bool {
-		return r.Host == ln.Addr().String()
-	}
+	checkHost := func(r *http.Request) bool { return r.Host == ln.Addr().String() }
 	checkPost := func(w http.ResponseWriter, r *http.Request) bool {
 		secureHeaders(w)
 		if r.Method != http.MethodPost || !checkHost(r) || r.Header.Get("Origin") != origin {
@@ -144,39 +142,26 @@ func StartConnector(ctx context.Context, cfg ConnectConfig) (*Connector, error) 
 		data := struct {
 			ChainHex string
 			RPCURL   string
-		}{
-			ChainHex: fmt.Sprintf("0x%x", cfg.EVMChainID),
-			RPCURL:   cfg.RPCURL,
-		}
+		}{ChainHex: fmt.Sprintf("0x%x", cfg.EVMChainID), RPCURL: cfg.RPCURL}
 		if err := connectorPage.Execute(w, data); err != nil {
 			http.Error(w, "page error", http.StatusInternalServerError)
 		}
 	})
 
 	mux.HandleFunc(base+"prepare", func(w http.ResponseWriter, r *http.Request) {
-		if !checkPost(w, r) {
-			return
-		}
+		if !checkPost(w, r) { return }
 		r.Body = http.MaxBytesReader(w, r.Body, 4096)
-		var body struct {
-			Wallet string `json:"wallet"`
-		}
+		var body struct { Wallet string `json:"wallet"` }
 		dec := json.NewDecoder(r.Body)
 		dec.DisallowUnknownFields()
 		if err := dec.Decode(&body); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
+			http.Error(w, "bad request", http.StatusBadRequest); return
 		}
 		typed, err := BuildSessionTypedData(cfg.request(body.Wallet))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
+		if err != nil { http.Error(w, err.Error(), http.StatusBadRequest); return }
 		mu.Lock()
 		if completed || (preparedWallet != "" && !strings.EqualFold(preparedWallet, body.Wallet)) {
-			mu.Unlock()
-			http.Error(w, "connector already bound to another wallet", http.StatusConflict)
-			return
+			mu.Unlock(); http.Error(w, "connector already bound to another wallet", http.StatusConflict); return
 		}
 		preparedWallet = body.Wallet
 		mu.Unlock()
@@ -185,61 +170,37 @@ func StartConnector(ctx context.Context, cfg ConnectConfig) (*Connector, error) 
 	})
 
 	mux.HandleFunc(base+"complete", func(w http.ResponseWriter, r *http.Request) {
-		if !checkPost(w, r) {
-			return
-		}
+		if !checkPost(w, r) { return }
 		r.Body = http.MaxBytesReader(w, r.Body, 4096)
 		var body ConnectResult
 		dec := json.NewDecoder(r.Body)
 		dec.DisallowUnknownFields()
-		if err := dec.Decode(&body); err != nil {
-			http.Error(w, "bad request", http.StatusBadRequest)
-			return
-		}
-		if !validHex(body.Wallet, 20) || !validHex(body.Signature, 65) {
-			http.Error(w, "invalid wallet response", http.StatusBadRequest)
-			return
-		}
+		if err := dec.Decode(&body); err != nil { http.Error(w, "bad request", http.StatusBadRequest); return }
+		if !validHex(body.Wallet, 20) || !validHex(body.Signature, 65) { http.Error(w, "invalid wallet response", http.StatusBadRequest); return }
 		mu.Lock()
 		if completed || preparedWallet == "" || !strings.EqualFold(preparedWallet, body.Wallet) {
-			mu.Unlock()
-			http.Error(w, "wallet response does not match prepared session", http.StatusConflict)
-			return
+			mu.Unlock(); http.Error(w, "wallet response does not match prepared session", http.StatusConflict); return
 		}
 		completed = true
 		mu.Unlock()
 		select {
 		case results <- body:
 		default:
-			http.Error(w, "connector already completed", http.StatusConflict)
-			return
+			http.Error(w, "connector already completed", http.StatusConflict); return
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"ok":true}`))
 	})
 
-	srv := &http.Server{
-		Handler:           mux,
-		ReadHeaderTimeout: 3 * time.Second,
-		ReadTimeout:       5 * time.Second,
-		WriteTimeout:      5 * time.Second,
-		IdleTimeout:       10 * time.Second,
-	}
-	connector := &Connector{
-		URL:      origin + base,
-		Results:  results,
-		server:   srv,
-		listener: ln,
-	}
+	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 3 * time.Second, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second, IdleTimeout: 10 * time.Second}
+	connector := &Connector{URL: origin + base, Results: results, server: srv, listener: ln}
 	go func() {
 		<-ctx.Done()
 		shutdown, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		defer cancel()
 		_ = srv.Shutdown(shutdown)
 	}()
-	go func() {
-		_ = srv.Serve(ln)
-	}()
+	go func() { _ = srv.Serve(ln) }()
 	return connector, nil
 }
 
