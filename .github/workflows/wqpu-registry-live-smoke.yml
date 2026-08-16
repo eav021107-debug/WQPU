@@ -1,0 +1,78 @@
+name: wqpu-registry-live-smoke
+
+on:
+  push:
+    branches: [next-foundation]
+    paths:
+      - 'chain/devnet.sh'
+      - 'chain/devnet_config.py'
+      - 'chain/runtime_patch*.py'
+      - 'chain/cmd/wqpu-rpc-write-smoke/**'
+      - 'chain/cmd/wqpu-registry-smoke/**'
+      - 'chain/x/wqpu/precompile/**'
+      - '.github/workflows/wqpu-registry-live-smoke.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  registry-live:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+      - name: Resolve Go module checksums
+        working-directory: chain
+        run: go mod tidy
+      - name: Boot WQPU and verify peer control-session registry
+        shell: bash
+        env:
+          WQPU_CHAIN_SRC: ${{ runner.temp }}/cosmos-evm
+          WQPU_CHAIN_BIN_DIR: ${{ runner.temp }}/wqpu-bin
+          WQPU_CHAIN_HOME: ${{ runner.temp }}/wqpu-home
+        run: |
+          set -euo pipefail
+          WQPU_DEVNET_TEST_ADDRESS="$(cd chain && go run ./cmd/wqpu-rpc-write-smoke address)"
+          export WQPU_DEVNET_TEST_ADDRESS
+          LOG="${RUNNER_TEMP}/wqpu-registry-devnet.log"
+          bash chain/devnet.sh --reset >"$LOG" 2>&1 &
+          PID=$!
+          trap 'kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true' EXIT
+
+          ready=0
+          for _ in $(seq 1 180); do
+            if ! kill -0 "$PID" 2>/dev/null; then
+              cat "$LOG"
+              exit 1
+            fi
+            RESPONSE="$(curl -fsS -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' http://127.0.0.1:8545 2>/dev/null || true)"
+            if python3 - "$RESPONSE" <<'PY'
+          import json, sys
+          try:
+              value = int(json.loads(sys.argv[1]).get("result", "0x0"), 16)
+          except Exception:
+              raise SystemExit(1)
+          raise SystemExit(0 if value >= 1 else 1)
+          PY
+            then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat "$LOG"
+            exit 1
+          fi
+
+          (cd chain && go run ./cmd/wqpu-rpc-write-smoke run http://127.0.0.1:8545)
+          (cd chain && go run ./cmd/wqpu-registry-smoke run http://127.0.0.1:8545)
+          echo 'Live WQPU chain-authorized peer registry passed.'
