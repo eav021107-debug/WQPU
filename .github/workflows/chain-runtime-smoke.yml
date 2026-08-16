@@ -8,12 +8,6 @@ on:
       - 'chain/devnet.sh'
       - 'chain/devnet_config.py'
       - '.github/workflows/chain-runtime-smoke.yml'
-  pull_request:
-    paths:
-      - 'chain/runtime.lock'
-      - 'chain/devnet.sh'
-      - 'chain/devnet_config.py'
-      - '.github/workflows/chain-runtime-smoke.yml'
   workflow_dispatch:
 
 permissions:
