@@ -10,6 +10,7 @@ on:
       - 'client/internal/peertransport/**'
       - 'client/internal/rpctunnel/**'
       - 'client/internal/rpcmesh/**'
+      - 'client/internal/computenode/**'
       - 'client/internal/sessionkey/**'
       - 'client/internal/transport/**'
       - 'client/cmd/wqpu-runtime-install/**'
@@ -114,17 +115,19 @@ jobs:
           grep -F 'tiny model inference crossed remote WQPU RPC0 with remote allocation' model-smoke.log
           grep -F '[alloc_buffer]' "$WQPU_RUNTIME_BASE/model-smoke-rpc.log"
 
-      - name: Split one tiny model across two production WQPU rpcmesh peers
+      - name: Split one tiny model across two equal production WQPU compute nodes
         shell: bash
         run: |
           set -euo pipefail
-          # This final proof uses the reusable production rpcmesh package, not
-          # smoke-specific accept/dial glue. Two ProviderServices expose fixed
-          # loopback RPC backends through bounded authenticated SecureStreams;
-          # two rpcmesh requester forwarders feed one llama-server. Both remote
-          # backend logs must show actual model allocation.
+          # Three equal computenode.Node instances are started. One happens to
+          # originate this request; the other two become RPC0/RPC1. The caller
+          # only supplies peer IDs to StartHFFileInference. Runtime installation,
+          # managed local RPC backends, bounded provider rpcmesh, requester
+          # forwarders, device mapping and llama-server lifecycle are all owned
+          # by production data-plane packages. Both remote backend logs must show
+          # actual model allocation.
           (cd client && go run ./cmd/wqpu-llama-multipeer-smoke --runtime-base "$WQPU_RUNTIME_BASE") 2>&1 | tee multipeer-smoke.log
-          grep -F 'two-peer production rpcmesh model inference allocated on RPC0 and RPC1' multipeer-smoke.log
+          grep -F 'three equal WQPU compute nodes split one model across RPC0 and RPC1' multipeer-smoke.log
           grep -F '[alloc_buffer]' "$WQPU_RUNTIME_BASE/multipeer-rpc-0.log"
           grep -F '[alloc_buffer]' "$WQPU_RUNTIME_BASE/multipeer-rpc-1.log"
-          echo 'Production rpcmesh two-peer model allocation and inference smoke passed.'
+          echo 'Equal-node WQPU distributed model allocation and inference smoke passed.'
