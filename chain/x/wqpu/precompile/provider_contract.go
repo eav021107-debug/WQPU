@@ -80,7 +80,7 @@ func (c ProviderNetworkContract) Run(evm *vm.EVM, contract *vm.Contract, readOnl
 	}
 
 	snapshot := evm.StateDB.Snapshot()
-	if err := CommitProviderPublish(evm.StateDB, envelope, c.config, height); err != nil {
+	if err := CommitProviderPublishV2(evm.StateDB, envelope, c.config, height); err != nil {
 		evm.StateDB.RevertToSnapshot(snapshot)
 		return nil, err
 	}
