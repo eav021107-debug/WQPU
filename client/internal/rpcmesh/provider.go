@@ -42,6 +42,9 @@ type ProviderService struct {
 	once     sync.Once
 	workers  sync.WaitGroup
 	active   atomic.Int64
+
+	connMu sync.Mutex
+	conns  map[net.Conn]struct{}
 }
 
 func validateProviderConfig(config ProviderConfig) (ProviderConfig, error) {
@@ -86,6 +89,7 @@ func StartProviderOnListener(parent context.Context, listener net.Listener, conf
 		sem: make(chan struct{}, validated.MaxConnections),
 		errors: make(chan error, providerErrorBuffer),
 		done: make(chan struct{}),
+		conns: make(map[net.Conn]struct{}),
 	}
 	go service.serve()
 	return service, nil
@@ -97,6 +101,26 @@ func (s *ProviderService) report(err error) {
 	case s.errors <- err:
 	default:
 	}
+}
+
+func (s *ProviderService) track(raw net.Conn) {
+	s.connMu.Lock()
+	s.conns[raw] = struct{}{}
+	s.connMu.Unlock()
+}
+
+func (s *ProviderService) untrack(raw net.Conn) {
+	s.connMu.Lock()
+	delete(s.conns, raw)
+	s.connMu.Unlock()
+}
+
+func (s *ProviderService) closeActiveCarriers() {
+	s.connMu.Lock()
+	connections := make([]net.Conn, 0, len(s.conns))
+	for raw := range s.conns { connections = append(connections, raw) }
+	s.connMu.Unlock()
+	for _, raw := range connections { _ = raw.Close() }
 }
 
 func (s *ProviderService) serve() {
@@ -114,6 +138,7 @@ func (s *ProviderService) serve() {
 		}
 		select {
 		case s.sem <- struct{}{}:
+			s.track(raw)
 			s.active.Add(1)
 			s.workers.Add(1)
 			go s.handle(raw)
@@ -126,6 +151,8 @@ func (s *ProviderService) serve() {
 
 func (s *ProviderService) handle(raw net.Conn) {
 	defer func() {
+		s.untrack(raw)
+		_ = raw.Close()
 		<-s.sem
 		s.active.Add(-1)
 		s.workers.Done()
@@ -175,6 +202,7 @@ func (s *ProviderService) Close() error {
 	s.once.Do(func() {
 		s.cancel()
 		closeErr = s.listener.Close()
+		s.closeActiveCarriers()
 	})
 	<-s.done
 	if errors.Is(closeErr, net.ErrClosed) { return nil }
