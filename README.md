@@ -112,3 +112,14 @@ WQPU_CPU_FRACTION=0.35 wqpu
 ```
 
 Model quality is determined by the selected GGUF model/quantization. Distribution itself does not requantize the model. The default small Gemma model is only for connectivity testing.
+
+## Decentralized compute economy prototype
+
+The repository now also contains the first blockchain-side market layer. It is deliberately not wired into the 0.5.3 runtime yet, so networking tests remain isolated from payment experiments.
+
+- `contracts/WQPUToken.sol` — fixed-supply WQPU token; there is no post-deployment mint function.
+- `contracts/WQPURegistry.sol` — permissionless public directory where any wallet can announce its peer endpoint, price and capacity.
+- `contracts/WQPUComputeMarket.sol` — requester deposits existing WQPU and providers claim cumulative wallet-signed compute vouchers.
+- `ECONOMY.md` — economic model and integration plan.
+
+The target UX is still one install command followed by wallet connection and then `wqpu>`. Seed phrases and private keys must never be entered into WQPU.
