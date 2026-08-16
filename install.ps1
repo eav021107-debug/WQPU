@@ -5,19 +5,25 @@ $bin = Join-Path $root 'bin'
 New-Item -ItemType Directory -Force -Path $root, $bin | Out-Null
 
 function Find-Python {
-    foreach ($cmd in @('python','python3','py')) {
+    foreach ($cmd in @('py','python','python3')) {
         $found = Get-Command $cmd -ErrorAction SilentlyContinue
-        if ($found) {
-            if ($cmd -eq 'py') { return @($found.Source, '-3') }
-            return @($found.Source)
-        }
+        if (-not $found) { continue }
+        try {
+            if ($cmd -eq 'py') {
+                & $found.Source -3 -c "import sys; assert sys.version_info >= (3,10)" 2>$null
+                if ($LASTEXITCODE -eq 0) { return [pscustomobject]@{ Exe = $found.Source; Extra = '-3' } }
+            } else {
+                & $found.Source -c "import sys; assert sys.version_info >= (3,10)" 2>$null
+                if ($LASTEXITCODE -eq 0) { return [pscustomobject]@{ Exe = $found.Source; Extra = '' } }
+            }
+        } catch { }
     }
     return $null
 }
 
 $py = Find-Python
 if (-not $py) {
-    Write-Host 'WQPU: Python not found. Installing Python for the current user...'
+    Write-Host 'WQPU: Python 3.10+ not found. Installing Python for the current user...'
     $winget = Get-Command winget -ErrorAction SilentlyContinue
     if (-not $winget) {
         throw 'Python is missing and winget is unavailable. Install Python 3.10+ once, then run the WQPU command again.'
@@ -25,16 +31,19 @@ if (-not $py) {
     winget install -e --id Python.Python.3.12 --scope user --accept-package-agreements --accept-source-agreements --silent
     $env:Path = [Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')
     $py = Find-Python
-    if (-not $py) { throw 'Python installation finished but python was not found in PATH. Open a new PowerShell window and run the WQPU command again.' }
+    if (-not $py) { throw 'Python installation finished but was not found in this shell. Open a new PowerShell window and run the WQPU command again.' }
 }
 
 $script = Join-Path $root 'wqpu.py'
 Invoke-WebRequest -UseBasicParsing "$repo/wqpu.py" -OutFile $script
 
 $launcher = Join-Path $bin 'wqpu.cmd'
-$pyExe = $py[0]
-$pyExtra = if ($py.Count -gt 1) { $py[1] } else { '' }
-$cmdText = "@echo off`r`n`"$pyExe`" $pyExtra `"$script`" %*`r`n"
+$pyExe = $py.Exe
+$pyExtra = $py.Extra
+$cmdText = @"
+@echo off
+"$pyExe" $pyExtra "$script" %*
+"@
 Set-Content -Path $launcher -Value $cmdText -Encoding ASCII
 
 $userPath = [Environment]::GetEnvironmentVariable('Path','User')
