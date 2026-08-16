@@ -92,6 +92,14 @@ func StartProviderOnListener(parent context.Context, listener net.Listener, conf
 		conns: make(map[net.Conn]struct{}),
 	}
 	go service.serve()
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = listener.Close()
+			service.closeActiveCarriers()
+		case <-service.done:
+		}
+	}()
 	return service, nil
 }
 
@@ -134,6 +142,8 @@ func (s *ProviderService) serve() {
 		if err != nil {
 			if s.ctx.Err() != nil || errors.Is(err, net.ErrClosed) { return }
 			s.report(fmt.Errorf("WQPU RPC provider accept: %w", err))
+			s.cancel()
+			s.closeActiveCarriers()
 			return
 		}
 		select {
