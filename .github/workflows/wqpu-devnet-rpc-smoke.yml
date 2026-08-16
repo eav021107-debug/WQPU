@@ -11,6 +11,7 @@ on:
       - 'chain/runtime_patch_settlement.py'
       - 'chain/cmd/wqpu-selector/**'
       - 'chain/cmd/wqpu-rpc-write-smoke/**'
+      - 'chain/cmd/wqpu-economic-smoke/**'
       - 'chain/x/wqpu/precompile/**'
       - '.github/workflows/wqpu-devnet-rpc-smoke.yml'
   workflow_dispatch:
@@ -52,9 +53,12 @@ jobs:
           EPOCH_SELECTOR="$(selector 'priceEpoch()')"
           BONDED_SELECTOR="$(selector 'bondedPriceCapacity()')"
 
-          # The write-smoke command contains an explicitly public devnet-only key.
+          # Both live helpers use the same explicitly public devnet-only wallet.
           # Only its derived address is passed into genesis funding.
-          WQPU_DEVNET_TEST_ADDRESS="$(cd chain && go run ./cmd/wqpu-rpc-write-smoke address)"
+          WRITE_ADDRESS="$(cd chain && go run ./cmd/wqpu-rpc-write-smoke address)"
+          ECONOMIC_ADDRESS="$(cd chain && go run ./cmd/wqpu-economic-smoke address)"
+          test "$WRITE_ADDRESS" = "$ECONOMIC_ADDRESS"
+          WQPU_DEVNET_TEST_ADDRESS="$WRITE_ADDRESS"
           export WQPU_DEVNET_TEST_ADDRESS
 
           LOG="${RUNNER_TEMP}/wqpu-devnet.log"
@@ -131,9 +135,13 @@ jobs:
           assert_uint "$(rpc_call "$EPOCH_SELECTOR")" 0
           assert_uint "$(rpc_call "$BONDED_SELECTOR")" 0
 
-          # Signed write path: authorize session -> publish peer -> native bond ->
-          # close bonded price epoch -> native unbond/refund.
+          # Basic signed write path: authorize -> publish -> native bond ->
+          # bonded global-price epoch -> native unbond/refund.
           (cd chain && go run ./cmd/wqpu-rpc-write-smoke run http://127.0.0.1:8545)
 
+          # Full production economic path with two independent temporary sessions:
+          # fund -> reserve -> dual-signed receipt -> finalize payout -> refund.
+          (cd chain && go run ./cmd/wqpu-economic-smoke run http://127.0.0.1:8545)
+
           grep -F 'precompile:    0x0000000000000000000000000000000000000900' "$LOG"
-          echo 'Live WQPU 0x0900 read/write JSON-RPC smoke passed.'
+          echo 'Live WQPU 0x0900 read/write and full economic-cycle smoke passed.'
