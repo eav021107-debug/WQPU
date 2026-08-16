@@ -4,33 +4,81 @@ $root = Join-Path $env:LOCALAPPDATA 'WQPU'
 $bin = Join-Path $root 'bin'
 $join = $env:WQPU_JOIN
 
+New-Item -ItemType Directory -Force -Path $root,$bin | Out-Null
+
+function Test-Python($exe, $extra) {
+  try {
+    if ($extra) { & $exe $extra -c "import sys; raise SystemExit(0 if sys.version_info >= (3,6) else 1)" 2>$null }
+    else { & $exe -c "import sys; raise SystemExit(0 if sys.version_info >= (3,6) else 1)" 2>$null }
+    return ($LASTEXITCODE -eq 0)
+  } catch { return $false }
+}
+
 function Find-Python {
+  $private = Join-Path $root 'python\python.exe'
+  if ((Test-Path $private) -and (Test-Python $private '')) { return @{Exe=$private; Extra=''} }
   foreach ($cmd in @('py','python','python3')) {
     $f = Get-Command $cmd -ErrorAction SilentlyContinue
     if (-not $f) { continue }
-    try {
-      if ($cmd -eq 'py') {
-        & $f.Source -3 -c "import sys; assert sys.version_info >= (3,10)" 2>$null
-        if ($LASTEXITCODE -eq 0) { return @{Exe=$f.Source; Extra='-3'} }
-      } else {
-        & $f.Source -c "import sys; assert sys.version_info >= (3,10)" 2>$null
-        if ($LASTEXITCODE -eq 0) { return @{Exe=$f.Source; Extra=''} }
-      }
-    } catch {}
+    if ($cmd -eq 'py') {
+      if (Test-Python $f.Source '-3') { return @{Exe=$f.Source; Extra='-3'} }
+    } elseif (Test-Python $f.Source '') {
+      return @{Exe=$f.Source; Extra=''}
+    }
   }
   return $null
 }
 
-$py = Find-Python
-if (-not $py) { throw 'WQPU needs Python 3.10+.' }
-if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) { throw 'WQPU needs OpenSSL in PATH.' }
+function Install-PrivatePython {
+  Write-Host 'WQPU: compatible Python not found; installing a private Python for WQPU only...'
+  $target = Join-Path $root 'python'
+  $installer = Join-Path $env:TEMP 'wqpu-python-installer.exe'
+  $url = 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-amd64.exe'
+  if ($env:PROCESSOR_ARCHITECTURE -eq 'ARM64') {
+    $url = 'https://www.python.org/ftp/python/3.12.10/python-3.12.10-arm64.exe'
+  }
+  Invoke-WebRequest -UseBasicParsing $url -OutFile $installer
+  $args = @('/quiet','InstallAllUsers=0',"TargetDir=$target",'Include_launcher=0','Include_pip=0','PrependPath=0','Shortcuts=0')
+  $p = Start-Process -FilePath $installer -ArgumentList $args -Wait -PassThru
+  Remove-Item $installer -Force -ErrorAction SilentlyContinue
+  if ($p.ExitCode -ne 0) { throw "Python installer failed with exit code $($p.ExitCode)." }
+  $exe = Join-Path $target 'python.exe'
+  if (-not (Test-Python $exe '')) { throw 'Private Python installation did not produce a usable Python.' }
+}
 
-New-Item -ItemType Directory -Force -Path $root,$bin | Out-Null
+$py = Find-Python
+if (-not $py) {
+  Install-PrivatePython
+  $py = Find-Python
+}
+if (-not $py) { throw 'WQPU could not prepare a compatible Python.' }
+
+if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
+  $git = Get-Command git -ErrorAction SilentlyContinue
+  if ($git) {
+    $gitRoot = Split-Path (Split-Path $git.Source -Parent) -Parent
+    $gitOpenSsl = Join-Path $gitRoot 'usr\bin'
+    if (Test-Path (Join-Path $gitOpenSsl 'openssl.exe')) { $env:Path="$gitOpenSsl;$env:Path" }
+  }
+}
+if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
+  throw 'WQPU needs OpenSSL. Install Git for Windows or OpenSSL, then run the same command again.'
+}
+
 $script = Join-Path $root 'wqpu.py'
-Invoke-WebRequest -UseBasicParsing "$raw/wqpu.py" -OutFile $script
-$launcher = Join-Path $bin 'wqpu.cmd'
+Invoke-WebRequest -UseBasicParsing "$raw/wqpu.py?version=0.5.1" -OutFile $script
+
 $exe=$py.Exe; $extra=$py.Extra
-Set-Content -Encoding ASCII -Path $launcher -Value "@echo off`r`n`"$exe`" $extra `"$script`" %*"
+if ($extra) { & $exe $extra -m py_compile $script }
+else { & $exe -m py_compile $script }
+if ($LASTEXITCODE -ne 0) { throw 'Downloaded WQPU core did not pass the Python compatibility check.' }
+
+$launcher = Join-Path $bin 'wqpu.cmd'
+if ($extra) {
+  Set-Content -Encoding ASCII -Path $launcher -Value "@echo off`r`n`"$exe`" $extra `"$script`" %*"
+} else {
+  Set-Content -Encoding ASCII -Path $launcher -Value "@echo off`r`n`"$exe`" `"$script`" %*"
+}
 
 $userPath=[Environment]::GetEnvironmentVariable('Path','User')
 if (-not (($userPath -split ';') -contains $bin)) {
@@ -38,7 +86,8 @@ if (-not (($userPath -split ';') -contains $bin)) {
 }
 $env:Path="$bin;$env:Path"
 
-Write-Host 'WQPU installed. Starting this computer as an equal peer...' -ForegroundColor Green
+$ver = if ($extra) { (& $exe $extra --version 2>&1) } else { (& $exe --version 2>&1) }
+Write-Host "WQPU installed with $ver. Starting this computer as an equal peer..." -ForegroundColor Green
 if ([string]::IsNullOrWhiteSpace($join)) {
   & $launcher
 } else {
