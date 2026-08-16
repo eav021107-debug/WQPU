@@ -1,87 +1,100 @@
 # WQPU 0.5
 
-**Equal-peer distributed LLM over the WQPU protocol. No Tailscale and no permanent coordinator.**
+WQPU is an experimental **equal-peer distributed LLM network** built around `llama.cpp` RPC.
 
-Every contributor computer has the same role. The VPS is only an encrypted meeting point/relay for machines behind NAT. It does not run the model and it does not choose a leader.
-
-```text
-Mac ─────┐
-Windows ─┼── encrypted WQPU relay ── equal peers
-Linux ───┘
-```
-
-## How a question works
-
-If a question is asked on PC A, only PC A temporarily coordinates that request:
+There is no permanent coordinator and no dedicated relay program. Every computer runs the same `wqpu.py` and has the same rights and functions.
 
 ```text
-question on A -> A connects online peers as helpers -> answer returns to A -> temporary coordinator stops
+Mac <----> Windows <----> Linux/VPS <----> other WQPU peers
+  \____________ equal-peer WQPU mesh ______________/
 ```
 
-If the next question is asked on PC C, PC C does the same. There is no permanent main computer and no peer has extra rights.
+## What every node does
 
-Each online peer keeps only a localhost `ggml-rpc-server` running and contributes about 50% of its logical CPU threads. A temporary `llama-server` exists only while that computer is answering its own user's request.
+Every online WQPU node:
 
-## 1. Install the relay on the VPS
+- contributes part of its CPU/RAM through a localhost-only `ggml-rpc-server`;
+- listens for WQPU peer connections when its network allows it;
+- connects outbound to known peers;
+- exchanges learned peer addresses and TLS fingerprints;
+- can temporarily relay an RPC stream for two other peers;
+- can ask its own questions.
 
-Run once:
+When a question is typed on a computer, **that computer coordinates only its own request**. It temporarily connects available workers, starts its own local `llama-server`, gets the answer, then tears the request coordinator down.
+
+Several computers can originate requests at the same time. There is no permanent leader election.
+
+## Install and immediately enter the CLI
+
+### macOS / Linux
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install-relay.sh | sudo sh
+curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh | sh
 ```
 
-The installer prints private join commands for Linux/macOS and Windows. Only TCP `7443` needs to be reachable on the VPS.
+### Windows PowerShell
 
-## 2. Join contributor computers
+```powershell
+irm https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1 | iex
+```
 
-Use the command printed by the relay. Linux/macOS looks like:
+The installer immediately starts the interactive CLI in the **same terminal**:
+
+```text
+wqpu> hello
+wqpu> /status
+wqpu> /peers
+wqpu> /exit
+```
+
+## Creating and joining a network
+
+The first node can start with no join code. It creates a private network secret locally.
+
+To invite another computer, the first reachable node types:
+
+```text
+/invite PUBLIC_HOST:7443
+```
+
+WQPU prints a private `WQPU1...` join code. On macOS/Linux the other computer can join with:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install-node.sh | sh -s -- 'WQPU1....'
+WQPU_JOIN='WQPU1...' curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh | sh
 ```
 
-Keep that terminal open while the computer contributes. In another terminal:
+On Windows:
 
-```bash
-wqpu status
-wqpu ask "Hello, who are you?"
+```powershell
+$env:WQPU_JOIN='WQPU1...'; irm https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1 | iex
 ```
 
-## Access rule
+The first address is only an introduction. After connection, nodes exchange peer information and cache other reachable peers. Any reachable WQPU node can perform the same introduction/relay function; there is no special VPS role in the protocol.
 
-The MVP rule is: a node that is authenticated, online, and running its contributor worker can ask questions. Precise contribution accounting/credits are not implemented yet.
+## Internet/NAT reality
+
+A brand-new computer cannot discover a private network on the global Internet from literally zero information. It needs at least one address of an existing peer for first contact.
+
+WQPU 0.5 avoids a dedicated relay service by making **every node capable of relaying**. Nodes reachable from the Internet naturally become useful routes for peers behind NAT, but they receive no extra permissions and run exactly the same software.
+
+If every single peer is behind restrictive NAT/firewalls and none is reachable, the mesh needs a port-forwarded/publicly reachable ordinary WQPU peer before those isolated groups can meet. Reliable universal NAT hole punching without any external rendezvous infrastructure is not physically guaranteed, so WQPU does not pretend otherwise.
 
 ## Security
 
-The join token contains the relay address, a random shared cluster secret, and a pinned SHA-256 fingerprint of the relay TLS certificate. Peers verify that fingerprint before sending traffic.
+- WQPU peer traffic uses TLS.
+- The join code carries a private network secret plus trusted bootstrap peer fingerprints.
+- Learned fingerprints are propagated through authenticated peers.
+- `llama.cpp` RPC stays on `127.0.0.1:50052` and is never intentionally exposed directly to the Internet.
+- Keep `WQPU1...` join codes private.
 
-`llama.cpp` RPC is bound only to `127.0.0.1`. WQPU carries RPC through the encrypted relay, so TCP `50052` is not exposed to the public Internet.
+This is still an experimental prototype, not a hardened public compute marketplace.
 
-## Model
+## Resource policy
 
-The default test model is:
+By default WQPU uses about 50% of logical CPU threads for contribution. Override temporarily with:
 
-```text
-ggml-org/gemma-3-1b-it-GGUF:Q4_K_M
+```bash
+WQPU_CPU_FRACTION=0.35 wqpu
 ```
 
-Set `WQPU_MODEL` before asking if you want another compatible Hugging Face GGUF repo. Distribution itself does not change or requantize the weights.
-
-## Current files
-
-The project intentionally stays small:
-
-- `wqpu.py` — the only peer client;
-- `relay.py` — relay/rendezvous only;
-- `install-node.sh` — Linux/macOS peer installer;
-- `install-node.ps1` — Windows peer installer;
-- `install-relay.sh` — VPS relay installer;
-- `README.md` — this documentation.
-
-## Current limitations
-
-- CPU backend first; automatic GPU acceleration is not implemented yet.
-- WAN RPC can be slow because inference is sensitive to latency and bandwidth.
-- Multiple simultaneous request-originators can compete for the same contributor resources; admission control still needs stress testing.
-- Authentication uses one shared cluster join token in this MVP; per-user identities/credits are not implemented yet.
-- This is an experimental prototype, not yet a hardened public compute marketplace.
+Model quality is determined by the selected GGUF model/quantization. Distribution itself does not requantize the model. The default small Gemma model is only for connectivity testing.
