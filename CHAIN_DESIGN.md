@@ -14,12 +14,15 @@ Development/test values:
 
 ```text
 chain-id: wqpu-dev-1
+EVM chain-id: 711711
 native display denom: WQPU
-native base denom: uwqpu
-1 WQPU = 1,000,000 uwqpu
+native base denom: awqpu
+1 WQPU = 1,000,000,000,000,000,000 awqpu
 ```
 
-Production genesis and final denomination parameters are deliberately not fixed yet.
+The 18-decimal base denomination keeps the native WQPU coin compatible with common EVM-wallet amount conventions. Users see `WQPU`; `awqpu` is internal base-unit accounting.
+
+Production genesis parameters are deliberately not fixed yet.
 
 ## External-chain independence
 
@@ -36,11 +39,11 @@ Optional bridges/interoperability may be added later but cannot be required for 
 
 ## Wallet connection
 
-Users connect an existing wallet. WQPU never generates or imports a seed phrase.
+Users connect an existing wallet. WQPU never generates or imports a user seed phrase or user private key.
 
-The wallet performs a one-time explicit authorization for a short-lived WQPU session key. That delegation is verified by the WQPU chain application and has strict expiry/spend/job limits.
+The wallet performs an explicit authorization for a short-lived WQPU session key. That delegation is chain-bound, replay-bounded by a revocation nonce, and has strict expiry, spend, per-job and permission limits.
 
-The local WQPU client then uses the delegated session key for background provider heartbeats, job reservations and bounded micropayment settlement without repeatedly asking the wallet to pop up for every token or tensor operation.
+The local WQPU client then uses the delegated session key for background provider heartbeats, job reservations and bounded settlement without repeatedly asking the wallet to pop up for every token or tensor operation.
 
 ## Native WQPU coin
 
@@ -58,11 +61,13 @@ The WQPU-specific application module owns the following consensus state.
 
 Keyed by wallet + session public key:
 
+- chain ID and protocol version;
 - expiry height;
 - maximum total spend;
 - maximum single job value;
 - revocation nonce;
-- permissions bitset.
+- permissions bitset;
+- currently reserved and already settled spend.
 
 ### 2. Provider registry
 
@@ -89,6 +94,8 @@ Before paid compute starts, the requester creates a bounded reservation containi
 - chosen providers;
 - reserved capacity per provider;
 - timeout height.
+
+The maximum payment and provider capacity are reserved **before** work starts. A failed reservation must change no state. Completion settles only the verified actual charge; timeout releases unused payment and compute capacity.
 
 Reservations are what the chain uses as the authoritative demand/load floor. A provider cannot move the global price merely by claiming to be busy.
 
