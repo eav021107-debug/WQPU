@@ -11,6 +11,7 @@ on:
       - 'client/internal/rpctunnel/**'
       - 'client/internal/sessionkey/**'
       - 'client/internal/transport/**'
+      - 'client/cmd/wqpu-runtime-install/**'
       - 'client/cmd/wqpu-llama-rpc-smoke/**'
       - '.github/workflows/llama-runtime-smoke.yml'
   workflow_dispatch:
@@ -37,27 +38,38 @@ jobs:
         working-directory: client
         run: go mod tidy
 
-      - name: Download exact official llama.cpp b10453 CPU archive
+      - name: Install exact official llama.cpp through production WQPU installer
         shell: bash
         run: |
           set -euo pipefail
-          URL='https://github.com/ggml-org/llama.cpp/releases/download/b10453/llama-b10453-bin-ubuntu-x64.tar.gz'
-          SHA='550eb155a09c3051c7add5becf6d0badc3a4c33416807985963036b27b859fb4'
-          curl --fail --location --retry 3 --output llama.tar.gz "$URL"
-          printf '%s  %s\n' "$SHA" llama.tar.gz | sha256sum --check --strict
-          mkdir runtime
-          tar -xzf llama.tar.gz -C runtime
+          BASE="${RUNNER_TEMP}/wqpu-runtime"
+          (cd client && go run ./cmd/wqpu-runtime-install "$BASE") > runtime.paths
+          cat runtime.paths
 
-      - name: Verify exact RPC/server/CLI binaries and current flags
-        shell: bash
-        run: |
-          set -euo pipefail
-          RPC="$(find runtime -type f -name 'ggml-rpc-server' -print -quit)"
-          SERVER="$(find runtime -type f -name 'llama-server' -print -quit)"
-          CLI="$(find runtime -type f -name 'llama-cli' -print -quit)"
+          TAG="$(sed -n 's/^tag=//p' runtime.paths)"
+          ROOT="$(sed -n 's/^root=//p' runtime.paths)"
+          RPC="$(sed -n 's/^rpc=//p' runtime.paths)"
+          SERVER="$(sed -n 's/^server=//p' runtime.paths)"
+          CLI="$(sed -n 's/^cli=//p' runtime.paths)"
+
+          test "$TAG" = 'b10453'
+          test -n "$ROOT" && test -d "$ROOT"
           test -n "$RPC" && test -x "$RPC"
           test -n "$SERVER" && test -x "$SERVER"
           test -n "$CLI" && test -x "$CLI"
+          case "$ROOT" in "$BASE"/*) ;; *) echo 'runtime escaped WQPU base directory' >&2; exit 1;; esac
+
+          # A second invocation must safely reuse the complete installed runtime.
+          (cd client && go run ./cmd/wqpu-runtime-install "$BASE") > runtime.second.paths
+          cmp runtime.paths runtime.second.paths
+
+      - name: Verify installed RPC/server/CLI flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          RPC="$(sed -n 's/^rpc=//p' runtime.paths)"
+          SERVER="$(sed -n 's/^server=//p' runtime.paths)"
+          CLI="$(sed -n 's/^cli=//p' runtime.paths)"
 
           "$RPC" --help > rpc.help 2>&1
           grep -F -- '--host HOST' rpc.help
@@ -79,8 +91,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          RPC="$(realpath "$(find runtime -type f -name 'ggml-rpc-server' -print -quit)")"
-          CLI="$(realpath "$(find runtime -type f -name 'llama-cli' -print -quit)")"
+          RPC="$(sed -n 's/^rpc=//p' runtime.paths)"
+          CLI="$(sed -n 's/^cli=//p' runtime.paths)"
 
           "$RPC" --host 127.0.0.1 --port 50053 --threads 1 > rpc.log 2>&1 &
           PID=$!
@@ -110,8 +122,8 @@ jobs:
             exit 1
           fi
 
-          # llama-cli never receives 50053. It only sees a random local WQPU
-          # forwarder; the helper authenticates both peer sessions, encrypts the
-          # stream, then the provider bridges it to the fixed loopback RPC target.
+          # llama-cli never receives 50053. It sees only the random local WQPU
+          # forwarder; WQPU authenticates both sessions, encrypts the carrier,
+          # and the provider bridges only to this fixed loopback RPC target.
           (cd client && go run ./cmd/wqpu-llama-rpc-smoke "$CLI" 127.0.0.1:50053)
-          echo 'Pinned official llama.cpp RPC crossed WQPU SecureStream.'
+          echo 'Production WQPU installer + official llama.cpp RPC SecureStream smoke passed.'
