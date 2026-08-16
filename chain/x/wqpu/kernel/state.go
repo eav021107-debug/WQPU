@@ -236,7 +236,7 @@ func (s *State) ReserveJob(j JobReservation) error {
 			return errors.New("provider heartbeat expires before job")
 		}
 		current := s.ReservedByPeer[provider.PeerID]
-		if reservation.ReservedComputeUnits > provider.CapacityUnits-current {
+		if current > provider.CapacityUnits || reservation.ReservedComputeUnits > provider.CapacityUnits-current {
 			return errors.New("provider capacity already reserved")
 		}
 	}
@@ -251,12 +251,18 @@ func (s *State) ReserveJob(j JobReservation) error {
 	return nil
 }
 
-func (s *State) releaseJobResources(j JobReservation) error {
+func (s *State) canReleaseJobResources(j JobReservation) error {
 	for _, reservation := range j.Providers {
-		current := s.ReservedByPeer[reservation.ProviderPeerID]
-		if reservation.ReservedComputeUnits > current {
+		if reservation.ReservedComputeUnits > s.ReservedByPeer[reservation.ProviderPeerID] {
 			return errors.New("corrupt provider reservation accounting")
 		}
+	}
+	return nil
+}
+
+func (s *State) releaseJobResources(j JobReservation) {
+	for _, reservation := range j.Providers {
+		current := s.ReservedByPeer[reservation.ProviderPeerID]
 		remaining := current - reservation.ReservedComputeUnits
 		if remaining == 0 {
 			delete(s.ReservedByPeer, reservation.ProviderPeerID)
@@ -264,7 +270,6 @@ func (s *State) releaseJobResources(j JobReservation) error {
 			s.ReservedByPeer[reservation.ProviderPeerID] = remaining
 		}
 	}
-	return nil
 }
 
 // CloseJob is called only after receipt verification determines the actual charge.
@@ -273,41 +278,57 @@ func (s *State) CloseJob(jobID string, actualCharge uint64) error {
 	if !ok {
 		return errors.New("unknown job")
 	}
-	if actualCharge > j.MaxChargeUnits {
-		return errors.New("actual charge exceeds job maximum")
-	}
 	session, err := s.session(j.RequesterWallet, j.RequesterSessionPubkey)
 	if err != nil {
 		return err
 	}
-	if err := s.releaseJobResources(j); err != nil {
+	if err := session.CanSettle(j.MaxChargeUnits, actualCharge); err != nil {
 		return err
 	}
-	if err := session.Settle(j.MaxChargeUnits, actualCharge); err != nil {
+	if err := s.canReleaseJobResources(j); err != nil {
 		return err
+	}
+
+	// All fallible checks are complete; commit both accounting changes together.
+	s.releaseJobResources(j)
+	if err := session.Settle(j.MaxChargeUnits, actualCharge); err != nil {
+		panic(err) // invariant violation after successful preflight
 	}
 	delete(s.Jobs, jobID)
 	return nil
 }
 
-func (s *State) expireJobs() error {
-	for id, j := range s.Jobs {
-		if j.ExpiresHeight > s.Height {
+func (s *State) preflightExpiry(targetHeight uint64) error {
+	for _, j := range s.Jobs {
+		if j.ExpiresHeight > targetHeight {
 			continue
 		}
 		session, err := s.session(j.RequesterWallet, j.RequesterSessionPubkey)
 		if err != nil {
 			return err
 		}
-		if err := s.releaseJobResources(j); err != nil {
+		if err := session.CanRelease(j.MaxChargeUnits); err != nil {
 			return err
 		}
-		if err := session.Release(j.MaxChargeUnits); err != nil {
+		if err := s.canReleaseJobResources(j); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func (s *State) expireJobs() {
+	for id, j := range s.Jobs {
+		if j.ExpiresHeight > s.Height {
+			continue
+		}
+		session, _ := s.session(j.RequesterWallet, j.RequesterSessionPubkey)
+		s.releaseJobResources(j)
+		if err := session.Release(j.MaxChargeUnits); err != nil {
+			panic(err) // preflight established this invariant
 		}
 		delete(s.Jobs, id)
 	}
-	return nil
 }
 
 func (s *State) expireProviders() {
@@ -332,10 +353,12 @@ func (s *State) AdvanceHeight(blocks uint64) error {
 	if blocks > ^uint64(0)-s.Height {
 		return errors.New("height overflow")
 	}
-	s.Height += blocks
-	if err := s.expireJobs(); err != nil {
+	target := s.Height + blocks
+	if err := s.preflightExpiry(target); err != nil {
 		return err
 	}
+	s.Height = target
+	s.expireJobs()
 	s.expireProviders()
 	return nil
 }
