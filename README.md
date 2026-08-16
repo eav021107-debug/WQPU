@@ -1,4 +1,4 @@
-# WQPU 0.5
+# WQPU 0.5.1
 
 WQPU is an experimental **equal-peer distributed LLM network** built around `llama.cpp` RPC.
 
@@ -29,14 +29,16 @@ Several computers can originate requests at the same time. There is no permanent
 ### macOS / Linux
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh | sh
+curl -fsSL "https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh?v=0.5.1" | sh
 ```
 
 ### Windows PowerShell
 
 ```powershell
-irm https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1 | iex
+irm 'https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1?v=0.5.1' | iex
 ```
+
+The version query prevents an old cached installer from being reused.
 
 The installer immediately starts the interactive CLI in the **same terminal**:
 
@@ -46,6 +48,18 @@ wqpu> /status
 wqpu> /peers
 wqpu> /exit
 ```
+
+## Python compatibility
+
+WQPU 0.5.1 is compatible with Python 3.6+.
+
+The installer does not depend on one exact Python version. It:
+
+1. uses an already installed compatible Python if available;
+2. tries the operating system package manager if Python is too old or missing;
+3. on macOS/Linux, as a last fallback, installs a private Python runtime only for WQPU without replacing the system Python;
+4. on Windows, installs a private WQPU Python runtime if needed;
+5. runs a Python compile check before starting WQPU.
 
 ## Creating and joining a network
 
@@ -60,13 +74,13 @@ To invite another computer, the first reachable node types:
 WQPU prints a private `WQPU1...` join code. On macOS/Linux the other computer can join with:
 
 ```bash
-WQPU_JOIN='WQPU1...' curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh | sh
+WQPU_JOIN='WQPU1...' curl -fsSL "https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh?v=0.5.1" | sh
 ```
 
 On Windows:
 
 ```powershell
-$env:WQPU_JOIN='WQPU1...'; irm https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1 | iex
+$env:WQPU_JOIN='WQPU1...'; irm 'https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1?v=0.5.1' | iex
 ```
 
 The first address is only an introduction. After connection, nodes exchange peer information and cache other reachable peers. Any reachable WQPU node can perform the same introduction/relay function; there is no special VPS role in the protocol.
@@ -75,7 +89,7 @@ The first address is only an introduction. After connection, nodes exchange peer
 
 A brand-new computer cannot discover a private network on the global Internet from literally zero information. It needs at least one address of an existing peer for first contact.
 
-WQPU 0.5 avoids a dedicated relay service by making **every node capable of relaying**. Nodes reachable from the Internet naturally become useful routes for peers behind NAT, but they receive no extra permissions and run exactly the same software.
+WQPU avoids a dedicated relay service by making **every node capable of relaying**. Nodes reachable from the Internet naturally become useful routes for peers behind NAT, but they receive no extra permissions and run exactly the same software.
 
 If every single peer is behind restrictive NAT/firewalls and none is reachable, the mesh needs a port-forwarded/publicly reachable ordinary WQPU peer before those isolated groups can meet. Reliable universal NAT hole punching without any external rendezvous infrastructure is not physically guaranteed, so WQPU does not pretend otherwise.
 
