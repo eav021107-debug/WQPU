@@ -5,6 +5,7 @@ from chain.devnet_config import (
     NATIVE_PRECOMPILE,
     evm_hex_to_bech32,
     patch_app_toml,
+    patch_comet_toml,
     patch_genesis,
 )
 
@@ -78,6 +79,24 @@ class AppTomlPatchTests(unittest.TestCase):
         sample = "[api]\nenable = false\n\n" + self.SAMPLE
         out = patch_app_toml(sample, 711711)
         self.assertTrue(out.startswith("[api]\nenable = false\n"))
+
+
+class CometTomlPatchTests(unittest.TestCase):
+    SAMPLE = """proxy_app = \"tcp://127.0.0.1:26658\"\n\n[mempool]\nversion = \"v0\"\ntype = \"flood\"\nrecheck = true\n\n[p2p]\nladdr = \"tcp://0.0.0.0:26656\"\n"""
+
+    def test_evm_uses_application_mempool(self):
+        out = patch_comet_toml(self.SAMPLE)
+        self.assertIn('[mempool]\nversion = "v0"\ntype = "app"\nrecheck = true', out)
+        self.assertNotIn('type = "flood"', out)
+
+    def test_patch_does_not_change_other_sections(self):
+        out = patch_comet_toml(self.SAMPLE)
+        self.assertIn('[p2p]\nladdr = "tcp://0.0.0.0:26656"', out)
+        self.assertTrue(out.startswith('proxy_app = "tcp://127.0.0.1:26658"'))
+
+    def test_patch_fails_closed_if_upstream_field_disappears(self):
+        with self.assertRaises(ValueError):
+            patch_comet_toml("[mempool]\nversion = \"v0\"\n")
 
 
 if __name__ == "__main__":
