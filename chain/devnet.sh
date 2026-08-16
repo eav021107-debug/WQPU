@@ -8,6 +8,7 @@ HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 SRC_DIR="${WQPU_CHAIN_SRC:-$HOME/.cache/wqpu-chain/cosmos-evm-$COSMOS_EVM_TAG}"
 BIN_DIR="${WQPU_CHAIN_BIN_DIR:-$HOME/.local/share/wqpu-chain/bin}"
 CHAIN_HOME="${WQPU_CHAIN_HOME:-$HOME/.wqpu-chain-dev}"
+DEV_TEST_ADDRESS="${WQPU_DEVNET_TEST_ADDRESS:-}"
 BIN="$BIN_DIR/wqpud"
 KEYRING="test" # local devnet only; never use this backend for a public validator
 RESET=0
@@ -116,6 +117,14 @@ if [ ! -f "$CHAIN_HOME/config/genesis.json" ]; then
     "1000000000000000000000000${BASE_DENOM}" \
     --keyring-backend "$KEYRING" \
     --home "$CHAIN_HOME" >/dev/null
+
+  # Optional deterministic test-only EVM address for CI/live RPC smoke tests.
+  # The address is public test infrastructure and must never be used for real funds.
+  if [ -n "$DEV_TEST_ADDRESS" ]; then
+    "$BIN" genesis add-genesis-account "$DEV_TEST_ADDRESS" \
+      "1000000000000000000000${BASE_DENOM}" \
+      --home "$CHAIN_HOME" >/dev/null
+  fi
 
   "$BIN" genesis gentx validator \
     "10000000000000000000000${BASE_DENOM}" \
