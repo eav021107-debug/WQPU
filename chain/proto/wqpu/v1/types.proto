@@ -1,0 +1,85 @@
+syntax = "proto3";
+
+package wqpu.v1;
+
+option go_package = "github.com/eav021107-debug/WQPU/chain/x/wqpu/types";
+
+// Wallet-authorized local session. Wallet secrets never enter WQPU.
+message SessionDelegation {
+  string wallet = 1;
+  bytes session_pubkey = 2;
+  uint64 issued_height = 3;
+  uint64 expires_height = 4;
+  uint64 max_spend_units = 5;
+  uint64 max_job_units = 6;
+  uint64 revocation_nonce = 7;
+  uint64 permissions = 8;
+}
+
+// Active compute advertisement stored in WQPU chain state.
+message ProviderRecord {
+  string wallet = 1;
+  bytes peer_pubkey = 2;
+  string peer_id = 3;
+  repeated string endpoints = 4;
+  repeated string model_hashes = 5;
+  uint64 capacity_units = 6;
+  uint64 reported_busy_units = 7;
+  uint64 free_memory_bytes = 8;
+  bytes capability_hash = 9;
+  uint64 heartbeat_height = 10;
+  uint64 expires_height = 11;
+  uint32 protocol_version = 12;
+}
+
+message ProviderReservation {
+  string provider_wallet = 1;
+  string provider_peer_id = 2;
+  uint64 reserved_compute_units = 3;
+  uint64 assigned_model_bytes = 4;
+}
+
+// Consensus-visible reservation accepted before paid compute starts.
+message JobReservation {
+  bytes job_id = 1;
+  string requester_wallet = 2;
+  bytes requester_session_pubkey = 3;
+  bytes model_hash = 4;
+  bytes prompt_commitment = 5;
+  uint64 price_epoch = 6;
+  uint64 price_per_million_units = 7;
+  uint64 max_compute_units = 8;
+  uint64 max_charge_units = 9;
+  uint64 created_height = 10;
+  uint64 expires_height = 11;
+  repeated ProviderReservation providers = 12;
+}
+
+// Monotonic cumulative work/payment receipt.
+message WorkReceipt {
+  bytes job_id = 1;
+  string provider_wallet = 2;
+  string provider_peer_id = 3;
+  uint64 sequence = 4;
+  uint64 compute_units = 5;
+  uint64 cumulative_compute_units = 6;
+  uint64 cumulative_payment_units = 7;
+  bytes result_commitment = 8;
+}
+
+message GlobalPriceState {
+  uint64 epoch = 1;
+  uint64 price_per_million_units = 2;
+  uint64 active_capacity_units = 3;
+  uint64 reserved_demand_units = 4;
+}
+
+message Params {
+  uint64 provider_ttl_blocks = 1;
+  uint64 session_max_ttl_blocks = 2;
+  uint64 job_max_ttl_blocks = 3;
+  uint32 target_utilization_bps = 4;
+  uint32 max_price_move_bps = 5;
+  uint64 minimum_price_per_million_units = 6;
+  uint32 protocol_version = 7;
+}
