@@ -38,8 +38,6 @@ func finalizeInput(t *testing.T, envelope FinalizeEnvelope) []byte {
 
 func TestFinalizeEnvelopeCodecAndABI(t *testing.T) {
 	state, delegation, _, job := receiptFixture(t)
-	// receiptFixture used a session without Settle permission, but codec/ABI do
-	// not weaken permissions; VerifyFinalizeEnvelope separately enforces them.
 	envelope := FinalizeEnvelope{Wallet: delegation.Wallet, Session: delegation.Session, ActionNonce: 2, JobID: job.Request.JobID, Signature: make([]byte, 65)}
 	raw, err := EncodeFinalizeEnvelope(envelope)
 	if err != nil { t.Fatal(err) }
@@ -64,10 +62,15 @@ func TestSettlementContractGasAndRegistration(t *testing.T) {
 	contract := NewSettlementNetworkContract(DevNetworkConfig)
 	if gas := contract.RequiredGas(selectorFinalizeJob[:]); gas != finalizeJobGas { t.Fatalf("finalize gas=%d", gas) }
 	if gas := contract.RequiredGas(selectorTimeoutJob[:]); gas != timeoutJobGas { t.Fatalf("timeout gas=%d", gas) }
+
 	precompiles := WithWQPUSettlementNetwork(nil)
 	registered, ok := precompiles[Address]
 	if !ok { t.Fatal("settlement WQPU contract missing") }
-	if _, ok := registered.(SettlementNetworkContract); !ok { t.Fatalf("unexpected contract type %T", registered) }
+	priced, ok := registered.(PricedSettlementNetworkContract)
+	if !ok { t.Fatalf("unexpected final contract type %T", registered) }
+	if gas := priced.RequiredGas(selectorClosePriceEpoch[:]); gas != closePriceEpochGas { t.Fatalf("price epoch gas=%d", gas) }
+	if gas := priced.RequiredGas(selectorBondProvider[:]); gas != bondProviderGas { t.Fatalf("provider bond gas=%d", gas) }
+	if gas := priced.RequiredGas(selectorFinalizeJob[:]); gas != finalizeJobGas { t.Fatalf("nested finalize gas=%d", gas) }
 }
 
 func TestSettlementContractRefusesAddressCollision(t *testing.T) {
@@ -82,5 +85,5 @@ func TestFinalizeSignatureRequiresSettlePermission(t *testing.T) {
 	if _, err := VerifyFinalizeEnvelope(state, envelope, DevNetworkConfig, 124); err == nil {
 		t.Fatal("job-only session must not finalize without Settle permission")
 	}
-	_ = hex.EncodeToString // keep test imports tied to signature representation
+	_ = hex.EncodeToString
 }
