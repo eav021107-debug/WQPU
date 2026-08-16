@@ -110,6 +110,6 @@ func (c SettlementNetworkContract) Run(evm *vm.EVM, contract *vm.Contract, readO
 func WithWQPUSettlementNetwork(existing map[common.Address]vm.PrecompiledContract) map[common.Address]vm.PrecompiledContract {
 	if existing == nil { existing = make(map[common.Address]vm.PrecompiledContract) }
 	if current, exists := existing[Address]; exists { panic("WQPU precompile address collision with " + current.Name()) }
-	existing[Address] = NewSettlementNetworkContract(DevNetworkConfig)
+	existing[Address] = NewBondedSettlementNetworkContract(DevNetworkConfig)
 	return existing
 }
