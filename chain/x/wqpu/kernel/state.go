@@ -70,6 +70,8 @@ type State struct {
 	PeerOwners            map[string]string
 	Jobs                  map[string]JobReservation
 	ReservedByPeer        map[string]uint64
+	LatestReceipts        map[string]map[string]WorkReceipt
+	CompletedSettlements  map[string]Settlement
 }
 
 func NewState(chainID string, initialPrice uint64) (*State, error) {
@@ -85,6 +87,8 @@ func NewState(chainID string, initialPrice uint64) (*State, error) {
 		PeerOwners:            map[string]string{},
 		Jobs:                  map[string]JobReservation{},
 		ReservedByPeer:        map[string]uint64{},
+		LatestReceipts:        map[string]map[string]WorkReceipt{},
+		CompletedSettlements:  map[string]Settlement{},
 	}, nil
 }
 
@@ -206,6 +210,9 @@ func (s *State) ReserveJob(j JobReservation) error {
 	if _, exists := s.Jobs[j.JobID]; exists {
 		return errors.New("job id already exists")
 	}
+	if _, exists := s.CompletedSettlements[j.JobID]; exists {
+		return errors.New("job id was already settled")
+	}
 	if j.CreatedHeight != s.Height {
 		return errors.New("job must be created at current height")
 	}
@@ -248,6 +255,46 @@ func (s *State) ReserveJob(j JobReservation) error {
 		s.ReservedByPeer[reservation.ProviderPeerID] += reservation.ReservedComputeUnits
 	}
 	s.Jobs[j.JobID] = j
+	s.LatestReceipts[j.JobID] = map[string]WorkReceipt{}
+	return nil
+}
+
+// RecordVerifiedReceipt must only receive a receipt after both requester and
+// provider signatures have been verified by the transaction boundary.
+func (s *State) RecordVerifiedReceipt(receipt WorkReceipt) error {
+	if s == nil {
+		return errors.New("nil state")
+	}
+	job, ok := s.Jobs[receipt.JobID]
+	if !ok {
+		return errors.New("unknown job")
+	}
+	if s.Height >= job.ExpiresHeight {
+		return errors.New("job already expired")
+	}
+	latest := s.LatestReceipts[job.JobID]
+	if latest == nil {
+		latest = map[string]WorkReceipt{}
+	}
+	var previous *WorkReceipt
+	if old, exists := latest[receipt.ProviderPeerID]; exists {
+		copy := old
+		previous = &copy
+	}
+	if err := ValidateReceipt(job, previous, receipt); err != nil {
+		return err
+	}
+
+	candidate := make(map[string]WorkReceipt, len(latest)+1)
+	for peerID, item := range latest {
+		candidate[peerID] = item
+	}
+	candidate[receipt.ProviderPeerID] = receipt
+	if _, err := BuildTimeoutSettlement(job, candidate); err != nil {
+		return err
+	}
+	latest[receipt.ProviderPeerID] = receipt
+	s.LatestReceipts[job.JobID] = latest
 	return nil
 }
 
@@ -272,45 +319,65 @@ func (s *State) releaseJobResources(j JobReservation) {
 	}
 }
 
-// CloseJob is called only after receipt verification determines the actual charge.
-func (s *State) CloseJob(jobID string, actualCharge uint64) error {
-	j, ok := s.Jobs[jobID]
-	if !ok {
-		return errors.New("unknown job")
+func (s *State) canSettleJob(j JobReservation, settlement Settlement) error {
+	if settlement.JobID != j.JobID {
+		return errors.New("settlement belongs to another job")
+	}
+	if settlement.TotalCharge > j.MaxChargeUnits {
+		return errors.New("settlement exceeds job maximum")
 	}
 	session, err := s.session(j.RequesterWallet, j.RequesterSessionPubkey)
 	if err != nil {
 		return err
 	}
-	if err := session.CanSettle(j.MaxChargeUnits, actualCharge); err != nil {
+	if err := session.CanSettle(j.MaxChargeUnits, settlement.TotalCharge); err != nil {
 		return err
 	}
-	if err := s.canReleaseJobResources(j); err != nil {
-		return err
-	}
+	return s.canReleaseJobResources(j)
+}
 
-	// All fallible checks are complete; commit both accounting changes together.
+func (s *State) settleJob(j JobReservation, settlement Settlement) {
+	session, _ := s.session(j.RequesterWallet, j.RequesterSessionPubkey)
 	s.releaseJobResources(j)
-	if err := session.Settle(j.MaxChargeUnits, actualCharge); err != nil {
-		panic(err) // invariant violation after successful preflight
+	if err := session.Settle(j.MaxChargeUnits, settlement.TotalCharge); err != nil {
+		panic(err) // preflight established this invariant
 	}
-	delete(s.Jobs, jobID)
-	return nil
+	delete(s.Jobs, j.JobID)
+	delete(s.LatestReceipts, j.JobID)
+	s.CompletedSettlements[j.JobID] = settlement
+}
+
+// FinalizeJob has no caller-supplied price. The only payable amount is derived
+// from the latest verified receipts at the job's immutable global price.
+func (s *State) FinalizeJob(jobID string) (Settlement, error) {
+	if s == nil {
+		return Settlement{}, errors.New("nil state")
+	}
+	job, ok := s.Jobs[jobID]
+	if !ok {
+		return Settlement{}, errors.New("unknown job")
+	}
+	settlement, err := BuildSettlement(job, s.LatestReceipts[jobID])
+	if err != nil {
+		return Settlement{}, err
+	}
+	if err := s.canSettleJob(job, settlement); err != nil {
+		return Settlement{}, err
+	}
+	s.settleJob(job, settlement)
+	return settlement, nil
 }
 
 func (s *State) preflightExpiry(targetHeight uint64) error {
-	for _, j := range s.Jobs {
-		if j.ExpiresHeight > targetHeight {
+	for _, job := range s.Jobs {
+		if job.ExpiresHeight > targetHeight {
 			continue
 		}
-		session, err := s.session(j.RequesterWallet, j.RequesterSessionPubkey)
+		settlement, err := BuildTimeoutSettlement(job, s.LatestReceipts[job.JobID])
 		if err != nil {
 			return err
 		}
-		if err := session.CanRelease(j.MaxChargeUnits); err != nil {
-			return err
-		}
-		if err := s.canReleaseJobResources(j); err != nil {
+		if err := s.canSettleJob(job, settlement); err != nil {
 			return err
 		}
 	}
@@ -318,16 +385,15 @@ func (s *State) preflightExpiry(targetHeight uint64) error {
 }
 
 func (s *State) expireJobs() {
-	for id, j := range s.Jobs {
-		if j.ExpiresHeight > s.Height {
+	for _, job := range s.Jobs {
+		if job.ExpiresHeight > s.Height {
 			continue
 		}
-		session, _ := s.session(j.RequesterWallet, j.RequesterSessionPubkey)
-		s.releaseJobResources(j)
-		if err := session.Release(j.MaxChargeUnits); err != nil {
+		settlement, err := BuildTimeoutSettlement(job, s.LatestReceipts[job.JobID])
+		if err != nil {
 			panic(err) // preflight established this invariant
 		}
-		delete(s.Jobs, id)
+		s.settleJob(job, settlement)
 	}
 }
 
@@ -336,8 +402,6 @@ func (s *State) expireProviders() {
 		if p.ExpiresHeight > s.Height {
 			continue
 		}
-		// A valid reservation cannot outlive its provider heartbeat. If this is
-		// non-zero, state invariants were violated earlier, so keep the record.
 		if s.ReservedByPeer[p.PeerID] != 0 {
 			continue
 		}
