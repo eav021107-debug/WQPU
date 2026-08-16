@@ -16,12 +16,36 @@ type Key struct {
 	address common.Address
 }
 
+func fromPrivate(priv *ecdsa.PrivateKey) (*Key, error) {
+	if priv == nil || priv.D == nil || priv.D.Sign() <= 0 {
+		return nil, errors.New("valid WQPU session private key is required")
+	}
+	// Re-parse a 32-byte scalar so Key owns an independent in-memory copy and
+	// callers cannot mutate the original ecdsa.PrivateKey after construction.
+	raw := crypto.FromECDSA(priv)
+	if len(raw) != 32 {
+		return nil, errors.New("WQPU session private key must be secp256k1")
+	}
+	copyPriv, err := crypto.ToECDSA(append([]byte(nil), raw...))
+	if err != nil {
+		return nil, err
+	}
+	return &Key{private: copyPriv, address: crypto.PubkeyToAddress(copyPriv.PublicKey)}, nil
+}
+
 func Generate() (*Key, error) {
 	priv, err := crypto.GenerateKey()
 	if err != nil {
 		return nil, err
 	}
-	return &Key{private: priv, address: crypto.PubkeyToAddress(priv.PublicKey)}, nil
+	return fromPrivate(priv)
+}
+
+// FromPrivateKey constructs a session key from an already-authorized in-memory
+// secp256k1 key. It exists for session handoff/devnet determinism; this API must
+// never be used with a user's wallet seed or wallet private key.
+func FromPrivateKey(priv *ecdsa.PrivateKey) (*Key, error) {
+	return fromPrivate(priv)
 }
 
 func (k *Key) Address() string {
