@@ -1,0 +1,42 @@
+name: one-time-fix-provider-test
+
+on:
+  push:
+    branches: [next-foundation]
+
+permissions:
+  contents: write
+
+jobs:
+  fix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: next-foundation
+      - name: Fix missing common import and remove this one-time workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          from pathlib import Path
+          p = Path('chain/x/wqpu/precompile/provider_publish_test.go')
+          text = p.read_text()
+          needle = '\t"github.com/ethereum/go-ethereum/crypto"\n'
+          replacement = '\t"github.com/ethereum/go-ethereum/common"\n\t"github.com/ethereum/go-ethereum/crypto"\n'
+          if '"github.com/ethereum/go-ethereum/common"' not in text:
+              if needle not in text:
+                  raise SystemExit('expected crypto import anchor not found')
+              text = text.replace(needle, replacement, 1)
+              p.write_text(text)
+          PY
+          git rm .github/workflows/one-time-fix-provider-test.yml
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add chain/x/wqpu/precompile/provider_publish_test.go
+          if git diff --cached --quiet; then
+            echo 'Nothing to fix.'
+            exit 0
+          fi
+          git commit -m 'Fix provider publish test import'
+          git push origin HEAD:next-foundation
