@@ -34,7 +34,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 PORT = int(os.environ.get("WQPU_PORT", "7443"))
 RPC_PORT = 50052
 DEFAULT_MODEL = "ggml-org/gemma-3-1b-it-GGUF:Q4_K_M"
@@ -237,6 +237,10 @@ def make_network(join_token=None):
     ensure_cert()
     if join_token:
         cfg = decode_join(join_token)
+        try:
+            PEERS_FILE.unlink()
+        except OSError:
+            pass
     else:
         cfg = {"secret": secrets.token_urlsafe(32), "peers": []}
     save_cfg(cfg)
@@ -819,10 +823,13 @@ async def interactive(mesh, server_bin):
 
 
 async def run(join_token=None):
-    cfg = load_cfg()
-    if not cfg:
+    if join_token:
         cfg = make_network(join_token)
-        if not join_token:
+        print("Joined the WQPU network from the supplied join code.")
+    else:
+        cfg = load_cfg()
+        if not cfg:
+            cfg = make_network()
             print("Created a new WQPU network.")
             print("After startup use /invite PUBLIC_HOST[:PORT] to make a join code.")
     server_bin, rpc_bin, tag = ensure_runtime()
