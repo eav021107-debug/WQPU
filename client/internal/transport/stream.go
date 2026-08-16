@@ -54,31 +54,39 @@ type SecureStream struct {
 	pending []byte
 }
 
+func closeHandshake(raw io.ReadWriteCloser, err error) (*SecureStream, error) {
+	if raw != nil { _ = raw.Close() }
+	return nil, err
+}
+
 // Initiate performs initiator-first handshake. expectedRemoteSession must be
 // obtained from verified WQPU chain registry state for expectedRemotePeerID.
+// A failed handshake closes the carrier so a rejected peer cannot leave the
+// opposite side blocked waiting for authentication bytes.
 func Initiate(raw io.ReadWriteCloser, signer Signer, chainID string, localPeerID, expectedRemotePeerID [32]byte, expectedRemoteSession string) (*SecureStream, error) {
 	if raw == nil { return nil, errors.New("WQPU carrier stream is required") }
 	handshake, err := NewHandshake(RoleInitiator, signer, chainID, localPeerID)
-	if err != nil { return nil, err }
-	if err := writeHello(raw, handshake.Bytes()); err != nil { return nil, err }
+	if err != nil { return closeHandshake(raw, err) }
+	if err := writeHello(raw, handshake.Bytes()); err != nil { return closeHandshake(raw, err) }
 	remote, err := readHello(raw)
-	if err != nil { return nil, err }
+	if err != nil { return closeHandshake(raw, err) }
 	channel, err := handshake.Establish(remote, expectedRemotePeerID, expectedRemoteSession)
-	if err != nil { return nil, err }
+	if err != nil { return closeHandshake(raw, err) }
 	return &SecureStream{raw: raw, channel: channel}, nil
 }
 
 // Accept verifies the initiator before sending the responder hello. This avoids
 // giving unauthenticated peers an encrypted channel or any application bytes.
+// Rejected carriers are closed immediately.
 func Accept(raw io.ReadWriteCloser, signer Signer, chainID string, localPeerID, expectedRemotePeerID [32]byte, expectedRemoteSession string) (*SecureStream, error) {
 	if raw == nil { return nil, errors.New("WQPU carrier stream is required") }
 	remote, err := readHello(raw)
-	if err != nil { return nil, err }
+	if err != nil { return closeHandshake(raw, err) }
 	handshake, err := NewHandshake(RoleResponder, signer, chainID, localPeerID)
-	if err != nil { return nil, err }
+	if err != nil { return closeHandshake(raw, err) }
 	channel, err := handshake.Establish(remote, expectedRemotePeerID, expectedRemoteSession)
-	if err != nil { return nil, err }
-	if err := writeHello(raw, handshake.Bytes()); err != nil { return nil, err }
+	if err != nil { return closeHandshake(raw, err) }
+	if err := writeHello(raw, handshake.Bytes()); err != nil { return closeHandshake(raw, err) }
 	return &SecureStream{raw: raw, channel: channel}, nil
 }
 
