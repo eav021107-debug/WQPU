@@ -6,8 +6,11 @@ on:
   pull_request:
     paths:
       - 'wqpu_next/**'
+      - 'chain/**'
       - 'tests/test_next_foundation.py'
+      - 'tests/test_devnet_config.py'
       - 'ARCHITECTURE_V1.md'
+      - 'CHAIN_DESIGN.md'
       - 'SECURITY.md'
       - '.github/workflows/next-foundation.yml'
 
@@ -26,6 +29,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile
-        run: python -m compileall -q wqpu_next tests
+        run: python -m compileall -q wqpu_next chain tests
+      - name: Shell syntax
+        run: bash -n chain/devnet.sh
       - name: Unit tests
-        run: python -m unittest -v tests.test_next_foundation
+        run: python -m unittest -v tests.test_next_foundation tests.test_devnet_config
