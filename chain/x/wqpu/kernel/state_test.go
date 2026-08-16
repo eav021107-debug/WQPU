@@ -1,14 +1,21 @@
 package kernel
 
-import "testing"
+import (
+	"crypto/sha256"
+	"encoding/hex"
+	"testing"
+)
+
+func sessionAddress(seed string) string {
+	sum := sha256.Sum256([]byte(seed))
+	return "0x" + hex.EncodeToString(sum[12:])
+}
 
 func stateSession(wallet string, permissions uint64) SessionDelegation {
-	var key [32]byte
-	key[0] = byte(len(wallet) + 1)
 	return SessionDelegation{
 		ChainID:         "wqpu-dev-1",
 		Wallet:          wallet,
-		SessionPubkey:   key,
+		SessionAddress:  sessionAddress(wallet),
 		IssuedHeight:    0,
 		ExpiresHeight:   100,
 		MaxSpendUnits:   10_000,
@@ -49,7 +56,7 @@ func preparedState(t *testing.T) (*State, SessionDelegation, SessionDelegation) 
 	if err := s.AuthorizeSession(providerSession); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PublishProvider("provider", providerSession.SessionPubkey, stateProvider("provider", "peer-1", 0, 20)); err != nil {
+	if err := s.PublishProvider("provider", providerSession.SessionAddress, stateProvider("provider", "peer-1", 0, 20)); err != nil {
 		t.Fatal(err)
 	}
 	return s, requester, providerSession
@@ -57,16 +64,16 @@ func preparedState(t *testing.T) (*State, SessionDelegation, SessionDelegation) 
 
 func jobFor(s *State, requester SessionDelegation, id string, reserve, charge, expires uint64) JobReservation {
 	return JobReservation{
-		JobID:                  id,
-		RequesterWallet:        requester.Wallet,
-		RequesterSessionPubkey: requester.SessionPubkey,
-		ModelHash:               testModel,
-		PriceEpoch:              s.Epoch,
-		PricePerMillionUnits:    s.PricePerMillionUnits,
-		MaxComputeUnits:         reserve,
-		MaxChargeUnits:          charge,
-		CreatedHeight:           s.Height,
-		ExpiresHeight:           expires,
+		JobID:                   id,
+		RequesterWallet:         requester.Wallet,
+		RequesterSessionAddress: requester.SessionAddress,
+		ModelHash:                testModel,
+		PriceEpoch:               s.Epoch,
+		PricePerMillionUnits:     s.PricePerMillionUnits,
+		MaxComputeUnits:          reserve,
+		MaxChargeUnits:           charge,
+		CreatedHeight:            s.Height,
+		ExpiresHeight:            expires,
 		Providers: []ProviderReservation{{
 			ProviderWallet:       "provider",
 			ProviderPeerID:       "peer-1",
@@ -103,7 +110,7 @@ func TestStateReservesComputeAndSpendBeforeWork(t *testing.T) {
 	if s.ReservedByPeer["peer-1"] != 70 {
 		t.Fatalf("reserved compute=%d", s.ReservedByPeer["peer-1"])
 	}
-	session, _ := s.session(requester.Wallet, requester.SessionPubkey)
+	session, _ := s.session(requester.Wallet, requester.SessionAddress)
 	if session.ReservedUnits != 500 || session.SpentUnits != 0 {
 		t.Fatalf("session reserved=%d spent=%d", session.ReservedUnits, session.SpentUnits)
 	}
@@ -114,7 +121,7 @@ func TestFailedSecondJobDoesNotPartiallyReserveAnything(t *testing.T) {
 	if err := s.ReserveJob(jobFor(s, requester, "job-1", 80, 500, 10)); err != nil {
 		t.Fatal(err)
 	}
-	session, _ := s.session(requester.Wallet, requester.SessionPubkey)
+	session, _ := s.session(requester.Wallet, requester.SessionAddress)
 	beforeSpend := session.ReservedUnits
 	beforeCompute := s.ReservedByPeer["peer-1"]
 	if err := s.ReserveJob(jobFor(s, requester, "job-2", 30, 600, 10)); err == nil {
@@ -137,7 +144,7 @@ func TestJobCannotFinalizeWithoutVerifiedReceipt(t *testing.T) {
 	if _, err := s.FinalizeJob(job.JobID); err == nil {
 		t.Fatal("job without a verified receipt must not settle")
 	}
-	session, _ := s.session(requester.Wallet, requester.SessionPubkey)
+	session, _ := s.session(requester.Wallet, requester.SessionAddress)
 	if session.SpentUnits != 0 || session.ReservedUnits != 500 {
 		t.Fatal("failed finalization changed payment accounting")
 	}
@@ -157,7 +164,7 @@ func TestFinalizeJobPaysOnlyReceiptAmountAndReturnsRemainder(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, _ := s.session(requester.Wallet, requester.SessionPubkey)
+	session, _ := s.session(requester.Wallet, requester.SessionAddress)
 	if session.ReservedUnits != 0 || session.SpentUnits != receipt.CumulativePaymentUnits {
 		t.Fatalf("session reserved=%d spent=%d", session.ReservedUnits, session.SpentUnits)
 	}
@@ -178,7 +185,7 @@ func TestExpiredUnusedJobRefundsEverything(t *testing.T) {
 	if err := s.AdvanceHeight(2); err != nil {
 		t.Fatal(err)
 	}
-	session, _ := s.session(requester.Wallet, requester.SessionPubkey)
+	session, _ := s.session(requester.Wallet, requester.SessionAddress)
 	if session.ReservedUnits != 0 || session.SpentUnits != 0 {
 		t.Fatal("expired unused job should not charge")
 	}
@@ -203,7 +210,7 @@ func TestTimeoutPaysAlreadyVerifiedWorkAndRefundsRemainder(t *testing.T) {
 	if err := s.AdvanceHeight(2); err != nil {
 		t.Fatal(err)
 	}
-	session, _ := s.session(requester.Wallet, requester.SessionPubkey)
+	session, _ := s.session(requester.Wallet, requester.SessionAddress)
 	if session.ReservedUnits != 0 || session.SpentUnits != receipt.CumulativePaymentUnits {
 		t.Fatalf("session reserved=%d spent=%d", session.ReservedUnits, session.SpentUnits)
 	}
@@ -263,7 +270,7 @@ func TestWalletNonceRevokesOldSessions(t *testing.T) {
 		t.Fatal("revoked session should not authorize a new job")
 	}
 	newSession := stateSession(requester.Wallet, SessionPermJob)
-	newSession.SessionPubkey[1] = 9
+	newSession.SessionAddress = sessionAddress(requester.Wallet + "-replacement")
 	newSession.RevocationNonce = 1
 	if err := s.AuthorizeSession(newSession); err != nil {
 		t.Fatal(err)
@@ -276,7 +283,7 @@ func TestDuplicatePeerIdentityCannotBeClaimedByAnotherWallet(t *testing.T) {
 	if err := s.AuthorizeSession(other); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.PublishProvider("other-provider", other.SessionPubkey, stateProvider("other-provider", "peer-1", 0, 20)); err == nil {
+	if err := s.PublishProvider("other-provider", other.SessionAddress, stateProvider("other-provider", "peer-1", 0, 20)); err == nil {
 		t.Fatal("duplicate peer id should be rejected")
 	}
 }
