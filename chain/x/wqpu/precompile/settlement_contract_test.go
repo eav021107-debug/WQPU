@@ -66,11 +66,12 @@ func TestSettlementContractGasAndRegistration(t *testing.T) {
 	precompiles := WithWQPUSettlementNetwork(nil)
 	registered, ok := precompiles[Address]
 	if !ok { t.Fatal("settlement WQPU contract missing") }
-	priced, ok := registered.(PricedSettlementNetworkContract)
+	registry, ok := registered.(RegistrySettlementNetworkContract)
 	if !ok { t.Fatalf("unexpected final contract type %T", registered) }
-	if gas := priced.RequiredGas(selectorClosePriceEpoch[:]); gas != closePriceEpochGas { t.Fatalf("price epoch gas=%d", gas) }
-	if gas := priced.RequiredGas(selectorBondProvider[:]); gas != bondProviderGas { t.Fatalf("provider bond gas=%d", gas) }
-	if gas := priced.RequiredGas(selectorFinalizeJob[:]); gas != finalizeJobGas { t.Fatalf("nested finalize gas=%d", gas) }
+	if gas := registry.RequiredGas(selectorPeerControlSession[:]); gas != networkReadGas { t.Fatalf("peer control gas=%d", gas) }
+	if gas := registry.RequiredGas(selectorClosePriceEpoch[:]); gas != closePriceEpochGas { t.Fatalf("price epoch gas=%d", gas) }
+	if gas := registry.RequiredGas(selectorBondProvider[:]); gas != bondProviderGas { t.Fatalf("provider bond gas=%d", gas) }
+	if gas := registry.RequiredGas(selectorFinalizeJob[:]); gas != finalizeJobGas { t.Fatalf("nested finalize gas=%d", gas) }
 }
 
 func TestSettlementContractRefusesAddressCollision(t *testing.T) {
