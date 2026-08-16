@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 NATIVE_PRECOMPILE = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
 
 def _set_if_present(root: dict[str, Any], path: list[str], value: Any) -> None:
@@ -119,7 +120,6 @@ def patch_app_toml(text: str, evm_chain_id: int) -> str:
             elif key == "ws-address":
                 replacement = 'ws-address = "127.0.0.1:8546"'
             elif key == "api":
-                # Keep the dev RPC minimal. No personal/debug namespace by default.
                 replacement = 'api = "eth,net,web3"'
             elif key == "allow-insecure-unlock":
                 replacement = "allow-insecure-unlock = false"
@@ -129,6 +129,51 @@ def patch_app_toml(text: str, evm_chain_id: int) -> str:
         out.append(replacement if replacement is not None else raw)
 
     return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+def _bech32_polymod(values: list[int]) -> int:
+    generators = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
+    chk = 1
+    for value in values:
+        top = chk >> 25
+        chk = ((chk & 0x1FFFFFF) << 5) ^ value
+        for bit, generator in enumerate(generators):
+            if (top >> bit) & 1:
+                chk ^= generator
+    return chk
+
+
+def _bech32_hrp_expand(hrp: str) -> list[int]:
+    return [ord(c) >> 5 for c in hrp] + [0] + [ord(c) & 31 for c in hrp]
+
+
+def _convert_bits(data: bytes, from_bits: int, to_bits: int) -> list[int]:
+    acc = 0
+    bits = 0
+    out: list[int] = []
+    max_value = (1 << to_bits) - 1
+    for value in data:
+        if value >> from_bits:
+            raise ValueError("input value exceeds source bit width")
+        acc = (acc << from_bits) | value
+        bits += from_bits
+        while bits >= to_bits:
+            bits -= to_bits
+            out.append((acc >> bits) & max_value)
+    if bits:
+        out.append((acc << (to_bits - bits)) & max_value)
+    return out
+
+
+def evm_hex_to_bech32(address: str, prefix: str = "cosmos") -> str:
+    if not re.fullmatch(r"0x[0-9a-fA-F]{40}", address):
+        raise ValueError("EVM address must be exactly 20 0x-prefixed bytes")
+    if not re.fullmatch(r"[a-z0-9]{1,83}", prefix):
+        raise ValueError("invalid bech32 prefix")
+    payload = _convert_bits(bytes.fromhex(address[2:]), 8, 5)
+    polymod = _bech32_polymod(_bech32_hrp_expand(prefix) + payload + [0] * 6) ^ 1
+    checksum = [(polymod >> (5 * (5 - i))) & 31 for i in range(6)]
+    return prefix + "1" + "".join(BECH32_CHARSET[v] for v in payload + checksum)
 
 
 def patch_genesis_file(path: Path, base: str, display: str, exponent: int) -> None:
@@ -155,11 +200,17 @@ def main() -> int:
     app.add_argument("path", type=Path)
     app.add_argument("--evm-chain-id", required=True, type=int)
 
+    bech32 = sub.add_parser("bech32")
+    bech32.add_argument("address")
+    bech32.add_argument("--prefix", default="cosmos")
+
     args = parser.parse_args()
     if args.command == "genesis":
         patch_genesis_file(args.path, args.base, args.display, args.exponent)
-    else:
+    elif args.command == "app-toml":
         patch_app_file(args.path, args.evm_chain_id)
+    else:
+        print(evm_hex_to_bech32(args.address, args.prefix))
     return 0
 
 
