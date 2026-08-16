@@ -59,6 +59,9 @@ func preparedState(t *testing.T) (*State, SessionDelegation, SessionDelegation) 
 	if err := s.PublishProvider("provider", providerSession.SessionAddress, stateProvider("provider", "peer-1", 0, 20)); err != nil {
 		t.Fatal(err)
 	}
+	if err := s.AddBondedPriceCapacity("peer-1", 100); err != nil {
+		t.Fatal(err)
+	}
 	return s, requester, providerSession
 }
 
@@ -247,8 +250,34 @@ func TestGlobalPriceUsesConfirmedReservationNotReportedBusy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if price.AggregateBusyUnits != 95 || price.PricePerMillionUnits != 1050 {
+	if price.AggregateCapacityUnits != 100 || price.AggregateBusyUnits != 95 || price.PricePerMillionUnits != 1050 {
 		t.Fatalf("price state=%+v", price)
+	}
+}
+
+func TestUnbondedAdvertisedCapacityDoesNotLowerGlobalPrice(t *testing.T) {
+	s, err := NewState("wqpu-dev-1", 1000)
+	if err != nil { t.Fatal(err) }
+	providerSession := stateSession("provider", SessionPermProvider)
+	if err := s.AuthorizeSession(providerSession); err != nil { t.Fatal(err) }
+	provider := stateProvider("provider", "peer-fake", 0, 20)
+	provider.CapacityUnits = 1_000_000_000_000
+	if err := s.PublishProvider("provider", providerSession.SessionAddress, provider); err != nil { t.Fatal(err) }
+	price, err := s.ClosePriceEpoch()
+	if err != nil { t.Fatal(err) }
+	if price.AggregateCapacityUnits != 0 || price.PricePerMillionUnits != 1050 {
+		t.Fatalf("unbonded fake capacity affected global price: %+v", price)
+	}
+}
+
+func TestCannotUnbondProviderWhileWorkIsReserved(t *testing.T) {
+	s, requester, _ := preparedState(t)
+	if err := s.ReserveJob(jobFor(s, requester, "job-1", 10, 100, 10)); err != nil { t.Fatal(err) }
+	if err := s.RemoveBondedPriceCapacity("peer-1", 1); err == nil {
+		t.Fatal("provider bond should remain locked while work is reserved")
+	}
+	if s.BondedCapacityByPeer["peer-1"] != 100 {
+		t.Fatalf("bond changed after rejected unbond: %d", s.BondedCapacityByPeer["peer-1"])
 	}
 }
 
