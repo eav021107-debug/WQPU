@@ -11,16 +11,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	goruntime "runtime"
 	"strings"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 
-	"github.com/eav021107-debug/WQPU/client/internal/carrier"
 	"github.com/eav021107-debug/WQPU/client/internal/chainregistry"
-	"github.com/eav021107-debug/WQPU/client/internal/llamaruntime"
-	"github.com/eav021107-debug/WQPU/client/internal/rpcmesh"
+	"github.com/eav021107-debug/WQPU/client/internal/computenode"
 	"github.com/eav021107-debug/WQPU/client/internal/sessionkey"
 )
 
@@ -48,7 +45,7 @@ func registryPeer(id common.Hash, session, endpoint string) chainregistry.Peer {
 	}, ControlSession: common.HexToAddress(session)}
 }
 
-func waitHealth(ctx context.Context, process *llamaruntime.ManagedProcess, url string) error {
+func waitHealth(ctx context.Context, done <-chan struct{}, url string) error {
 	client := &http.Client{Timeout: 2 * time.Second}
 	ticker := time.NewTicker(250 * time.Millisecond)
 	defer ticker.Stop()
@@ -61,9 +58,7 @@ func waitHealth(ctx context.Context, process *llamaruntime.ManagedProcess, url s
 			if response.StatusCode == http.StatusOK { return nil }
 		}
 		select {
-		case <-process.Done():
-			if err := process.Wait(); err != nil { return fmt.Errorf("llama-server exited while loading split model: %w", err) }
-			return errors.New("llama-server exited while loading split model")
+		case <-done: return errors.New("distributed llama-server exited while loading model")
 		case <-ctx.Done(): return ctx.Err()
 		case <-ticker.C:
 		}
@@ -88,47 +83,54 @@ func completion(ctx context.Context, endpoint string) (string, error) {
 	return decoded.Content, nil
 }
 
-type providerRuntime struct {
+type smokeNode struct {
 	id      common.Hash
 	key     *sessionkey.Key
-	mesh    *rpcmesh.ProviderService
-	backend *llamaruntime.ManagedProcess
+	node    *computenode.Node
 	logFile *os.File
 	logPath string
 }
 
-func closeProvider(p *providerRuntime) {
-	if p == nil { return }
-	if p.mesh != nil { _ = p.mesh.Close() }
-	if p.backend != nil { _ = p.backend.Close() }
-	if p.logFile != nil { _ = p.logFile.Close() }
-}
-
-func startProvider(ctx context.Context, baseDir string, installed llamaruntime.Runtime, index, rpcPort int, requesterID common.Hash, requesterKey *sessionkey.Key) (*providerRuntime, error) {
-	key, err := sessionkey.Generate()
-	if err != nil { return nil, err }
-	id := peerID(byte(index + 2))
-	logPath := filepath.Join(baseDir, fmt.Sprintf("multipeer-rpc-%d.log", index))
-	logFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
-	if err != nil { return nil, err }
-	backend, err := llamaruntime.StartRPCServer(ctx, installed, rpcPort, 1, nil, false, logFile, 30*time.Second)
-	if err != nil { _ = logFile.Close(); return nil, err }
-
+func startNode(ctx context.Context, baseDir string, reg registry, id common.Hash, key *sessionkey.Key, rpcPort int, logPath string, output io.Writer) (*smokeNode, error) {
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil { _ = backend.Close(); _ = logFile.Close(); return nil, err }
-	providerRegistry := registry{requesterID: registryPeer(requesterID, requesterKey.Address(), "wqpu://127.0.0.1:1")}
-	mesh, err := rpcmesh.StartProviderOnListener(ctx, listener, rpcmesh.ProviderConfig{
-		Signer: key, ChainID: chainID, LocalPeerID: id, Registry: providerRegistry,
-		RPCTarget: fmt.Sprintf("127.0.0.1:%d", rpcPort), MaxConnections: 8,
+	if err != nil { return nil, err }
+	var logFile *os.File
+	if logPath != "" {
+		logFile, err = os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+		if err != nil { _ = listener.Close(); return nil, err }
+		output = logFile
+	}
+	node, err := computenode.Start(ctx, computenode.Config{
+		RuntimeBase: baseDir,
+		Signer: key,
+		ChainID: chainID,
+		LocalPeerID: id,
+		Registry: reg,
+		Listener: listener,
+		MaxConnections: 8,
+		RPCPort: rpcPort,
+		RPCThreads: 1,
+		RPCOutput: output,
+		BackendReady: 30 * time.Second,
 	})
-	if err != nil { _ = listener.Close(); _ = backend.Close(); _ = logFile.Close(); return nil, err }
-	return &providerRuntime{id: id, key: key, mesh: mesh, backend: backend, logFile: logFile, logPath: logPath}, nil
+	if err != nil {
+		_ = listener.Close()
+		if logFile != nil { _ = logFile.Close() }
+		return nil, err
+	}
+	return &smokeNode{id: id, key: key, node: node, logFile: logFile, logPath: logPath}, nil
 }
 
-func providerError(p *providerRuntime) error {
-	if p == nil || p.mesh == nil { return nil }
+func closeNode(n *smokeNode) {
+	if n == nil { return }
+	if n.node != nil { _ = n.node.Close() }
+	if n.logFile != nil { _ = n.logFile.Close() }
+}
+
+func providerError(node *computenode.Node) error {
+	if node == nil { return nil }
 	select {
-	case err, ok := <-p.mesh.Errors():
+	case err, ok := <-node.ProviderErrors():
 		if ok { return err }
 		return nil
 	default:
@@ -136,74 +138,75 @@ func providerError(p *providerRuntime) error {
 	}
 }
 
+func restoreEnv(name, previous string, existed bool) {
+	if existed { _ = os.Setenv(name, previous) } else { _ = os.Unsetenv(name) }
+}
+
 func run(baseDir string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-	installed, err := (llamaruntime.Installer{}).InstallCPU(ctx, baseDir, goruntime.GOOS, goruntime.GOARCH)
-	if err != nil { return err }
+	reg := registry{}
 
-	requesterKey, err := sessionkey.Generate()
+	requesterKey, err := sessionkey.Generate(); if err != nil { return err }
+	provider0Key, err := sessionkey.Generate(); if err != nil { return err }
+	provider1Key, err := sessionkey.Generate(); if err != nil { return err }
+	requesterID, provider0ID, provider1ID := peerID(1), peerID(2), peerID(3)
+
+	requester, err := startNode(ctx, baseDir, reg, requesterID, requesterKey, 50052, "", io.Discard)
 	if err != nil { return err }
-	requesterID := peerID(1)
+	defer closeNode(requester)
 
 	previousDebug, hadDebug := os.LookupEnv("GGML_RPC_DEBUG")
 	if err := os.Setenv("GGML_RPC_DEBUG", "1"); err != nil { return err }
-	provider0, err := startProvider(ctx, baseDir, installed, 0, 50053, requesterID, requesterKey)
-	if err != nil {
-		if hadDebug { _ = os.Setenv("GGML_RPC_DEBUG", previousDebug) } else { _ = os.Unsetenv("GGML_RPC_DEBUG") }
-		return err
-	}
-	provider1, err := startProvider(ctx, baseDir, installed, 1, 50054, requesterID, requesterKey)
-	if hadDebug { _ = os.Setenv("GGML_RPC_DEBUG", previousDebug) } else { _ = os.Unsetenv("GGML_RPC_DEBUG") }
-	if err != nil { closeProvider(provider0); return err }
-	defer closeProvider(provider0)
-	defer closeProvider(provider1)
+	provider0Path := filepath.Join(baseDir, "multipeer-rpc-0.log")
+	provider0, err := startNode(ctx, baseDir, reg, provider0ID, provider0Key, 50053, provider0Path, nil)
+	if err != nil { restoreEnv("GGML_RPC_DEBUG", previousDebug, hadDebug); return err }
+	provider1Path := filepath.Join(baseDir, "multipeer-rpc-1.log")
+	provider1, err := startNode(ctx, baseDir, reg, provider1ID, provider1Key, 50054, provider1Path, nil)
+	restoreEnv("GGML_RPC_DEBUG", previousDebug, hadDebug)
+	if err != nil { closeNode(provider0); return err }
+	defer closeNode(provider0)
+	defer closeNode(provider1)
 
-	requesterRegistry := registry{
-		provider0.id: registryPeer(provider0.id, provider0.key.Address(), provider0.mesh.Endpoint()),
-		provider1.id: registryPeer(provider1.id, provider1.key.Address(), provider1.mesh.Endpoint()),
-	}
-	openForwarder := func(remote common.Hash) (*rpcmesh.Forwarder, error) {
-		return rpcmesh.OpenForwarder(ctx, rpcmesh.ForwarderConfig{
-			Signer: requesterKey, ChainID: chainID, LocalPeerID: requesterID,
-			RemotePeerID: remote, Registry: requesterRegistry,
-			Dialer: carrier.TCPDialer{Timeout: 5 * time.Second},
-		})
-	}
-	forwarder0, err := openForwarder(provider0.id)
-	if err != nil { return err }
-	defer forwarder0.Close()
-	forwarder1, err := openForwarder(provider1.id)
-	if err != nil { return err }
-	defer forwarder1.Close()
+	// The smoke registry stands in for already-proven live chain resolution. All
+	// three equal compute nodes share one registry view before any RPC connection.
+	reg[requesterID] = registryPeer(requesterID, requesterKey.Address(), requester.node.ProviderEndpoint())
+	reg[provider0ID] = registryPeer(provider0ID, provider0Key.Address(), provider0.node.ProviderEndpoint())
+	reg[provider1ID] = registryPeer(provider1ID, provider1Key.Address(), provider1.node.ProviderEndpoint())
 
 	serverLogPath := filepath.Join(baseDir, "multipeer-server.log")
 	serverLog, err := os.OpenFile(serverLogPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil { return err }
-	server, err := llamaruntime.StartLlamaServerForHFFile(ctx, installed, apiPort, []string{forwarder0.Address(), forwarder1.Address()}, tinyRepo, tinyModelFile, llamaruntime.ServerTuning{
-		Devices: []string{"RPC0", "RPC1"}, SplitMode: "layer", TensorSplit: []uint64{1, 1}, GPULayers: 99, ContextSize: 128, Parallel: 1, Threads: 1,
+	defer serverLog.Close()
+	inference, err := requester.node.StartHFFileInference(ctx, []common.Hash{provider0ID, provider1ID}, apiPort, tinyRepo, tinyModelFile, computenode.InferenceTuning{
+		GPULayers: 99,
+		ContextSize: 128,
+		Parallel: 1,
+		Threads: 1,
+		SplitMode: "layer",
+		TensorSplit: []uint64{1, 1},
 	}, serverLog, 45*time.Second)
-	if err != nil { _ = serverLog.Close(); return err }
-	defer func() { _ = server.Close(); _ = serverLog.Close() }()
+	if err != nil { return err }
+	defer inference.Close()
 
-	baseURL := fmt.Sprintf("http://127.0.0.1:%d", apiPort)
-	if err := waitHealth(ctx, server, baseURL+"/health"); err != nil {
+	if err := waitHealth(ctx, inference.Done(), inference.APIURL()+"/health"); err != nil {
 		_ = serverLog.Sync(); log, _ := os.ReadFile(serverLogPath)
-		return fmt.Errorf("multipeer llama-server health: %w\n%s", err, log)
+		return fmt.Errorf("compute-node llama-server health: %w\n%s", err, log)
 	}
-	text, err := completion(ctx, baseURL+"/completion")
+	text, err := completion(ctx, inference.APIURL()+"/completion")
 	if err != nil { return err }
 
-	for index, p := range []*providerRuntime{provider0, provider1} {
-		if err := p.logFile.Sync(); err != nil { return err }
-		log, err := os.ReadFile(p.logPath)
+	for index, provider := range []*smokeNode{provider0, provider1} {
+		if provider.logFile == nil { return errors.New("missing provider RPC debug log") }
+		if err := provider.logFile.Sync(); err != nil { return err }
+		log, err := os.ReadFile(provider.logPath)
 		if err != nil { return err }
 		if !strings.Contains(string(log), "[alloc_buffer]") {
-			return fmt.Errorf("RPC%d never received remote model allocation:\n%s", index, log)
+			return fmt.Errorf("RPC%d compute node never received remote model allocation:\n%s", index, log)
 		}
-		if err := providerError(p); err != nil { return fmt.Errorf("RPC%d mesh error: %w", index, err) }
+		if err := providerError(provider.node); err != nil { return fmt.Errorf("RPC%d compute node mesh error: %w", index, err) }
 	}
-	fmt.Printf("two-peer production rpcmesh model inference allocated on RPC0 and RPC1: %q\n", text)
+	fmt.Printf("three equal WQPU compute nodes split one model across RPC0 and RPC1: %q\n", text)
 	return nil
 }
 
