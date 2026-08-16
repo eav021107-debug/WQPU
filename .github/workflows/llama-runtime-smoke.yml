@@ -43,6 +43,7 @@ jobs:
         run: |
           set -euo pipefail
           BASE="${RUNNER_TEMP}/wqpu-runtime"
+          echo "WQPU_RUNTIME_BASE=$BASE" >> "$GITHUB_ENV"
           (cd client && go run ./cmd/wqpu-runtime-install "$BASE") > runtime.paths
           cat runtime.paths
 
@@ -87,43 +88,18 @@ jobs:
           grep -F -- '--rpc' cli.help
           grep -F -- '--list-devices' cli.help
 
-      - name: Send real llama.cpp RPC protocol through WQPU SecureStream
+      - name: Send real llama.cpp RPC protocol through managed WQPU SecureStream
         shell: bash
         run: |
           set -euo pipefail
-          RPC="$(sed -n 's/^rpc=//p' runtime.paths)"
-          CLI="$(sed -n 's/^cli=//p' runtime.paths)"
-
-          "$RPC" --host 127.0.0.1 --port 50053 --threads 1 > rpc.log 2>&1 &
-          PID=$!
-          cleanup() {
-            kill "$PID" 2>/dev/null || true
-            wait "$PID" 2>/dev/null || true
-          }
-          trap cleanup EXIT
-
-          python3 - <<'PY'
-          import socket
-          import time
-          for _ in range(100):
-              try:
-                  with socket.create_connection(("127.0.0.1", 50053), timeout=0.25):
-                      break
-              except OSError:
-                  time.sleep(0.1)
-          else:
-              raise SystemExit("ggml-rpc-server did not bind loopback")
-          PY
-
-          kill -0 "$PID"
-          grep -F '127.0.0.1:50053' rpc.log
-          if grep -Fq "WARNING: Host ('127.0.0.1') is != '127.0.0.1'" rpc.log; then
-            echo 'llama.cpp RPC server unexpectedly considered loopback unsafe' >&2
+          # The helper reuses the verified runtime, starts ggml-rpc-server via
+          # llamaruntime.StartRPCServer, waits for loopback readiness, creates
+          # the encrypted WQPU tunnel, runs the real llama-cli RPC discovery,
+          # then tears the managed backend down itself.
+          (cd client && go run ./cmd/wqpu-llama-rpc-smoke --runtime-base "$WQPU_RUNTIME_BASE") 2>&1 | tee managed-rpc.log
+          grep -F 'real llama.cpp RPC crossed WQPU SecureStream' managed-rpc.log
+          if grep -Fq "WARNING: Host ('127.0.0.1') is != '127.0.0.1'" managed-rpc.log; then
+            echo 'managed llama.cpp RPC backend unexpectedly left loopback' >&2
             exit 1
           fi
-
-          # llama-cli never receives 50053. It sees only the random local WQPU
-          # forwarder; WQPU authenticates both sessions, encrypts the carrier,
-          # and the provider bridges only to this fixed loopback RPC target.
-          (cd client && go run ./cmd/wqpu-llama-rpc-smoke "$CLI" 127.0.0.1:50053)
-          echo 'Production WQPU installer + official llama.cpp RPC SecureStream smoke passed.'
+          echo 'Production WQPU installer + process manager + official llama.cpp SecureStream smoke passed.'
