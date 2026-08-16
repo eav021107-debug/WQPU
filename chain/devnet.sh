@@ -112,6 +112,10 @@ if [ ! -f "$CHAIN_HOME/config/genesis.json" ]; then
   python3 "$HERE/devnet_config.py" app-toml "$CHAIN_HOME/config/app.toml" \
     --evm-chain-id "$EVM_CHAIN_ID"
 
+  # Cosmos EVM uses its application mempool and requires CometBFT to delegate
+  # mempool handling instead of running the default flood mempool.
+  python3 "$HERE/devnet_config.py" config-toml "$CHAIN_HOME/config/config.toml"
+
   # 1,000,000 WQPU for the dev validator; 10,000 WQPU bonded at genesis.
   "$BIN" genesis add-genesis-account validator \
     "1000000000000000000000000${BASE_DENOM}" \
