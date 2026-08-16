@@ -6,14 +6,16 @@ option go_package = "github.com/eav021107-debug/WQPU/chain/x/wqpu/types";
 
 // Wallet-authorized local session. Wallet secrets never enter WQPU.
 message SessionDelegation {
-  string wallet = 1;
-  bytes session_pubkey = 2;
-  uint64 issued_height = 3;
-  uint64 expires_height = 4;
-  uint64 max_spend_units = 5;
-  uint64 max_job_units = 6;
-  uint64 revocation_nonce = 7;
-  uint64 permissions = 8;
+  string chain_id = 1;
+  string wallet = 2;
+  bytes session_pubkey = 3;
+  uint64 issued_height = 4;
+  uint64 expires_height = 5;
+  uint64 max_spend_units = 6;
+  uint64 max_job_units = 7;
+  uint64 revocation_nonce = 8;
+  uint64 permissions = 9;
+  uint32 protocol_version = 10;
 }
 
 // Active compute advertisement stored in WQPU chain state.
