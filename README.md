@@ -1,28 +1,28 @@
-# WQPU 0.4
+# WQPU 0.5
 
 **Equal-peer distributed LLM over the WQPU protocol. No Tailscale and no permanent coordinator.**
 
-All contributor computers have the same role. The VPS is only a small encrypted relay/meeting point so machines behind NAT can reach each other. It does not run the model and does not choose a leader.
+Every contributor computer has the same role. The VPS is only an encrypted meeting point/relay for machines behind NAT. It does not run the model and it does not choose a leader.
 
 ```text
 Mac ─────┐
-Windows ─┼── encrypted WQPU relay ── peer network
+Windows ─┼── encrypted WQPU relay ── equal peers
 Linux ───┘
 ```
 
 ## How a question works
 
-If a user asks from PC A, PC A coordinates only that request:
+If a question is asked on PC A, only PC A temporarily coordinates that request:
 
 ```text
-question on A -> A connects B/C/D as helpers -> answer returns to A -> temporary coordinator disappears
+question on A -> A connects online peers as helpers -> answer returns to A -> temporary coordinator stops
 ```
 
-If the next question is asked from PC C, then C coordinates that request. There is no permanent main computer and no node has extra rights.
+If the next question is asked on PC C, PC C does the same. There is no permanent main computer and no peer has extra rights.
 
-Every online node keeps only a localhost `ggml-rpc-server` running and contributes about 50% of its logical CPU threads. A temporary `llama-server` is started only on the machine that asks a question, uses the other online peers through encrypted WQPU tunnels, returns the answer, then stops.
+Each online peer keeps only a localhost `ggml-rpc-server` running and contributes about 50% of its logical CPU threads. A temporary `llama-server` exists only while that computer is answering its own user's request.
 
-## 1. Relay on the VPS
+## 1. Install the relay on the VPS
 
 Run once:
 
@@ -30,19 +30,17 @@ Run once:
 curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install-relay.sh | sudo sh
 ```
 
-The installer prints private join commands. The relay only needs TCP `7443` reachable from the Internet.
+The installer prints private join commands for Linux/macOS and Windows. Only TCP `7443` needs to be reachable on the VPS.
 
-## 2. Contributor computers
+## 2. Join contributor computers
 
-Linux/macOS uses the command printed by the relay, shaped like:
+Use the command printed by the relay. Linux/macOS looks like:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install-node.sh | sh -s -- 'WQPU1....'
 ```
 
-Windows gets a PowerShell command from the relay installer.
-
-Keep WQPU running while contributing. In another terminal:
+Keep that terminal open while the computer contributes. In another terminal:
 
 ```bash
 wqpu status
@@ -51,22 +49,39 @@ wqpu ask "Hello, who are you?"
 
 ## Access rule
 
-The MVP rule is simple: an authenticated node that is online and contributing can ask questions. Precise credits/accounting are not implemented yet.
+The MVP rule is: a node that is authenticated, online, and running its contributor worker can ask questions. Precise contribution accounting/credits are not implemented yet.
 
 ## Security
 
-The join token contains the relay address, a random cluster secret, and the pinned SHA-256 fingerprint of the relay TLS certificate. Nodes verify that fingerprint before using the relay. The token is private.
+The join token contains the relay address, a random shared cluster secret, and a pinned SHA-256 fingerprint of the relay TLS certificate. Peers verify that fingerprint before sending traffic.
 
-`llama.cpp` RPC stays bound to `127.0.0.1`; WQPU carries it through the encrypted relay, so TCP `50052` is not exposed publicly.
+`llama.cpp` RPC is bound only to `127.0.0.1`. WQPU carries RPC through the encrypted relay, so TCP `50052` is not exposed to the public Internet.
 
-## Model quality
+## Model
 
-Distribution does not change or requantize the model. Quality is determined by the chosen GGUF model. The default `gemma-3-1b-it Q4_K_M` is only a connectivity test model.
+The default test model is:
 
-## MVP limitations
+```text
+ggml-org/gemma-3-1b-it-GGUF:Q4_K_M
+```
 
-- CPU backend first; GPU acceleration comes later.
+Set `WQPU_MODEL` before asking if you want another compatible Hugging Face GGUF repo. Distribution itself does not change or requantize the weights.
+
+## Current files
+
+The project intentionally stays small:
+
+- `wqpu.py` — the only peer client;
+- `relay.py` — relay/rendezvous only;
+- `install-node.sh` — Linux/macOS peer installer;
+- `install-node.ps1` — Windows peer installer;
+- `install-relay.sh` — VPS relay installer;
+- `README.md` — this documentation.
+
+## Current limitations
+
+- CPU backend first; automatic GPU acceleration is not implemented yet.
 - WAN RPC can be slow because inference is sensitive to latency and bandwidth.
-- Simultaneous requests from many peers still need stress testing and resource admission controls.
-- Shared join tokens are temporary MVP authentication; per-user identities/credits come later.
-- Experimental prototype, not yet a hardened public compute marketplace.
+- Multiple simultaneous request-originators can compete for the same contributor resources; admission control still needs stress testing.
+- Authentication uses one shared cluster join token in this MVP; per-user identities/credits are not implemented yet.
+- This is an experimental prototype, not yet a hardened public compute marketplace.
