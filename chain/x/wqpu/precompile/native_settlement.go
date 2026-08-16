@@ -22,7 +22,7 @@ func FinalizeJobNative(evm *vm.EVM, jobID [32]byte, height uint64, timedOut bool
 	totalNative, err := PaymentUnitsToNative(settlement.TotalCharge)
 	if err != nil { return JobSettlement{}, err }
 	if settlement.TotalCharge > 0 {
-		if evm.Context.CanTransfer == nil || evm.Context.Transfer == nil || !evm.Context.CanTransfer(evm.StateDB, Address, totalNative) {
+		if evm.Context.CanTransfer == nil || !evm.Context.CanTransfer(evm.StateDB, Address, totalNative) {
 			return JobSettlement{}, errors.New("WQPU precompile native balance cannot cover settlement")
 		}
 	}
@@ -36,7 +36,9 @@ func FinalizeJobNative(evm *vm.EVM, jobID [32]byte, height uint64, timedOut bool
 		for _, payout := range settlement.Payouts {
 			amount, err := PaymentUnitsToNative(payout.PaymentUnits)
 			if err != nil { return JobSettlement{}, err }
-			evm.Context.Transfer(evm.StateDB, Address, payout.ProviderWallet, amount)
+			if err := transferNative(evm, Address, payout.ProviderWallet, amount); err != nil {
+				return JobSettlement{}, err
+			}
 		}
 	}
 	return settlement, nil
