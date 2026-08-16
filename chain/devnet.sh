@@ -18,7 +18,7 @@ usage() {
 Usage: chain/devnet.sh [--reset] [--build-only]
 
 --reset       delete only the local WQPU devnet state and create a fresh genesis
---build-only  fetch/verify/build the pinned chain runtime, then exit
+--build-only  fetch/verify/patch/build the pinned WQPU chain runtime, then exit
 EOF
 }
 
@@ -59,7 +59,17 @@ if [ "$ACTUAL_COMMIT" != "$COSMOS_EVM_COMMIT" ]; then
   exit 1
 fi
 
-echo "WQPU chain: building pinned runtime..."
+echo "WQPU chain: applying native 0x0900 wallet/provider/job/receipt/escrow/bond/price overlay..."
+python3 "$HERE/runtime_patch_settlement.py" \
+  --source "$SRC_DIR" \
+  --overlay "$HERE/x/wqpu/precompile"
+
+if ! grep -q 'WithWQPUSettlementNetwork' "$SRC_DIR/evmd/app.go"; then
+  echo "WQPU chain overlay registration verification failed." >&2
+  exit 1
+fi
+
+echo "WQPU chain: building pinned WQPU runtime..."
 (
   cd "$SRC_DIR/evmd"
   GOWORK=off go build -trimpath -o "$BIN" ./cmd/evmd
@@ -122,6 +132,7 @@ echo "WQPU sovereign devnet"
 echo "  chain-id:      $CHAIN_ID"
 echo "  EVM chain-id:  $EVM_CHAIN_ID"
 echo "  native coin:   $DISPLAY_DENOM ($BASE_DENOM)"
+echo "  precompile:    0x0000000000000000000000000000000000000900"
 echo "  JSON-RPC:      http://127.0.0.1:8545"
 echo "  data:          $CHAIN_HOME"
 echo
