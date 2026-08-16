@@ -10,14 +10,14 @@ from wqpu_next.wallet_session import build_session_typed_data, build_wallet_requ
 
 
 WALLET = "0x1111111111111111111111111111111111111111"
-SESSION_KEY = "0x" + "22" * 32
+SESSION_ADDRESS = "0x2222222222222222222222222222222222222222"
 
 
 def delegation(**changes):
     values = dict(
         chain_id="wqpu-dev-1",
         wallet=WALLET,
-        session_pubkey=SESSION_KEY,
+        session_address=SESSION_ADDRESS,
         issued_height=100,
         expires_height=200,
         max_spend_units=1_000_000,
@@ -30,10 +30,11 @@ def delegation(**changes):
 
 
 class WalletSessionTests(unittest.TestCase):
-    def test_typed_data_binds_both_chain_ids_and_limits(self):
+    def test_typed_data_binds_both_chain_ids_session_and_limits(self):
         typed = build_session_typed_data(delegation(), 711711)
         self.assertEqual(typed["domain"]["chainId"], 711711)
         self.assertEqual(typed["message"]["wqpuChainId"], "wqpu-dev-1")
+        self.assertEqual(typed["message"]["sessionAddress"], SESSION_ADDRESS)
         self.assertEqual(typed["message"]["maxSpendUnits"], 1_000_000)
         self.assertEqual(typed["message"]["maxJobUnits"], 100_000)
         self.assertEqual(typed["message"]["permissions"], SESSION_PERM_JOB)
@@ -53,9 +54,14 @@ class WalletSessionTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             build_session_typed_data(delegation(wallet="not-a-wallet"), 711711)
 
-    def test_invalid_session_key_is_rejected(self):
+    def test_invalid_session_address_is_rejected(self):
         with self.assertRaises(ValueError):
-            build_session_typed_data(delegation(session_pubkey="0x1234"), 711711)
+            build_session_typed_data(delegation(session_address="0x1234"), 711711)
+        with self.assertRaises(ValueError):
+            build_session_typed_data(
+                delegation(session_address="0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+                711711,
+            )
 
     def test_expired_shape_is_rejected_before_wallet_prompt(self):
         with self.assertRaises(ValueError):
