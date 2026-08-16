@@ -20,7 +20,7 @@ type SessionRequest struct {
 	WQPUChainID     string
 	EVMChainID      uint64
 	Wallet          string
-	SessionPubkey   string
+	SessionAddress  string
 	IssuedHeight    uint64
 	ExpiresHeight   uint64
 	MaxSpendUnits   uint64
@@ -56,8 +56,8 @@ func (r SessionRequest) Validate() error {
 	if !validHex(r.Wallet, 20) {
 		return errors.New("wallet must be a 20-byte 0x-prefixed address")
 	}
-	if !validHex(r.SessionPubkey, 32) {
-		return errors.New("session public key must be 32-byte 0x-prefixed hex")
+	if !validHex(r.SessionAddress, 20) || r.SessionAddress != strings.ToLower(r.SessionAddress) {
+		return errors.New("session address must be a canonical lowercase EVM address")
 	}
 	if r.ExpiresHeight <= r.IssuedHeight {
 		return errors.New("session expiry must follow issue height")
@@ -74,14 +74,14 @@ func BuildSessionTypedData(r SessionRequest) (TypedData, error) {
 	}
 	return TypedData{
 		Types: map[string][]TypeField{
-			"EIP712Domain": []TypeField{
+			"EIP712Domain": {
 				{Name: "name", Type: "string"},
 				{Name: "version", Type: "string"},
 				{Name: "chainId", Type: "uint256"},
 			},
-			"WQPUSession": []TypeField{
+			"WQPUSession": {
 				{Name: "wallet", Type: "address"},
-				{Name: "sessionPubkey", Type: "bytes32"},
+				{Name: "sessionAddress", Type: "address"},
 				{Name: "wqpuChainId", Type: "string"},
 				{Name: "issuedHeight", Type: "uint64"},
 				{Name: "expiresHeight", Type: "uint64"},
@@ -100,7 +100,7 @@ func BuildSessionTypedData(r SessionRequest) (TypedData, error) {
 		},
 		Message: map[string]any{
 			"wallet":          r.Wallet,
-			"sessionPubkey":   r.SessionPubkey,
+			"sessionAddress":  r.SessionAddress,
 			"wqpuChainId":     r.WQPUChainID,
 			"issuedHeight":    r.IssuedHeight,
 			"expiresHeight":   r.ExpiresHeight,
