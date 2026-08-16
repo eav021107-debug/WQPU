@@ -1,7 +1,12 @@
 import copy
 import unittest
 
-from chain.devnet_config import NATIVE_PRECOMPILE, patch_app_toml, patch_genesis
+from chain.devnet_config import (
+    NATIVE_PRECOMPILE,
+    evm_hex_to_bech32,
+    patch_app_toml,
+    patch_genesis,
+)
 
 
 class GenesisPatchTests(unittest.TestCase):
@@ -40,6 +45,18 @@ class GenesisPatchTests(unittest.TestCase):
         a = patch_genesis(copy.deepcopy(src), "awqpu", "WQPU", 18)
         b = patch_genesis(copy.deepcopy(src), "awqpu", "WQPU", 18)
         self.assertEqual(a, b)
+
+
+class AddressConversionTests(unittest.TestCase):
+    def test_ci_evm_address_has_pinned_cosmos_bech32_form(self):
+        self.assertEqual(
+            evm_hex_to_bech32("0x69e839c39103813cd198767E0567254C0624a240"),
+            "cosmos1d85rnsu3qwqne5vcwelq2ee9fsrzfgjqmfsa9f",
+        )
+
+    def test_address_conversion_rejects_wrong_length(self):
+        with self.assertRaises(ValueError):
+            evm_hex_to_bech32("0x1234")
 
 
 class AppTomlPatchTests(unittest.TestCase):
