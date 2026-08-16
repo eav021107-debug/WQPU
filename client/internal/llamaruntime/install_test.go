@@ -30,9 +30,10 @@ func tarFixture(t *testing.T, entries []tar.Header, bodies [][]byte) []byte {
 		header := entries[index]
 		body := bodies[index]
 		if header.Typeflag == 0 { header.Typeflag = tar.TypeReg }
-		if header.Typeflag == tar.TypeReg || header.Typeflag == tar.TypeRegA { header.Size = int64(len(body)) }
+		regular := header.Typeflag == tar.TypeReg || header.Typeflag == tar.TypeRegA
+		if regular { header.Size = int64(len(body)) }
 		if err := tw.WriteHeader(&header); err != nil { t.Fatal(err) }
-		if len(body) > 0 {
+		if regular && len(body) > 0 {
 			if _, err := tw.Write(body); err != nil { t.Fatal(err) }
 		}
 	}
