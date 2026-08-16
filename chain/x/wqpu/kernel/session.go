@@ -1,6 +1,10 @@
 package kernel
 
-import "errors"
+import (
+	"encoding/hex"
+	"errors"
+	"strings"
+)
 
 const (
 	SessionPermProvider uint64 = 1 << iota
@@ -9,10 +13,25 @@ const (
 	SessionAllPermissions = SessionPermProvider | SessionPermJob | SessionPermSettle
 )
 
+func validSessionAddress(value string) bool {
+	if len(value) != 42 || !strings.HasPrefix(value, "0x") {
+		return false
+	}
+	decoded, err := hex.DecodeString(value[2:])
+	return err == nil && len(decoded) == 20
+}
+
+func CanonicalSessionAddress(value string) (string, error) {
+	if !validSessionAddress(value) {
+		return "", errors.New("session address must be a 20-byte 0x-prefixed address")
+	}
+	return strings.ToLower(value), nil
+}
+
 type SessionDelegation struct {
 	ChainID           string
 	Wallet            string
-	SessionPubkey     [32]byte
+	SessionAddress    string
 	IssuedHeight      uint64
 	ExpiresHeight     uint64
 	MaxSpendUnits     uint64
@@ -26,9 +45,12 @@ func (d SessionDelegation) Validate() error {
 	if d.ChainID == "" || d.Wallet == "" {
 		return errors.New("session chain and wallet must be non-empty")
 	}
-	var zero [32]byte
-	if d.SessionPubkey == zero {
-		return errors.New("session public key must be non-zero")
+	canonical, err := CanonicalSessionAddress(d.SessionAddress)
+	if err != nil {
+		return err
+	}
+	if canonical != d.SessionAddress {
+		return errors.New("session address must use canonical lowercase hex")
 	}
 	if d.ExpiresHeight <= d.IssuedHeight {
 		return errors.New("session expiry must follow issue height")
@@ -43,10 +65,10 @@ func (d SessionDelegation) Validate() error {
 }
 
 type SessionState struct {
-	Delegation   SessionDelegation
-	SpentUnits   uint64
+	Delegation    SessionDelegation
+	SpentUnits    uint64
 	ReservedUnits uint64
-	Revoked      bool
+	Revoked       bool
 }
 
 func singlePermission(permission uint64) bool {
