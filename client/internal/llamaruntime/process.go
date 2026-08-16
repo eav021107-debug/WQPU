@@ -155,3 +155,13 @@ func StartLlamaServerForHFRepo(parent context.Context, runtime Runtime, apiPort 
 	if err := waitLoopbackReady(parent, process, apiPort, readiness); err != nil { return nil, err }
 	return process, nil
 }
+
+func StartLlamaServerForHFFile(parent context.Context, runtime Runtime, apiPort int, rpcEndpoints []string, repo, file string, tuning ServerTuning, output io.Writer, readiness time.Duration) (*ManagedProcess, error) {
+	if err := executableInside(runtime.Root, runtime.LlamaServer); err != nil { return nil, err }
+	args, err := ServerArgsForHFFile(apiPort, rpcEndpoints, repo, file, tuning)
+	if err != nil { return nil, err }
+	process, err := startManaged(parent, runtime.LlamaServer, args, output)
+	if err != nil { return nil, err }
+	if err := waitLoopbackReady(parent, process, apiPort, readiness); err != nil { return nil, err }
+	return process, nil
+}
