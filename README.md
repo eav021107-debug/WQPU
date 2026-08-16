@@ -1,60 +1,72 @@
-# WQPU 0.3
+# WQPU 0.4
 
-**One LLM across computers connected through the WQPU protocol. No Tailscale required.**
+**Equal-peer distributed LLM over the WQPU protocol. No Tailscale and no permanent coordinator.**
 
-WQPU uses one small public VPS as a TLS relay/coordinator. Contributor computers make outbound encrypted connections to the relay. `llama.cpp` RPC stays on localhost and is tunneled through WQPU, so port `50052` is never exposed to the Internet.
+All contributor computers have the same role. The VPS is only a small encrypted relay/meeting point so machines behind NAT can reach each other. It does not run the model and does not choose a leader.
 
 ```text
 Mac ─────┐
-Windows ─┼── encrypted WQPU relay ── one llama-server
+Windows ─┼── encrypted WQPU relay ── peer network
 Linux ───┘
 ```
 
-## 1. Install the relay once on the VPS
+## How a question works
+
+If a user asks from PC A, PC A coordinates only that request:
+
+```text
+question on A -> A connects B/C/D as helpers -> answer returns to A -> temporary coordinator disappears
+```
+
+If the next question is asked from PC C, then C coordinates that request. There is no permanent main computer and no node has extra rights.
+
+Every online node keeps only a localhost `ggml-rpc-server` running and contributes about 50% of its logical CPU threads. A temporary `llama-server` is started only on the machine that asks a question, uses the other online peers through encrypted WQPU tunnels, returns the answer, then stops.
+
+## 1. Relay on the VPS
+
+Run once:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install-relay.sh | sudo sh
 ```
 
-The relay installer prints a **single node-install command** containing a private join token. Copy that command to each contributor computer.
+The installer prints private join commands. The relay only needs TCP `7443` reachable from the Internet.
 
 ## 2. Contributor computers
 
-Linux/macOS command is printed automatically by the relay. It has this form:
+Linux/macOS uses the command printed by the relay, shaped like:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install-node.sh | sh -s -- 'WQPU1....'
 ```
 
-Windows PowerShell command is also printed by the relay.
+Windows gets a PowerShell command from the relay installer.
 
-Every connected node:
+Keep WQPU running while contributing. In another terminal:
 
-- contributes about 50% of its logical CPU threads by default;
-- keeps inference processes at lower priority;
-- gets local access to the shared LLM at `http://127.0.0.1:8080`;
-- can ask from the terminal with `wqpu ask "your question"`;
-- can check the cluster with `wqpu status`.
+```bash
+wqpu status
+wqpu ask "Hello, who are you?"
+```
 
-The computer with the most RAM becomes the inference coordinator. Other nodes expose only a localhost `ggml-rpc-server`; the WQPU relay tunnels RPC traffic between machines.
+## Access rule
 
-## Multi-user model
-
-In this MVP, **an online authenticated node is a contributor and gets access to the shared model**. All users talk to the same `llama-server`, which supports concurrent requests. Precise contribution credits/accounting are intentionally not implemented yet; that comes after the network/inference path is proven stable.
+The MVP rule is simple: an authenticated node that is online and contributing can ask questions. Precise credits/accounting are not implemented yet.
 
 ## Security
 
-The relay generates its own TLS certificate. The node join token contains the pinned SHA-256 certificate fingerprint and a random cluster secret. Nodes verify the relay certificate fingerprint before sending traffic. The join token is private and should not be posted publicly.
+The join token contains the relay address, a random cluster secret, and the pinned SHA-256 fingerprint of the relay TLS certificate. Nodes verify that fingerprint before using the relay. The token is private.
 
-Only the WQPU relay port (`7443/tcp` by default) needs to be Internet-accessible. `llama.cpp` RPC and the local chat/API are bound to localhost.
+`llama.cpp` RPC stays bound to `127.0.0.1`; WQPU carries it through the encrypted relay, so TCP `50052` is not exposed publicly.
 
 ## Model quality
 
-WQPU distribution itself does not quantize or alter model weights. Quality is determined by the GGUF model you choose. The default small `gemma-3-1b-it Q4_K_M` model is only for the first connectivity test.
+Distribution does not change or requantize the model. Quality is determined by the chosen GGUF model. The default `gemma-3-1b-it Q4_K_M` is only a connectivity test model.
 
-## Current MVP limitations
+## MVP limitations
 
-- CPU backend first; GPU auto-detection/acceleration is the next step.
-- Internet RPC is functional but can be slow because transformer inference is latency/bandwidth sensitive.
-- Join tokens are shared-cluster credentials; per-user accounts and contribution credits are not implemented yet.
-- This remains an experimental prototype, not a hardened public compute marketplace.
+- CPU backend first; GPU acceleration comes later.
+- WAN RPC can be slow because inference is sensitive to latency and bandwidth.
+- Simultaneous requests from many peers still need stress testing and resource admission controls.
+- Shared join tokens are temporary MVP authentication; per-user identities/credits come later.
+- Experimental prototype, not yet a hardened public compute marketplace.
