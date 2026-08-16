@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -134,5 +134,3 @@ func main() {
 		os.Exit(1)
 	}
 }
-
-var _ = sync.Once{}
