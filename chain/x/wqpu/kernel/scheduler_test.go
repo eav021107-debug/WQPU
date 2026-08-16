@@ -1,9 +1,6 @@
 package kernel
 
-import (
-	"math"
-	"testing"
-)
+import "testing"
 
 const testModel = "model-sha256:abc"
 
@@ -113,7 +110,8 @@ func TestChargeRoundsUpAndRejectsOverflow(t *testing.T) {
 	if err != nil || v != 1000 {
 		t.Fatalf("full charge=%d err=%v", v, err)
 	}
-	if _, err := ChargeForUnits(math.MaxUint64, math.MaxUint64); err == nil {
+	max := ^uint64(0)
+	if _, err := ChargeForUnits(max, max); err == nil {
 		t.Fatal("expected overflow error")
 	}
 }
