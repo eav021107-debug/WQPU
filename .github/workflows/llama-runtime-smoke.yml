@@ -13,6 +13,7 @@ on:
       - 'client/internal/transport/**'
       - 'client/cmd/wqpu-runtime-install/**'
       - 'client/cmd/wqpu-llama-rpc-smoke/**'
+      - 'client/cmd/wqpu-llama-model-smoke/**'
       - '.github/workflows/llama-runtime-smoke.yml'
   workflow_dispatch:
 
@@ -26,7 +27,7 @@ permissions:
 jobs:
   official-linux-x64:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -83,6 +84,9 @@ jobs:
           grep -F -- '--fit' server.help
           grep -F -- '--host' server.help
           grep -F -- '--port' server.help
+          grep -F -- '--hf-file' server.help
+          grep -F -- '--device' server.help
+          grep -F -- '--n-gpu-layers' server.help
 
           "$CLI" --help > cli.help 2>&1
           grep -F -- '--rpc' cli.help
@@ -92,14 +96,22 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The helper reuses the verified runtime, starts ggml-rpc-server via
-          # llamaruntime.StartRPCServer, waits for loopback readiness, creates
-          # the encrypted WQPU tunnel, runs the real llama-cli RPC discovery,
-          # then tears the managed backend down itself.
           (cd client && go run ./cmd/wqpu-llama-rpc-smoke --runtime-base "$WQPU_RUNTIME_BASE") 2>&1 | tee managed-rpc.log
           grep -F 'real llama.cpp RPC crossed WQPU SecureStream' managed-rpc.log
           if grep -Fq "WARNING: Host ('127.0.0.1') is != '127.0.0.1'" managed-rpc.log; then
             echo 'managed llama.cpp RPC backend unexpectedly left loopback' >&2
             exit 1
           fi
-          echo 'Production WQPU installer + process manager + official llama.cpp SecureStream smoke passed.'
+
+      - name: Load and infer a tiny model on remote WQPU RPC0
+        shell: bash
+        run: |
+          set -euo pipefail
+          # b10453's own server tests use ggml-org/models +
+          # tinyllamas/stories260K.gguf. The helper starts llama-server with
+          # --device RPC0 --n-gpu-layers 99, waits for /health=200, then POSTs
+          # /completion. If the encrypted remote backend is absent, startup fails.
+          (cd client && go run ./cmd/wqpu-llama-model-smoke --runtime-base "$WQPU_RUNTIME_BASE") 2>&1 | tee model-smoke.log
+          grep -F 'tiny model inference crossed remote WQPU RPC0' model-smoke.log
+          grep -F 'RPC0' "$WQPU_RUNTIME_BASE/model-smoke-server.log"
+          echo 'Remote WQPU RPC0 model-load and inference smoke passed.'
