@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 NATIVE_PRECOMPILE = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE"
+WQPU_PRECOMPILE = "0x0000000000000000000000000000000000000900"
 BECH32_CHARSET = "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
 
 
@@ -37,7 +38,16 @@ def patch_genesis(data: dict[str, Any], base: str, display: str, exponent: int) 
 
     _set_if_present(app, ["staking", "params", "bond_denom"], base)
     _set_if_present(app, ["mint", "params", "mint_denom"], base)
-    _set_if_present(app, ["evm", "params", "evm_denom"], base)
+
+    evm = app.get("evm")
+    if not isinstance(evm, dict) or not isinstance(evm.get("params"), dict):
+        raise ValueError("genesis is missing EVM params")
+    evm_params = evm["params"]
+    evm_params["evm_denom"] = base
+    # Cosmos EVM keeps the compile-time precompile map and the consensus-active
+    # address list separately. 0x0900 must be present in both or calls are
+    # treated like calls to an ordinary empty EVM account.
+    evm_params["active_static_precompiles"] = [WQPU_PRECOMPILE]
 
     gov = app.get("gov")
     if isinstance(gov, dict):
