@@ -161,7 +161,7 @@ fi
 mkdir -p "$ROOT" "$BIN"
 
 curl -fsSL --retry 3 \
-  "${RAW}/wqpu.py?version=0.5.2" \
+  "${RAW}/wqpu.py?installer=0.5.3" \
   -o "$ROOT/wqpu.py"
 chmod 755 "$ROOT/wqpu.py"
 
@@ -188,13 +188,18 @@ fi
 
 echo "WQPU installed with $($PYTHON --version 2>&1). Starting this computer as an equal peer..."
 
-# curl | sh uses the pipe as stdin. Give the interactive WQPU CLI the real terminal.
+# When install.sh is read from `curl | sh`, the shell itself still needs the
+# pipe as stdin. Redirect only the final WQPU process to the real terminal.
 if [ -r /dev/tty ]; then
-  exec </dev/tty
-fi
-
-if [ -n "$JOIN" ]; then
-  exec "$BIN/wqpu" --join "$JOIN"
+  if [ -n "$JOIN" ]; then
+    exec "$BIN/wqpu" --join "$JOIN" </dev/tty
+  else
+    exec "$BIN/wqpu" </dev/tty
+  fi
 else
-  exec "$BIN/wqpu"
+  if [ -n "$JOIN" ]; then
+    exec "$BIN/wqpu" --join "$JOIN"
+  else
+    exec "$BIN/wqpu"
+  fi
 fi
