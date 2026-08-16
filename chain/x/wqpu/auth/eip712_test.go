@@ -17,14 +17,14 @@ func signedDelegation(t *testing.T) (kernel.SessionDelegation, string) {
 		t.Fatal(err)
 	}
 	wallet := crypto.PubkeyToAddress(key.PublicKey).Hex()
-	var session [32]byte
-	for i := range session {
-		session[i] = byte(i + 1)
+	sessionKey, err := crypto.HexToECDSA("8f2a559490e4f2fda090c1121e52d1d02235d61cf511bfd5baf0f68c19d0f4f3")
+	if err != nil {
+		t.Fatal(err)
 	}
 	d := kernel.SessionDelegation{
 		ChainID:         "wqpu-dev-1",
 		Wallet:          wallet,
-		SessionPubkey:   session,
+		SessionAddress:  strings.ToLower(crypto.PubkeyToAddress(sessionKey.PublicKey).Hex()),
 		IssuedHeight:    100,
 		ExpiresHeight:   200,
 		MaxSpendUnits:   1_000_000,
@@ -68,6 +68,14 @@ func TestTamperedSessionLimitInvalidatesSignature(t *testing.T) {
 	d.MaxSpendUnits++
 	if err := VerifySessionSignature(d, 711711, sig); err == nil {
 		t.Fatal("tampered spend limit should invalidate wallet signature")
+	}
+}
+
+func TestTamperedSessionAddressInvalidatesSignature(t *testing.T) {
+	d, sig := signedDelegation(t)
+	d.SessionAddress = "0x1111111111111111111111111111111111111111"
+	if err := VerifySessionSignature(d, 711711, sig); err == nil {
+		t.Fatal("tampered session address should invalidate wallet signature")
 	}
 }
 
