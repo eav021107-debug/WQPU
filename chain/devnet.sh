@@ -109,13 +109,6 @@ if [ ! -f "$CHAIN_HOME/config/genesis.json" ]; then
     --display "$DISPLAY_DENOM" \
     --exponent "$DISPLAY_EXPONENT"
 
-  python3 "$HERE/devnet_config.py" app-toml "$CHAIN_HOME/config/app.toml" \
-    --evm-chain-id "$EVM_CHAIN_ID"
-
-  # Cosmos EVM uses its application mempool and requires CometBFT to delegate
-  # mempool handling instead of running the default flood mempool.
-  python3 "$HERE/devnet_config.py" config-toml "$CHAIN_HOME/config/config.toml"
-
   # 1,000,000 WQPU for the dev validator; 10,000 WQPU bonded at genesis.
   "$BIN" genesis add-genesis-account validator \
     "1000000000000000000000000${BASE_DENOM}" \
@@ -142,6 +135,12 @@ if [ ! -f "$CHAIN_HOME/config/genesis.json" ]; then
   "$BIN" genesis collect-gentxs --home "$CHAIN_HOME" >/dev/null
   "$BIN" genesis validate-genesis --home "$CHAIN_HOME" >/dev/null
 fi
+
+# Runtime config is repaired on every start, not just first genesis creation.
+# This makes an existing devnet home self-heal after older WQPU versions.
+python3 "$HERE/devnet_config.py" app-toml "$CHAIN_HOME/config/app.toml" \
+  --evm-chain-id "$EVM_CHAIN_ID"
+python3 "$HERE/devnet_config.py" config-toml "$CHAIN_HOME/config/config.toml"
 
 echo "WQPU sovereign devnet"
 echo "  chain-id:      $CHAIN_ID"
