@@ -35,20 +35,23 @@ def provider(
 
 
 class PriceTests(unittest.TestCase):
-    def test_high_utilization_increases_one_global_price(self):
-        p = [provider("a", "p1", 100, 95, 1_000_000)]
-        state = aggregate_price_state(p, 1000, 1)
+    def test_high_confirmed_demand_increases_one_global_price(self):
+        state = aggregate_price_state(100, 95, 1000, 1)
         self.assertGreater(state.price_per_million_units, 1000)
         self.assertLessEqual(state.price_per_million_units, 1050)
 
-    def test_low_utilization_decreases_price(self):
-        p = [provider("a", "p1", 100, 10, 1_000_000)]
-        state = aggregate_price_state(p, 1000, 1)
+    def test_low_confirmed_demand_decreases_price(self):
+        state = aggregate_price_state(100, 10, 1000, 1)
         self.assertLess(state.price_per_million_units, 1000)
         self.assertGreaterEqual(state.price_per_million_units, 950)
 
     def test_no_capacity_moves_price_up_but_is_bounded(self):
-        state = aggregate_price_state([], 1000, 1)
+        state = aggregate_price_state(0, 0, 1000, 1)
+        self.assertEqual(state.price_per_million_units, 1050)
+
+    def test_demand_is_clamped_to_capacity(self):
+        state = aggregate_price_state(100, 500, 1000, 1)
+        self.assertEqual(state.aggregate_busy_units, 100)
         self.assertEqual(state.price_per_million_units, 1050)
 
     def test_integer_charge_rounds_up(self):
@@ -72,6 +75,20 @@ class SchedulerTests(unittest.TestCase):
         )
         self.assertEqual(plan.assigned_model_bytes, 1000)
         self.assertEqual([x.peer_id for x in plan.allocations], ["p2", "p3"])
+
+    def test_chain_reservation_is_floor_for_busy_state(self):
+        providers = [
+            provider("claims-free", "p1", 100, 0, 5000),
+            provider("actually-free", "p2", 100, 20, 5000),
+        ]
+        plan = select_least_busy(
+            providers,
+            MODEL,
+            model_bytes=100,
+            at_height=20,
+            reserved_by_peer={"p1": 90},
+        )
+        self.assertEqual(plan.allocations[0].peer_id, "p2")
 
     def test_expired_provider_is_not_selected(self):
         providers = [
@@ -101,12 +118,26 @@ class ChainStateTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             chain.apply_provider_record(provider("a", "p1", 100, 5, 1000, 10, 40))
 
-    def test_price_epoch_uses_active_chain_state(self):
+    def test_chain_reservation_drives_price_epoch(self):
         chain = ChainState(chain_id="wqpu-test", height=20, price_per_million_units=1000)
-        chain.apply_provider_record(provider("a", "p1", 100, 95, 1000, 20, 30))
+        chain.apply_provider_record(provider("a", "p1", 100, 0, 1000, 20, 30))
+        chain.reserve_compute("p1", 95)
         epoch = chain.close_price_epoch()
-        self.assertEqual(epoch.epoch, 1)
-        self.assertEqual(chain.price_per_million_units, epoch.price_per_million_units)
+        self.assertGreater(epoch.price_per_million_units, 1000)
+        self.assertEqual(epoch.aggregate_busy_units, 95)
+
+    def test_reservation_cannot_exceed_capacity(self):
+        chain = ChainState(chain_id="wqpu-test", height=20)
+        chain.apply_provider_record(provider("a", "p1", 100, 0, 1000, 20, 30))
+        with self.assertRaises(ValueError):
+            chain.reserve_compute("p1", 101)
+
+    def test_expired_provider_releases_reservation(self):
+        chain = ChainState(chain_id="wqpu-test", height=20)
+        chain.apply_provider_record(provider("a", "p1", 100, 0, 1000, 20, 21))
+        chain.reserve_compute("p1", 50)
+        chain.advance_height(1)
+        self.assertEqual(chain.active_reserved_units(), 0)
 
 
 class ReceiptTests(unittest.TestCase):
