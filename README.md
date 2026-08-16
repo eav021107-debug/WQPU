@@ -29,14 +29,16 @@ Several computers can originate requests at the same time. There is no permanent
 ### macOS / Linux
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh?v=0.5.3" | sh
+curl -fsSL "https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh?v=0.5.3-r2" | sh
 ```
 
 ### Windows PowerShell
 
 ```powershell
-irm 'https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1?v=0.5.3' | iex
+irm 'https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1?v=0.5.3-r2' | iex
 ```
+
+The `r2` installer revision deliberately uses a new cache key and verifies that the downloaded core actually reports `WQPU 0.5.3` before it is allowed to start.
 
 The installer immediately starts the interactive CLI in the **same terminal**. WQPU 0.5.3 restores console input inside the core itself if the installer was launched through a pipe, instead of relying on shell-specific stdin redirection.
 
@@ -51,7 +53,7 @@ wqpu> /exit
 
 WQPU is compatible with Python 3.6+.
 
-The installer does not depend on one exact Python version. It uses an already installed compatible Python when possible, tries the operating system package manager, and can prepare a private Python runtime for WQPU without replacing the system Python.
+The installer does not depend on one exact Python version. It uses an already installed compatible Python when possible, tries the operating system package manager only when required, and can prepare a private Python runtime for WQPU without replacing the system Python.
 
 ## Creating and joining a network
 
@@ -68,7 +70,7 @@ WQPU prints a private `WQPU1...` join code.
 On macOS/Linux, pass the join code as an argument to the installer:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh?v=0.5.3" | sh -s -- 'WQPU1...'
+curl -fsSL "https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh?v=0.5.3-r2" | sh -s -- 'WQPU1...'
 ```
 
 Do **not** use `WQPU_JOIN='...' curl ... | sh`: that environment variable belongs to `curl`, not to the `sh` process on the right side of the pipe.
@@ -76,7 +78,7 @@ Do **not** use `WQPU_JOIN='...' curl ... | sh`: that environment variable belong
 On Windows:
 
 ```powershell
-$env:WQPU_JOIN='WQPU1...'; irm 'https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1?v=0.5.3' | iex
+$env:WQPU_JOIN='WQPU1...'; irm 'https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1?v=0.5.3-r2' | iex
 ```
 
 Supplying a join code always switches the local node to that WQPU network and clears stale peer-cache entries from any previous test network. This makes repeat/recovery joins safe.
