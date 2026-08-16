@@ -1,9 +1,6 @@
 package kernel
 
-import (
-	"errors"
-	"math"
-)
+import "errors"
 
 const (
 	SessionPermProvider uint64 = 1 << iota
@@ -71,7 +68,7 @@ func (s SessionState) CanAuthorize(height, permission, jobCharge uint64) error {
 	if jobCharge > s.Delegation.MaxJobUnits {
 		return errors.New("job exceeds session per-job limit")
 	}
-	if jobCharge > math.MaxUint64-s.SpentUnits {
+	if jobCharge > ^uint64(0)-s.SpentUnits {
 		return errors.New("session spend overflow")
 	}
 	if s.SpentUnits+jobCharge > s.Delegation.MaxSpendUnits {
