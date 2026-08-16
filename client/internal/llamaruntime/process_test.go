@@ -48,8 +48,8 @@ func TestManagedProcessReportsEarlyExit(t *testing.T) {
 }
 
 func TestManagedProcessCloseCancelsLongRunningChild(t *testing.T) {
-	if goruntime.GOOS == "windows" { t.Skip("shell fixture is Unix-only") }
-	process, err := startManaged(context.Background(), "/bin/sh", []string{"-c", "sleep 30"}, nil)
+	if goruntime.GOOS == "windows" { t.Skip("sleep fixture is Unix-only") }
+	process, err := startManaged(context.Background(), "/bin/sleep", []string{"30"}, nil)
 	if err != nil { t.Fatal(err) }
 	if process.PID() <= 0 { t.Fatal("managed child has no pid") }
 	started := time.Now()
