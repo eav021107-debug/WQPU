@@ -3,6 +3,7 @@ import unittest
 
 from chain.devnet_config import (
     NATIVE_PRECOMPILE,
+    WQPU_PRECOMPILE,
     evm_hex_to_bech32,
     patch_app_toml,
     patch_comet_toml,
@@ -16,7 +17,7 @@ class GenesisPatchTests(unittest.TestCase):
             "app_state": {
                 "staking": {"params": {"bond_denom": "stake"}},
                 "mint": {"params": {"mint_denom": "stake"}},
-                "evm": {"params": {"evm_denom": "atest"}},
+                "evm": {"params": {"evm_denom": "atest", "active_static_precompiles": []}},
                 "gov": {
                     "params": {
                         "min_deposit": [{"denom": "stake", "amount": "1"}],
@@ -41,11 +42,24 @@ class GenesisPatchTests(unittest.TestCase):
         self.assertEqual(app["erc20"]["token_pairs"][0]["denom"], "awqpu")
         self.assertEqual(app["erc20"]["token_pairs"][0]["erc20_address"], NATIVE_PRECOMPILE)
 
+    def test_wqpu_precompile_is_consensus_active(self):
+        out = patch_genesis(self.sample_genesis(), "awqpu", "WQPU", 18)
+        self.assertEqual(
+            out["app_state"]["evm"]["params"]["active_static_precompiles"],
+            [WQPU_PRECOMPILE],
+        )
+
     def test_patch_is_deterministic(self):
         src = self.sample_genesis()
         a = patch_genesis(copy.deepcopy(src), "awqpu", "WQPU", 18)
         b = patch_genesis(copy.deepcopy(src), "awqpu", "WQPU", 18)
         self.assertEqual(a, b)
+
+    def test_missing_evm_params_fails_closed(self):
+        src = self.sample_genesis()
+        del src["app_state"]["evm"]["params"]
+        with self.assertRaises(ValueError):
+            patch_genesis(src, "awqpu", "WQPU", 18)
 
 
 class AddressConversionTests(unittest.TestCase):
