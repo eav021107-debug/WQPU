@@ -1,9 +1,4 @@
-"""Wallet-facing authorization for a bounded WQPU session.
-
-WQPU never receives a wallet seed phrase or private key. An EIP-1193-compatible
-wallet signs this EIP-712 object, authorizing only one short-lived local session
-key with explicit limits and permissions.
-"""
+"""Wallet-facing authorization for a bounded WQPU session."""
 
 from __future__ import annotations
 
@@ -14,7 +9,6 @@ from typing import Dict, Any
 from .protocol import SessionDelegation
 
 _ADDRESS = re.compile(r"^0x[0-9a-fA-F]{40}$")
-_BYTES32 = re.compile(r"^0x[0-9a-fA-F]{64}$")
 
 
 def validate_wallet_address(address: str) -> str:
@@ -23,20 +17,16 @@ def validate_wallet_address(address: str) -> str:
     return address
 
 
-def validate_session_pubkey(value: str) -> str:
-    if not isinstance(value, str) or not _BYTES32.fullmatch(value):
-        raise ValueError("session public key must be 32 bytes as 0x-prefixed hex")
-    return value
+def validate_session_address(address: str) -> str:
+    if not isinstance(address, str) or not re.fullmatch(r"0x[0-9a-f]{40}", address):
+        raise ValueError("session address must be a canonical lowercase EVM address")
+    return address
 
 
-def build_session_typed_data(
-    delegation: SessionDelegation,
-    evm_chain_id: int,
-) -> Dict[str, Any]:
-    """Build the exact human-readable EIP-712 object the wallet must sign."""
+def build_session_typed_data(delegation: SessionDelegation, evm_chain_id: int) -> Dict[str, Any]:
     delegation.validate()
     validate_wallet_address(delegation.wallet)
-    validate_session_pubkey(delegation.session_pubkey)
+    validate_session_address(delegation.session_address)
     if not isinstance(evm_chain_id, int) or evm_chain_id <= 0:
         raise ValueError("EVM chain id must be a positive integer")
 
@@ -49,7 +39,7 @@ def build_session_typed_data(
             ],
             "WQPUSession": [
                 {"name": "wallet", "type": "address"},
-                {"name": "sessionPubkey", "type": "bytes32"},
+                {"name": "sessionAddress", "type": "address"},
                 {"name": "wqpuChainId", "type": "string"},
                 {"name": "issuedHeight", "type": "uint64"},
                 {"name": "expiresHeight", "type": "uint64"},
@@ -61,14 +51,10 @@ def build_session_typed_data(
             ],
         },
         "primaryType": "WQPUSession",
-        "domain": {
-            "name": "WQPU Session",
-            "version": "1",
-            "chainId": evm_chain_id,
-        },
+        "domain": {"name": "WQPU Session", "version": "1", "chainId": evm_chain_id},
         "message": {
             "wallet": delegation.wallet,
-            "sessionPubkey": delegation.session_pubkey,
+            "sessionAddress": delegation.session_address,
             "wqpuChainId": delegation.chain_id,
             "issuedHeight": delegation.issued_height,
             "expiresHeight": delegation.expires_height,
@@ -81,11 +67,7 @@ def build_session_typed_data(
     }
 
 
-def build_wallet_request(
-    delegation: SessionDelegation,
-    evm_chain_id: int,
-) -> Dict[str, Any]:
-    """Return a wallet-provider request without ever handling wallet secrets."""
+def build_wallet_request(delegation: SessionDelegation, evm_chain_id: int) -> Dict[str, Any]:
     typed_data = build_session_typed_data(delegation, evm_chain_id)
     return {
         "method": "eth_signTypedData_v4",
