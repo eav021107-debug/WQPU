@@ -34,5 +34,8 @@ else
   exit 1
 fi
 
+# Conservative remote-test setting so a ~2 GB VPS can still contribute.
+export WQPU_RAM_RESERVE_FRACTION=0.10
+
 echo 'WQPU mesh: Tailscale connected. Updating and starting WQPU...'
 curl -fsSL "$WQPU_INSTALL" | sh
