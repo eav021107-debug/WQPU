@@ -1,0 +1,122 @@
+name: wqpu-live-compute-integration
+
+on:
+  push:
+    branches: [next-foundation]
+    paths:
+      - 'chain/devnet.sh'
+      - 'chain/devnet_config.py'
+      - 'chain/runtime.lock'
+      - 'chain/runtime_patch*.py'
+      - 'chain/cmd/wqpu-compute-bootstrap/**'
+      - 'chain/x/wqpu/precompile/**'
+      - 'client/internal/chainclient/**'
+      - 'client/internal/chainregistry/**'
+      - 'client/internal/computenode/**'
+      - 'client/internal/llamaruntime/**'
+      - 'client/internal/carrier/**'
+      - 'client/internal/peertransport/**'
+      - 'client/internal/rpctunnel/**'
+      - 'client/internal/rpcmesh/**'
+      - 'client/internal/sessionkey/**'
+      - 'client/internal/transport/**'
+      - 'client/cmd/wqpu-live-chain-compute-smoke/**'
+      - '.github/workflows/wqpu-live-compute-integration.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  full-live-chain-compute:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+
+      - name: Resolve pinned chain dependencies
+        working-directory: chain
+        run: go mod tidy
+
+      - name: Resolve pinned client dependencies
+        working-directory: client
+        run: go mod tidy
+
+      - name: Boot sovereign WQPU chain and run equal-node distributed model
+        shell: bash
+        env:
+          WQPU_CHAIN_SRC: ${{ runner.temp }}/cosmos-evm
+          WQPU_CHAIN_BIN_DIR: ${{ runner.temp }}/wqpu-bin
+          WQPU_CHAIN_HOME: ${{ runner.temp }}/wqpu-home
+        run: |
+          set -euo pipefail
+          RPC='http://127.0.0.1:8545'
+          RUNTIME_BASE="${RUNNER_TEMP}/wqpu-runtime"
+
+          # The same explicitly public devnet-only wallet signs the three
+          # session delegations/provider publishes and is the only address that
+          # needs genesis funds. Compute nodes never receive this wallet key.
+          WQPU_DEVNET_TEST_ADDRESS="$(cd chain && go run ./cmd/wqpu-compute-bootstrap address)"
+          export WQPU_DEVNET_TEST_ADDRESS
+
+          LOG="${RUNNER_TEMP}/wqpu-live-compute-chain.log"
+          bash chain/devnet.sh --reset >"$LOG" 2>&1 &
+          PID=$!
+          cleanup() {
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          ready=0
+          for _ in $(seq 1 180); do
+            if ! kill -0 "$PID" 2>/dev/null; then
+              cat "$LOG"
+              echo 'WQPU devnet exited before live compute integration' >&2
+              exit 1
+            fi
+            RESPONSE="$(curl -fsS -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' "$RPC" 2>/dev/null || true)"
+            if python3 - "$RESPONSE" <<'PY'
+          import json, sys
+          try:
+              value = int(json.loads(sys.argv[1]).get("result", "0x0"), 16)
+          except Exception:
+              raise SystemExit(1)
+          raise SystemExit(0 if value >= 1 else 1)
+          PY
+            then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat "$LOG"
+            echo 'WQPU chain never produced canonical block 1' >&2
+            exit 1
+          fi
+
+          echo 'Publishing three CI-only equal compute identities into native 0x0900:'
+          (cd chain && go run ./cmd/wqpu-compute-bootstrap describe)
+          (cd chain && go run ./cmd/wqpu-compute-bootstrap publish "$RPC")
+
+          # No in-memory registry is used below. The client verifies chain ID
+          # 711711 and protocolVersion=1 at 0x0900, resolves all peer endpoints
+          # and control sessions from the live chain, then starts three equal
+          # computenode.Node instances. Node 1 originates this request; nodes 2
+          # and 3 become RPC0/RPC1. Both remote RPC debug logs must record model
+          # buffer allocation, and the shared llama-server must complete text.
+          (cd client && go run ./cmd/wqpu-live-chain-compute-smoke "$RPC" "$RUNTIME_BASE") 2>&1 | tee live-compute.log
+          grep -F 'LIVE CHAIN COMPUTE PASSED' client/live-compute.log
+          grep -F '[alloc_buffer]' "$RUNTIME_BASE/live-chain-rpc-1.log"
+          grep -F '[alloc_buffer]' "$RUNTIME_BASE/live-chain-rpc-2.log"
+          grep -F 'precompile:    0x0000000000000000000000000000000000000900' "$LOG"
+
+          echo 'FULL LIVE WQPU CHAIN + EQUAL-NODE DISTRIBUTED MODEL INTEGRATION PASSED.'
