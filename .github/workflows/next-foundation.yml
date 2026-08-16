@@ -18,7 +18,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  python-reference:
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -34,3 +34,15 @@ jobs:
         run: bash -n chain/devnet.sh
       - name: Unit tests
         run: python -m unittest -v tests.test_next_foundation tests.test_devnet_config
+
+  go-consensus-kernel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22.x'
+          cache-dependency-path: chain/go.mod
+      - name: Go consensus tests
+        working-directory: chain
+        run: go test ./...
