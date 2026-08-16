@@ -1,0 +1,39 @@
+name: chain-runtime-smoke
+
+on:
+  push:
+    branches: [next-foundation]
+    paths:
+      - 'chain/runtime.lock'
+      - 'chain/devnet.sh'
+      - 'chain/devnet_config.py'
+      - '.github/workflows/chain-runtime-smoke.yml'
+  pull_request:
+    paths:
+      - 'chain/runtime.lock'
+      - 'chain/devnet.sh'
+      - 'chain/devnet_config.py'
+      - '.github/workflows/chain-runtime-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-pinned-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+      - name: Build exact pinned WQPU chain runtime
+        env:
+          WQPU_CHAIN_SRC: ${{ runner.temp }}/cosmos-evm
+          WQPU_CHAIN_BIN_DIR: ${{ runner.temp }}/wqpu-bin
+        run: bash chain/devnet.sh --build-only
+      - name: Verify daemon exists
+        run: test -x "${{ runner.temp }}/wqpu-bin/wqpud"
+      - name: Verify daemon starts as a CLI
+        run: "${{ runner.temp }}/wqpu-bin/wqpud" version
