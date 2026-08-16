@@ -34,7 +34,7 @@ import uuid
 import zipfile
 from pathlib import Path
 
-VERSION = "0.5.2"
+VERSION = "0.5.3"
 PORT = int(os.environ.get("WQPU_PORT", "7443"))
 RPC_PORT = 50052
 DEFAULT_MODEL = "ggml-org/gemma-3-1b-it-GGUF:Q4_K_M"
@@ -166,6 +166,28 @@ async def close_server(server):
 async def to_thread(func, *args):
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(None, lambda: func(*args))
+
+
+def ensure_console_stdin():
+    try:
+        if sys.stdin is not None and sys.stdin.isatty():
+            return
+    except Exception:
+        pass
+
+    device = "CONIN$" if os.name == "nt" else "/dev/tty"
+    try:
+        stream = open(device, "r")
+        if stream.isatty():
+            sys.stdin = stream
+            return
+        stream.close()
+    except (OSError, IOError):
+        pass
+
+    raise RuntimeError(
+        "interactive terminal input is unavailable; run wqpu from a terminal"
+    )
 
 
 def ensure_cert():
@@ -778,6 +800,7 @@ def parse_hostport(text):
 
 
 async def interactive(mesh, server_bin):
+    ensure_console_stdin()
     print("\nWQPU peer is online. Type a question.")
     print("Commands: /status  /peers  /invite HOST[:PORT]  /exit\n")
     while not mesh.stop.is_set():
