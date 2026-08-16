@@ -43,9 +43,10 @@ func (d SessionDelegation) Validate() error {
 }
 
 type SessionState struct {
-	Delegation SessionDelegation
-	SpentUnits uint64
-	Revoked    bool
+	Delegation  SessionDelegation
+	SpentUnits  uint64
+	ReservedUnits uint64
+	Revoked     bool
 }
 
 func singlePermission(permission uint64) bool {
@@ -68,23 +69,60 @@ func (s SessionState) CanAuthorize(height, permission, jobCharge uint64) error {
 	if jobCharge > s.Delegation.MaxJobUnits {
 		return errors.New("job exceeds session per-job limit")
 	}
-	if jobCharge > ^uint64(0)-s.SpentUnits {
+	max := ^uint64(0)
+	if s.ReservedUnits > max-s.SpentUnits {
+		return errors.New("session accounting overflow")
+	}
+	committed := s.SpentUnits + s.ReservedUnits
+	if jobCharge > max-committed {
 		return errors.New("session spend overflow")
 	}
-	if s.SpentUnits+jobCharge > s.Delegation.MaxSpendUnits {
+	if committed+jobCharge > s.Delegation.MaxSpendUnits {
 		return errors.New("session total spend limit exceeded")
 	}
 	return nil
 }
 
-func (s *SessionState) Consume(height, permission, amount uint64) error {
+func (s *SessionState) Reserve(height, permission, amount uint64) error {
 	if s == nil {
 		return errors.New("nil session")
 	}
 	if err := s.CanAuthorize(height, permission, amount); err != nil {
 		return err
 	}
-	s.SpentUnits += amount
+	s.ReservedUnits += amount
+	return nil
+}
+
+func (s *SessionState) Release(amount uint64) error {
+	if s == nil {
+		return errors.New("nil session")
+	}
+	if amount > s.ReservedUnits {
+		return errors.New("cannot release more session spend than reserved")
+	}
+	s.ReservedUnits -= amount
+	return nil
+}
+
+func (s *SessionState) Settle(reservedAmount, actualAmount uint64) error {
+	if s == nil {
+		return errors.New("nil session")
+	}
+	if actualAmount > reservedAmount {
+		return errors.New("settlement exceeds reserved job amount")
+	}
+	if reservedAmount > s.ReservedUnits {
+		return errors.New("settlement exceeds session reservation")
+	}
+	if actualAmount > ^uint64(0)-s.SpentUnits {
+		return errors.New("session spend overflow")
+	}
+	s.ReservedUnits -= reservedAmount
+	s.SpentUnits += actualAmount
+	if s.SpentUnits+s.ReservedUnits > s.Delegation.MaxSpendUnits {
+		return errors.New("session total spend limit exceeded")
+	}
 	return nil
 }
 
