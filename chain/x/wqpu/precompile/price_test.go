@@ -6,6 +6,8 @@ import (
 	legacykernel "github.com/eav021107-debug/WQPU/chain/x/wqpu/kernel"
 )
 
+const priceTestHeight uint64 = 120
+
 func TestBondedPriceCurveMatchesReferenceKernel(t *testing.T) {
 	vectors := []struct {
 		capacity uint64
@@ -34,8 +36,9 @@ func TestBondedPriceCurveMatchesReferenceKernel(t *testing.T) {
 func TestHugeUnbondedProviderCannotPushGlobalPriceDown(t *testing.T) {
 	state := newMemoryState()
 	provider := bondTestProvider("0x1000000000000000000000000000000000000001", 1, 1_000_000_000_000)
+	if !provider.ActiveAt(priceTestHeight) { t.Fatal("test provider must be active") }
 	if err := StorePeerProvider(state, provider); err != nil { t.Fatal(err) }
-	price, err := CloseBondedPriceEpoch(state, PriceEpochBlocks)
+	price, err := CloseBondedPriceEpoch(state, priceTestHeight)
 	if err != nil { t.Fatal(err) }
 	if price.BondedCapacityUnits != 0 {
 		t.Fatalf("fake advertised supply entered price denominator: %d", price.BondedCapacityUnits)
@@ -48,9 +51,10 @@ func TestHugeUnbondedProviderCannotPushGlobalPriceDown(t *testing.T) {
 func TestBondedProviderCanLegitimatelyIncreasePriceSupply(t *testing.T) {
 	state := newMemoryState()
 	provider := bondTestProvider("0x1000000000000000000000000000000000000001", 1, 1_000)
+	if !provider.ActiveAt(priceTestHeight) { t.Fatal("test provider must be active") }
 	if err := StorePeerProvider(state, provider); err != nil { t.Fatal(err) }
 	if err := AddProviderBondCapacity(state, provider.PeerID, 1_000); err != nil { t.Fatal(err) }
-	price, err := CloseBondedPriceEpoch(state, PriceEpochBlocks)
+	price, err := CloseBondedPriceEpoch(state, priceTestHeight)
 	if err != nil { t.Fatal(err) }
 	if price.BondedCapacityUnits != 1_000 { t.Fatalf("bonded capacity=%d", price.BondedCapacityUnits) }
 	if price.PricePerMillionUnits != 950 {
@@ -60,8 +64,8 @@ func TestBondedProviderCanLegitimatelyIncreasePriceSupply(t *testing.T) {
 
 func TestPriceEpochCannotBeClosedTwiceAtSameHeight(t *testing.T) {
 	state := newMemoryState()
-	if _, err := CloseBondedPriceEpoch(state, PriceEpochBlocks); err != nil { t.Fatal(err) }
-	if _, err := CloseBondedPriceEpoch(state, PriceEpochBlocks); err == nil {
+	if _, err := CloseBondedPriceEpoch(state, priceTestHeight); err != nil { t.Fatal(err) }
+	if _, err := CloseBondedPriceEpoch(state, priceTestHeight); err == nil {
 		t.Fatal("same price epoch must not be applied twice")
 	}
 }
