@@ -13,7 +13,7 @@ func TestActiveProvidersComeFromChainState(t *testing.T) {
 			t.Fatal(err)
 		}
 		peer := "peer-" + wallet
-		if err := s.PublishProvider(wallet, d.SessionPubkey, stateProvider(wallet, peer, 0, 20)); err != nil {
+		if err := s.PublishProvider(wallet, d.SessionAddress, stateProvider(wallet, peer, 0, 20)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -45,7 +45,7 @@ func TestPlanModelAvoidsChainReservedPeer(t *testing.T) {
 		}
 		p := stateProvider(item.wallet, item.peer, 0, 20)
 		p.BusyUnits = item.busy
-		if err := s.PublishProvider(item.wallet, d.SessionPubkey, p); err != nil {
+		if err := s.PublishProvider(item.wallet, d.SessionAddress, p); err != nil {
 			t.Fatal(err)
 		}
 	}
