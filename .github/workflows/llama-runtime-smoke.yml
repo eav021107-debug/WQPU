@@ -14,6 +14,7 @@ on:
       - 'client/cmd/wqpu-runtime-install/**'
       - 'client/cmd/wqpu-llama-rpc-smoke/**'
       - 'client/cmd/wqpu-llama-model-smoke/**'
+      - 'client/cmd/wqpu-llama-multipeer-smoke/**'
       - '.github/workflows/llama-runtime-smoke.yml'
   workflow_dispatch:
 
@@ -27,7 +28,7 @@ permissions:
 jobs:
   official-linux-x64:
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
@@ -86,6 +87,8 @@ jobs:
           grep -F -- '--hf-file' server.help
           grep -F -- '--device' server.help
           grep -F -- '--n-gpu-layers' server.help
+          grep -F -- '--tensor-split' server.help
+          grep -F -- '--split-mode' server.help
 
           "$CLI" --help > cli.help 2>&1
           grep -F -- '--rpc' cli.help
@@ -106,11 +109,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          # The helper forces --device RPC0 --n-gpu-layers 99, performs a real
-          # completion, and enables upstream GGML_RPC_DEBUG only in the remote
-          # backend. Success requires a server-side [alloc_buffer] operation,
-          # proving model memory was actually allocated through the encrypted RPC.
           (cd client && go run ./cmd/wqpu-llama-model-smoke --runtime-base "$WQPU_RUNTIME_BASE") 2>&1 | tee model-smoke.log
           grep -F 'tiny model inference crossed remote WQPU RPC0 with remote allocation' model-smoke.log
           grep -F '[alloc_buffer]' "$WQPU_RUNTIME_BASE/model-smoke-rpc.log"
-          echo 'Remote WQPU RPC0 model allocation and inference smoke passed.'
+
+      - name: Split one tiny model across two encrypted WQPU RPC peers
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Two independent providers expose separate loopback RPC backends only
+          # through their own authenticated SecureStreams. llama-server receives
+          # two requester-side forwarders, selects RPC0,RPC1, and forces a 1:1
+          # layer split. Both backend logs must show actual model allocation.
+          (cd client && go run ./cmd/wqpu-llama-multipeer-smoke --runtime-base "$WQPU_RUNTIME_BASE") 2>&1 | tee multipeer-smoke.log
+          grep -F 'two-peer WQPU model inference allocated on RPC0 and RPC1' multipeer-smoke.log
+          grep -F '[alloc_buffer]' "$WQPU_RUNTIME_BASE/multipeer-rpc-0.log"
+          grep -F '[alloc_buffer]' "$WQPU_RUNTIME_BASE/multipeer-rpc-1.log"
+          echo 'Two-peer WQPU distributed model allocation and inference smoke passed.'
