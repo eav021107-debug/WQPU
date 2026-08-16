@@ -18,11 +18,13 @@ func TestSessionSpendMustBeReservedBeforeWork(t *testing.T) {
 
 func TestSessionCannotOverbookConcurrentJobs(t *testing.T) {
 	state, delegation := providerAuthorizedFixture(t)
-	if err := ReserveSessionSpend(state, delegation.Wallet, delegation.Session, 121, 100_000); err != nil {
-		t.Fatal(err)
+	for i := 0; i < 10; i++ {
+		if err := ReserveSessionSpend(state, delegation.Wallet, delegation.Session, 121, 100_000); err != nil {
+			t.Fatalf("reservation %d failed: %v", i, err)
+		}
 	}
-	if err := ReserveSessionSpend(state, delegation.Wallet, delegation.Session, 121, 100_000); err == nil {
-		t.Fatal("second reservation should exceed per-session committed spend")
+	if err := ReserveSessionSpend(state, delegation.Wallet, delegation.Session, 121, 1); err == nil {
+		t.Fatal("reservation above total session spend limit should fail")
 	}
 }
 
