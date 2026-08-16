@@ -57,7 +57,7 @@ func (c EconomicNetworkContract) runFundSession(evm *vm.EVM, contract *vm.Contra
 	if readOnly { return nil, errors.New("fundSession cannot run in static context") }
 	wallet, session, units, err := decodeSessionMoney(contract.Input)
 	if err != nil { return nil, err }
-	if contract.CallerAddress != wallet { return nil, errors.New("only the wallet may fund its WQPU session") }
+	if contract.Caller() != wallet { return nil, errors.New("only the wallet may fund its WQPU session") }
 	expected, err := PaymentUnitsToNative(units)
 	if err != nil { return nil, err }
 	if contract.Value() == nil || contract.Value().Cmp(expected) != 0 { return nil, errors.New("fundSession value does not match declared WQPU payment units") }
@@ -78,21 +78,21 @@ func (c EconomicNetworkContract) runWithdrawSession(evm *vm.EVM, contract *vm.Co
 	if contract.Value() != nil && !contract.Value().IsZero() { return nil, errors.New("withdrawSession does not accept value") }
 	wallet, session, units, err := decodeSessionMoney(contract.Input)
 	if err != nil { return nil, err }
-	if contract.CallerAddress != wallet { return nil, errors.New("only the wallet may withdraw its WQPU escrow") }
+	if contract.Caller() != wallet { return nil, errors.New("only the wallet may withdraw its WQPU escrow") }
 	withdrawable, err := WithdrawableSessionEscrow(evm.StateDB, wallet, session)
 	if err != nil { return nil, err }
 	if units > withdrawable { return nil, errors.New("withdrawal would consume reserved WQPU escrow") }
 	native, err := PaymentUnitsToNative(units)
 	if err != nil { return nil, err }
-	if evm.Context.CanTransfer == nil || evm.Context.Transfer == nil || !evm.Context.CanTransfer(evm.StateDB, Address, native) {
-		return nil, errors.New("WQPU precompile native escrow balance is insufficient")
-	}
 	snapshot := evm.StateDB.Snapshot()
 	if err := DebitSessionEscrow(evm.StateDB, wallet, session, units); err != nil {
 		evm.StateDB.RevertToSnapshot(snapshot)
 		return nil, err
 	}
-	evm.Context.Transfer(evm.StateDB, Address, wallet, native)
+	if err := transferNative(evm, Address, wallet, native); err != nil {
+		evm.StateDB.RevertToSnapshot(snapshot)
+		return nil, err
+	}
 	return encodeBool(true), nil
 }
 
