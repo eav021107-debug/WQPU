@@ -43,10 +43,10 @@ func (d SessionDelegation) Validate() error {
 }
 
 type SessionState struct {
-	Delegation  SessionDelegation
-	SpentUnits  uint64
+	Delegation   SessionDelegation
+	SpentUnits   uint64
 	ReservedUnits uint64
-	Revoked     bool
+	Revoked      bool
 }
 
 func singlePermission(permission uint64) bool {
@@ -94,21 +94,25 @@ func (s *SessionState) Reserve(height, permission, amount uint64) error {
 	return nil
 }
 
+func (s SessionState) CanRelease(amount uint64) error {
+	if amount > s.ReservedUnits {
+		return errors.New("cannot release more session spend than reserved")
+	}
+	return nil
+}
+
 func (s *SessionState) Release(amount uint64) error {
 	if s == nil {
 		return errors.New("nil session")
 	}
-	if amount > s.ReservedUnits {
-		return errors.New("cannot release more session spend than reserved")
+	if err := s.CanRelease(amount); err != nil {
+		return err
 	}
 	s.ReservedUnits -= amount
 	return nil
 }
 
-func (s *SessionState) Settle(reservedAmount, actualAmount uint64) error {
-	if s == nil {
-		return errors.New("nil session")
-	}
+func (s SessionState) CanSettle(reservedAmount, actualAmount uint64) error {
 	if actualAmount > reservedAmount {
 		return errors.New("settlement exceeds reserved job amount")
 	}
@@ -118,11 +122,23 @@ func (s *SessionState) Settle(reservedAmount, actualAmount uint64) error {
 	if actualAmount > ^uint64(0)-s.SpentUnits {
 		return errors.New("session spend overflow")
 	}
-	s.ReservedUnits -= reservedAmount
-	s.SpentUnits += actualAmount
-	if s.SpentUnits+s.ReservedUnits > s.Delegation.MaxSpendUnits {
+	newReserved := s.ReservedUnits - reservedAmount
+	newSpent := s.SpentUnits + actualAmount
+	if newReserved > ^uint64(0)-newSpent || newSpent+newReserved > s.Delegation.MaxSpendUnits {
 		return errors.New("session total spend limit exceeded")
 	}
+	return nil
+}
+
+func (s *SessionState) Settle(reservedAmount, actualAmount uint64) error {
+	if s == nil {
+		return errors.New("nil session")
+	}
+	if err := s.CanSettle(reservedAmount, actualAmount); err != nil {
+		return err
+	}
+	s.ReservedUnits -= reservedAmount
+	s.SpentUnits += actualAmount
 	return nil
 }
 
