@@ -97,7 +97,7 @@ func (c BondedSettlementNetworkContract) runBondProvider(evm *vm.EVM, contract *
 	if err != nil {
 		return nil, err
 	}
-	provider, err := providerOwnedByCaller(evm.StateDB, peerID, contract.CallerAddress)
+	provider, err := providerOwnedByCaller(evm.StateDB, peerID, contract.Caller())
 	if err != nil {
 		return nil, err
 	}
@@ -141,7 +141,8 @@ func (c BondedSettlementNetworkContract) runUnbondProvider(evm *vm.EVM, contract
 	if err != nil {
 		return nil, err
 	}
-	if _, err := providerOwnedByCaller(evm.StateDB, peerID, contract.CallerAddress); err != nil {
+	caller := contract.Caller()
+	if _, err := providerOwnedByCaller(evm.StateDB, peerID, caller); err != nil {
 		return nil, err
 	}
 	paymentUnits, err := ProviderBondPaymentUnits(capacity)
@@ -152,15 +153,15 @@ func (c BondedSettlementNetworkContract) runUnbondProvider(evm *vm.EVM, contract
 	if err != nil {
 		return nil, err
 	}
-	if evm.Context.CanTransfer == nil || evm.Context.Transfer == nil || !evm.Context.CanTransfer(evm.StateDB, Address, native) {
-		return nil, errors.New("WQPU precompile native bond balance is insufficient")
-	}
 	snapshot := evm.StateDB.Snapshot()
 	if err := RemoveProviderBondCapacity(evm.StateDB, peerID, capacity); err != nil {
 		evm.StateDB.RevertToSnapshot(snapshot)
 		return nil, err
 	}
-	evm.Context.Transfer(evm.StateDB, Address, contract.CallerAddress, native)
+	if err := transferNative(evm, Address, caller, native); err != nil {
+		evm.StateDB.RevertToSnapshot(snapshot)
+		return nil, err
+	}
 	return encodeBool(true), nil
 }
 
