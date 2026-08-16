@@ -1,0 +1,93 @@
+name: llama-runtime-smoke
+
+on:
+  push:
+    branches: [next-foundation]
+    paths:
+      - 'client/internal/llamaruntime/**'
+      - '.github/workflows/llama-runtime-smoke.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  official-linux-x64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download exact official llama.cpp b10453 CPU archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL='https://github.com/ggml-org/llama.cpp/releases/download/b10453/llama-b10453-bin-ubuntu-x64.tar.gz'
+          SHA='550eb155a09c3051c7add5becf6d0badc3a4c33416807985963036b27b859fb4'
+          curl --fail --location --retry 3 --output llama.tar.gz "$URL"
+          printf '%s  %s\n' "$SHA" llama.tar.gz | sha256sum --check --strict
+          mkdir runtime
+          tar -xzf llama.tar.gz -C runtime
+
+      - name: Verify exact RPC/server/CLI binaries and current flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          RPC="$(find runtime -type f -name 'ggml-rpc-server' -print -quit)"
+          SERVER="$(find runtime -type f -name 'llama-server' -print -quit)"
+          CLI="$(find runtime -type f -name 'llama-cli' -print -quit)"
+          test -n "$RPC" && test -x "$RPC"
+          test -n "$SERVER" && test -x "$SERVER"
+          test -n "$CLI" && test -x "$CLI"
+
+          "$RPC" --help > rpc.help 2>&1
+          grep -F -- '--host HOST' rpc.help
+          grep -F -- '--port PORT' rpc.help
+          grep -F -- '--device <dev1,dev2,...>' rpc.help
+          grep -F -- '--cache' rpc.help
+
+          "$SERVER" --help > server.help 2>&1
+          grep -F -- '--rpc' server.help
+          grep -F -- '--fit' server.help
+          grep -F -- '--host' server.help
+          grep -F -- '--port' server.help
+
+          "$CLI" --help > cli.help 2>&1
+          grep -F -- '--rpc' cli.help
+
+      - name: Boot the real RPC backend on loopback only
+        shell: bash
+        run: |
+          set -euo pipefail
+          RPC="$(find runtime -type f -name 'ggml-rpc-server' -print -quit)"
+          "$RPC" --host 127.0.0.1 --port 50053 --threads 1 > rpc.log 2>&1 &
+          PID=$!
+          cleanup() {
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          python3 - <<'PY'
+          import socket
+          import time
+          for _ in range(100):
+              try:
+                  with socket.create_connection(("127.0.0.1", 50053), timeout=0.25):
+                      break
+              except OSError:
+                  time.sleep(0.1)
+          else:
+              raise SystemExit("ggml-rpc-server did not bind loopback")
+          PY
+
+          kill -0 "$PID"
+          grep -F '127.0.0.1:50053' rpc.log
+          if grep -Fq "WARNING: Host ('127.0.0.1') is != '127.0.0.1'" rpc.log; then
+            echo 'llama.cpp RPC server unexpectedly considered loopback unsafe' >&2
+            exit 1
+          fi
+          echo 'Pinned official llama.cpp runtime smoke passed.'
