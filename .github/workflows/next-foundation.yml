@@ -43,6 +43,9 @@ jobs:
         with:
           go-version: '1.22.x'
           cache-dependency-path: chain/go.mod
+      - name: Download pinned crypto dependencies
+        working-directory: chain
+        run: go mod download
       - name: Go consensus tests
         working-directory: chain
         run: go test ./...
