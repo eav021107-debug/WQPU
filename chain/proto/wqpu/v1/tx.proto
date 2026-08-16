@@ -23,7 +23,7 @@ message MsgAuthorizeSessionResponse {}
 
 message MsgRevokeSession {
   string wallet = 1;
-  bytes session_pubkey = 2;
+  string session_address = 2;
   uint64 revocation_nonce = 3;
   bytes wallet_signature = 4;
 }
@@ -31,21 +31,21 @@ message MsgRevokeSessionResponse {}
 
 message MsgPublishProvider {
   ProviderRecord provider = 1;
-  bytes session_pubkey = 2;
+  string session_address = 2;
   bytes session_signature = 3;
 }
 message MsgPublishProviderResponse {}
 
 message MsgReserveJob {
   JobReservation reservation = 1;
-  bytes session_pubkey = 2;
+  string session_address = 2;
   bytes session_signature = 3;
 }
 message MsgReserveJobResponse {}
 
 message MsgSubmitReceipt {
   WorkReceipt receipt = 1;
-  bytes requester_session_pubkey = 2;
+  string requester_session_address = 2;
   bytes requester_signature = 3;
   bytes provider_signature = 4;
 }
@@ -53,7 +53,7 @@ message MsgSubmitReceiptResponse {}
 
 message MsgCloseJob {
   bytes job_id = 1;
-  bytes session_pubkey = 2;
+  string session_address = 2;
   bytes session_signature = 3;
 }
 message MsgCloseJobResponse {}
