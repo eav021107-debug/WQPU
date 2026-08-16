@@ -66,17 +66,30 @@ jobs:
           }
           trap cleanup EXIT
 
+          # A listening JSON-RPC socket is not enough: eth_call needs an actual
+          # canonical header. Wait until the sovereign chain has produced block 1.
           ready=0
           for _ in $(seq 1 180); do
             if ! kill -0 "$PID" 2>/dev/null; then
               cat "$LOG"
-              echo 'WQPU devnet exited before JSON-RPC became ready' >&2
+              echo 'WQPU devnet exited before the first block became ready' >&2
               exit 1
             fi
-            if curl -fsS \
+            RESPONSE="$(curl -fsS \
               -H 'content-type: application/json' \
-              --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
-              http://127.0.0.1:8545 >/dev/null 2>&1; then
+              --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+              http://127.0.0.1:8545 2>/dev/null || true)"
+            if python3 - "$RESPONSE" <<'PY'
+          import json
+          import sys
+          try:
+              response = json.loads(sys.argv[1])
+              value = int(response.get("result", "0x0"), 16)
+          except Exception:
+              raise SystemExit(1)
+          raise SystemExit(0 if value >= 1 else 1)
+          PY
+            then
               ready=1
               break
             fi
@@ -84,7 +97,7 @@ jobs:
           done
           if [ "$ready" -ne 1 ]; then
             cat "$LOG"
-            echo 'WQPU JSON-RPC did not become ready' >&2
+            echo 'WQPU JSON-RPC did not expose a canonical block in time' >&2
             exit 1
           fi
 
