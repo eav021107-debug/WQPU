@@ -160,9 +160,8 @@ fi
 
 mkdir -p "$ROOT" "$BIN"
 
-# Version query avoids stale CDN copies while still following main.
 curl -fsSL --retry 3 \
-  "${RAW}/wqpu.py?version=0.5.1" \
+  "${RAW}/wqpu.py?version=0.5.2" \
   -o "$ROOT/wqpu.py"
 chmod 755 "$ROOT/wqpu.py"
 
@@ -189,8 +188,7 @@ fi
 
 echo "WQPU installed with $($PYTHON --version 2>&1). Starting this computer as an equal peer..."
 
-# When install.sh itself is run as `curl | sh`, stdin belongs to the curl pipe.
-# Reattach stdin to the real terminal before starting the interactive WQPU CLI.
+# curl | sh uses the pipe as stdin. Give the interactive WQPU CLI the real terminal.
 if [ -r /dev/tty ]; then
   exec </dev/tty
 fi
