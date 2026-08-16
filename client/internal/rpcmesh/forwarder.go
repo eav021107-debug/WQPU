@@ -22,6 +22,20 @@ type ForwarderConfig struct {
 	Dialer       carrier.Dialer
 }
 
+type Forwarder struct {
+	inner *rpctunnel.Forwarder
+}
+
+func (f *Forwarder) Address() string {
+	if f == nil || f.inner == nil { return "" }
+	return f.inner.Address()
+}
+
+func (f *Forwarder) Close() error {
+	if f == nil || f.inner == nil { return nil }
+	return f.inner.Close()
+}
+
 func validateForwarderConfig(config ForwarderConfig) error {
 	if config.Signer == nil { return errors.New("WQPU RPC requester signer is required") }
 	if config.ChainID == "" { return errors.New("WQPU RPC requester chain id is required") }
@@ -36,16 +50,18 @@ func validateForwarderConfig(config ForwarderConfig) error {
 // remote peer. Each llama.cpp TCP connection performs a fresh chain lookup and
 // a fresh authenticated WQPU SecureStream handshake before application bytes
 // are forwarded.
-func OpenForwarder(parent context.Context, config ForwarderConfig) (*rpctunnel.Forwarder, error) {
+func OpenForwarder(parent context.Context, config ForwarderConfig) (*Forwarder, error) {
 	if parent == nil { return nil, errors.New("WQPU RPC requester context is required") }
 	if err := validateForwarderConfig(config); err != nil { return nil, err }
 	select {
 	case <-parent.Done(): return nil, parent.Err()
 	default:
 	}
-	return rpctunnel.StartLocalForwarder(parent, func(ctx context.Context) (io.ReadWriteCloser, error) {
+	inner, err := rpctunnel.StartLocalForwarder(parent, func(ctx context.Context) (io.ReadWriteCloser, error) {
 		connection, err := peertransport.DialRegistered(ctx, config.Dialer, config.Signer, config.ChainID, config.LocalPeerID, config.RemotePeerID, config.Registry)
 		if err != nil { return nil, err }
 		return connection.Stream, nil
 	})
+	if err != nil { return nil, err }
+	return &Forwarder{inner: inner}, nil
 }
