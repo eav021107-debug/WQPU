@@ -30,6 +30,8 @@ func registryPeer(id common.Hash, session common.Address, endpoint string) chain
 	}
 }
 
+type peerResult struct { conn *Connection; err error }
+
 func TestDialAndAcceptUseChainResolvedControlSessions(t *testing.T) {
 	leftRaw, rightRaw := net.Pipe()
 	leftKey, err := sessionkey.Generate(); if err != nil { t.Fatal(err) }
@@ -38,9 +40,8 @@ func TestDialAndAcceptUseChainResolvedControlSessions(t *testing.T) {
 	leftRegistry := fakeRegistry{rightID: registryPeer(rightID, common.HexToAddress(rightKey.Address()), "wqpu://right:7443")}
 	rightRegistry := fakeRegistry{leftID: registryPeer(leftID, common.HexToAddress(leftKey.Address()), "wqpu://left:7443")}
 
-	type result struct { conn *Connection; err error }
-	accepted := make(chan result, 1)
-	go func() { conn, err := Accept(context.Background(), rightRaw, rightKey, "wqpu-dev-1", rightID, rightRegistry); accepted <- result{conn, err} }()
+	accepted := make(chan peerResult, 1)
+	go func() { conn, err := Accept(context.Background(), rightRaw, rightKey, "wqpu-dev-1", rightID, rightRegistry); accepted <- peerResult{conn, err} }()
 	dialed, err := Dial(context.Background(), leftRaw, leftKey, "wqpu-dev-1", leftID, rightID, leftRegistry)
 	if err != nil { t.Fatal(err) }
 	defer dialed.Stream.Close()
@@ -59,7 +60,6 @@ func TestDialAndAcceptUseChainResolvedControlSessions(t *testing.T) {
 
 func TestDialRejectsRegistrySessionThatDoesNotMatchRemoteSigner(t *testing.T) {
 	leftRaw, rightRaw := net.Pipe()
-	defer rightRaw.Close()
 	leftKey, err := sessionkey.Generate(); if err != nil { t.Fatal(err) }
 	rightKey, err := sessionkey.Generate(); if err != nil { t.Fatal(err) }
 	wrong, err := sessionkey.Generate(); if err != nil { t.Fatal(err) }
@@ -67,13 +67,23 @@ func TestDialRejectsRegistrySessionThatDoesNotMatchRemoteSigner(t *testing.T) {
 	leftRegistry := fakeRegistry{rightID: registryPeer(rightID, common.HexToAddress(wrong.Address()), "wqpu://right:7443")}
 	rightRegistry := fakeRegistry{leftID: registryPeer(leftID, common.HexToAddress(leftKey.Address()), "wqpu://left:7443")}
 
-	accepted := make(chan error, 1)
-	go func() { _, err := Accept(context.Background(), rightRaw, rightKey, "wqpu-dev-1", rightID, rightRegistry); accepted <- err }()
+	accepted := make(chan peerResult, 1)
+	go func() { conn, err := Accept(context.Background(), rightRaw, rightKey, "wqpu-dev-1", rightID, rightRegistry); accepted <- peerResult{conn, err} }()
 	if _, err := Dial(context.Background(), leftRaw, leftKey, "wqpu-dev-1", leftID, rightID, leftRegistry); err == nil {
 		t.Fatal("dial should reject signer that differs from chain control session")
 	}
-	if err := <-accepted; err == nil {
-		t.Fatal("responder should observe closed/rejected handshake")
+
+	// The responder may have authenticated the initiator and returned just before
+	// the initiator discovers that the responder session disagrees with its own
+	// chain snapshot. That is safe: the rejecting initiator closes the carrier,
+	// so no application bytes can flow on the responder's one-sided stream.
+	remote := <-accepted
+	if remote.err == nil {
+		defer remote.conn.Stream.Close()
+		buf := make([]byte, 1)
+		if _, err := remote.conn.Stream.Read(buf); err == nil {
+			t.Fatal("one-sided responder stream must close before application data")
+		}
 	}
 }
 
