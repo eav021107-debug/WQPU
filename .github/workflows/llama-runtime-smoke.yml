@@ -5,6 +5,13 @@ on:
     branches: [next-foundation]
     paths:
       - 'client/internal/llamaruntime/**'
+      - 'client/internal/carrier/**'
+      - 'client/internal/chainregistry/**'
+      - 'client/internal/peertransport/**'
+      - 'client/internal/rpctunnel/**'
+      - 'client/internal/sessionkey/**'
+      - 'client/internal/transport/**'
+      - 'client/cmd/wqpu-llama-rpc-smoke/**'
       - '.github/workflows/llama-runtime-smoke.yml'
   workflow_dispatch:
 
@@ -18,9 +25,18 @@ permissions:
 jobs:
   official-linux-x64:
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+          cache-dependency-path: client/go.mod
+
+      - name: Resolve pinned WQPU client module checksums
+        working-directory: client
+        run: go mod tidy
+
       - name: Download exact official llama.cpp b10453 CPU archive
         shell: bash
         run: |
@@ -57,12 +73,15 @@ jobs:
 
           "$CLI" --help > cli.help 2>&1
           grep -F -- '--rpc' cli.help
+          grep -F -- '--list-devices' cli.help
 
-      - name: Boot the real RPC backend on loopback only
+      - name: Send real llama.cpp RPC protocol through WQPU SecureStream
         shell: bash
         run: |
           set -euo pipefail
-          RPC="$(find runtime -type f -name 'ggml-rpc-server' -print -quit)"
+          RPC="$(realpath "$(find runtime -type f -name 'ggml-rpc-server' -print -quit)")"
+          CLI="$(realpath "$(find runtime -type f -name 'llama-cli' -print -quit)")"
+
           "$RPC" --host 127.0.0.1 --port 50053 --threads 1 > rpc.log 2>&1 &
           PID=$!
           cleanup() {
@@ -90,4 +109,9 @@ jobs:
             echo 'llama.cpp RPC server unexpectedly considered loopback unsafe' >&2
             exit 1
           fi
-          echo 'Pinned official llama.cpp runtime smoke passed.'
+
+          # llama-cli never receives 50053. It only sees a random local WQPU
+          # forwarder; the helper authenticates both peer sessions, encrypts the
+          # stream, then the provider bridges it to the fixed loopback RPC target.
+          (cd client && go run ./cmd/wqpu-llama-rpc-smoke "$CLI" 127.0.0.1:50053)
+          echo 'Pinned official llama.cpp RPC crossed WQPU SecureStream.'
