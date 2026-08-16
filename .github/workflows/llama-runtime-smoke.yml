@@ -9,6 +9,7 @@ on:
       - 'client/internal/chainregistry/**'
       - 'client/internal/peertransport/**'
       - 'client/internal/rpctunnel/**'
+      - 'client/internal/rpcmesh/**'
       - 'client/internal/sessionkey/**'
       - 'client/internal/transport/**'
       - 'client/cmd/wqpu-runtime-install/**'
@@ -113,16 +114,17 @@ jobs:
           grep -F 'tiny model inference crossed remote WQPU RPC0 with remote allocation' model-smoke.log
           grep -F '[alloc_buffer]' "$WQPU_RUNTIME_BASE/model-smoke-rpc.log"
 
-      - name: Split one tiny model across two encrypted WQPU RPC peers
+      - name: Split one tiny model across two production WQPU rpcmesh peers
         shell: bash
         run: |
           set -euo pipefail
-          # Two independent providers expose separate loopback RPC backends only
-          # through their own authenticated SecureStreams. llama-server receives
-          # two requester-side forwarders, selects RPC0,RPC1, and forces a 1:1
-          # layer split. Both backend logs must show actual model allocation.
+          # This final proof uses the reusable production rpcmesh package, not
+          # smoke-specific accept/dial glue. Two ProviderServices expose fixed
+          # loopback RPC backends through bounded authenticated SecureStreams;
+          # two rpcmesh requester forwarders feed one llama-server. Both remote
+          # backend logs must show actual model allocation.
           (cd client && go run ./cmd/wqpu-llama-multipeer-smoke --runtime-base "$WQPU_RUNTIME_BASE") 2>&1 | tee multipeer-smoke.log
-          grep -F 'two-peer WQPU model inference allocated on RPC0 and RPC1' multipeer-smoke.log
+          grep -F 'two-peer production rpcmesh model inference allocated on RPC0 and RPC1' multipeer-smoke.log
           grep -F '[alloc_buffer]' "$WQPU_RUNTIME_BASE/multipeer-rpc-0.log"
           grep -F '[alloc_buffer]' "$WQPU_RUNTIME_BASE/multipeer-rpc-1.log"
-          echo 'Two-peer WQPU distributed model allocation and inference smoke passed.'
+          echo 'Production rpcmesh two-peer model allocation and inference smoke passed.'
