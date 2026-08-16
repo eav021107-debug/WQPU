@@ -1,0 +1,54 @@
+name: wqpu-provider-runtime-smoke
+
+on:
+  push:
+    branches: [next-foundation]
+    paths:
+      - 'chain/runtime.lock'
+      - 'chain/devnet.sh'
+      - 'chain/runtime_patch.py'
+      - 'chain/runtime_patch_provider.py'
+      - 'chain/x/wqpu/precompile/**'
+      - '.github/workflows/wqpu-provider-runtime-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  provider-wqpud:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+      - name: Prepare exact pinned Cosmos EVM source
+        env:
+          WQPU_CHAIN_SRC: ${{ runner.temp }}/cosmos-evm
+          WQPU_CHAIN_BIN_DIR: ${{ runner.temp }}/wqpu-bin
+        run: bash chain/devnet.sh --build-only
+      - name: Apply signed-provider WQPU overlay
+        env:
+          WQPU_CHAIN_SRC: ${{ runner.temp }}/cosmos-evm
+        run: >-
+          python chain/runtime_patch_provider.py
+          --source "$WQPU_CHAIN_SRC"
+          --overlay chain/x/wqpu/precompile
+      - name: Rebuild provider-enabled wqpud
+        working-directory: ${{ runner.temp }}/cosmos-evm
+        env:
+          WQPU_CHAIN_BIN_DIR: ${{ runner.temp }}/wqpu-bin
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="$(go list -f '{{if eq .Name "main"}}{{.ImportPath}}{{end}}' ./... | grep 'evmd' | head -n 1)"
+          test -n "$pkg"
+          mkdir -p "$WQPU_CHAIN_BIN_DIR"
+          go build -trimpath -o "$WQPU_CHAIN_BIN_DIR/wqpud" "$pkg"
+      - name: Verify provider-enabled daemon registration
+        run: |
+          "${{ runner.temp }}/wqpu-bin/wqpud" version
+          test -f "${{ runner.temp }}/cosmos-evm/precompiles/wqpu/provider_contract.go"
+          grep -F 'wqpuprecompile.WithWQPUProviderNetwork(precompiletypes.DefaultStaticPrecompiles(' "${{ runner.temp }}/cosmos-evm/evmd/app.go"
