@@ -1,92 +1,60 @@
-# WQPU
+# WQPU 0.3
 
-**One LLM across several home computers.**
+**One LLM across computers connected through the WQPU protocol. No Tailscale required.**
 
-WQPU is a small experimental launcher around the `llama.cpp` RPC backend. Run the same installer on several computers on the same trusted local network. The nodes discover each other, elect one coordinator, and run one `llama-server` that can offload parts of the model to the other computers.
-
-## Windows: one command
-
-Open **PowerShell** and run this on every computer:
-
-```powershell
-irm https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1 | iex
-```
-
-Keep that PowerShell window open while the computer is contributing resources.
-
-## Linux / macOS: one command
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh | sh
-```
-
-## What it does
-
-- detects CPU count and RAM automatically;
-- uses about 50% of logical CPU threads by default;
-- runs inference processes at lower priority;
-- keeps a large RAM safety margin (`llama.cpp --fit`);
-- downloads an official prebuilt `llama.cpp` release automatically;
-- finds other WQPU nodes by LAN broadcast;
-- starts `ggml-rpc-server` on workers;
-- starts one Web UI + OpenAI-compatible `llama-server` on the elected coordinator;
-- restarts the coordinator automatically when nodes join/leave so the model can be redistributed.
-
-The first run uses `ggml-org/gemma-3-1b-it-GGUF:Q4_K_M` only as a small test model. You can switch to a larger GGUF model later.
-
-## Commands
+WQPU uses one small public VPS as a TLS relay/coordinator. Contributor computers make outbound encrypted connections to the relay. `llama.cpp` RPC stays on localhost and is tunneled through WQPU, so port `50052` is never exposed to the Internet.
 
 ```text
-wqpu start
-wqpu status
-wqpu doctor
-wqpu model
-wqpu model <huggingface-user/repo:quant>
-wqpu update
-wqpu stop
+Mac ─────┐
+Windows ─┼── encrypted WQPU relay ── one llama-server
+Linux ───┘
 ```
 
-Example:
-
-```text
-wqpu model ggml-org/GLM-4.7-Flash-GGUF:Q4_K_M
-```
-
-## Resource limits
-
-By default WQPU reserves roughly half the CPU threads for your normal work and asks llama.cpp to retain at least 30% of RAM (minimum 4 GiB) as headroom. These are best-effort limits rather than a hard virtual-machine quota.
-
-Temporary CPU override:
-
-```powershell
-$env:WQPU_CPU_FRACTION="0.35"
-wqpu start
-```
-
-or on Linux/macOS:
+## 1. Install the relay once on the VPS
 
 ```bash
-WQPU_CPU_FRACTION=0.35 wqpu start
+curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install-relay.sh | sudo sh
 ```
 
-## Network
+The relay installer prints a **single node-install command** containing a private join token. Copy that command to each contributor computer.
 
-Default ports:
+## 2. Contributor computers
 
-- UDP `51111` — WQPU discovery
-- TCP `50052` — llama.cpp RPC
-- TCP `8080` — coordinator Web UI / API
+Linux/macOS command is printed automatically by the relay. It has this form:
 
-Ethernet is strongly preferred to Wi-Fi for large models.
+```bash
+curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install-node.sh | sh -s -- 'WQPU1....'
+```
 
-## Important security note
+Windows PowerShell command is also printed by the relay.
 
-`llama.cpp` currently describes its RPC backend as experimental/proof-of-concept and insecure. **Use WQPU only on a trusted private LAN. Never expose TCP 50052 to the public Internet.**
+Every connected node:
 
-## How the split works
+- contributes about 50% of its logical CPU threads by default;
+- keeps inference processes at lower priority;
+- gets local access to the shared LLM at `http://127.0.0.1:8080`;
+- can ask from the terminal with `wqpu ask "your question"`;
+- can check the cluster with `wqpu status`.
 
-`llama.cpp` can distribute model weights and KV cache across local and RPC devices. WQPU does not create several independent copies of the chatbot. It launches one coordinator inference graph and remote worker devices. Distribution itself does not add an extra quantization step; the quality is determined by the GGUF model/quantization you choose.
+The computer with the most RAM becomes the inference coordinator. Other nodes expose only a localhost `ggml-rpc-server`; the WQPU relay tunnels RPC traffic between machines.
 
-## MVP limitations
+## Multi-user model
 
-This first version intentionally prioritizes reliable mixed-PC setup over maximum speed. Windows/Linux use the official CPU build so different GPU brands/drivers do not break first-run setup. CPU load is limited; GPU acceleration can be added as a next layer after the cluster is confirmed working.
+In this MVP, **an online authenticated node is a contributor and gets access to the shared model**. All users talk to the same `llama-server`, which supports concurrent requests. Precise contribution credits/accounting are intentionally not implemented yet; that comes after the network/inference path is proven stable.
+
+## Security
+
+The relay generates its own TLS certificate. The node join token contains the pinned SHA-256 certificate fingerprint and a random cluster secret. Nodes verify the relay certificate fingerprint before sending traffic. The join token is private and should not be posted publicly.
+
+Only the WQPU relay port (`7443/tcp` by default) needs to be Internet-accessible. `llama.cpp` RPC and the local chat/API are bound to localhost.
+
+## Model quality
+
+WQPU distribution itself does not quantize or alter model weights. Quality is determined by the GGUF model you choose. The default small `gemma-3-1b-it Q4_K_M` model is only for the first connectivity test.
+
+## Current MVP limitations
+
+- CPU backend first; GPU auto-detection/acceleration is the next step.
+- Internet RPC is functional but can be slow because transformer inference is latency/bandwidth sensitive.
+- Join tokens are shared-cluster credentials; per-user accounts and contribution credits are not implemented yet.
+- This remains an experimental prototype, not a hardened public compute marketplace.
