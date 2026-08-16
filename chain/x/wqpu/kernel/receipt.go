@@ -3,14 +3,14 @@ package kernel
 import "errors"
 
 type WorkReceipt struct {
-	JobID                     string
-	ProviderWallet             string
-	ProviderPeerID             string
-	Sequence                   uint64
-	ComputeUnits               uint64
-	CumulativeComputeUnits     uint64
-	CumulativePaymentUnits     uint64
-	ResultCommitment           string
+	JobID                 string
+	ProviderWallet         string
+	ProviderPeerID         string
+	Sequence               uint64
+	ComputeUnits           uint64
+	CumulativeComputeUnits uint64
+	CumulativePaymentUnits uint64
+	ResultCommitment       string
 }
 
 func (r WorkReceipt) Validate() error {
@@ -35,9 +35,7 @@ func reservationForPeer(job JobReservation, peerID string) (ProviderReservation,
 	return ProviderReservation{}, false
 }
 
-// ValidateReceipt is called only after requester+provider signatures are verified.
-// It enforces replay, monotonic accounting and the single global network price.
-func ValidateReceipt(job JobReservation, previous *WorkReceipt, receipt WorkReceipt) error {
+func validateReceiptSnapshot(job JobReservation, receipt WorkReceipt) error {
 	if err := job.Validate(); err != nil {
 		return err
 	}
@@ -50,6 +48,25 @@ func ValidateReceipt(job JobReservation, previous *WorkReceipt, receipt WorkRece
 	reservation, ok := reservationForPeer(job, receipt.ProviderPeerID)
 	if !ok || reservation.ProviderWallet != receipt.ProviderWallet {
 		return errors.New("receipt provider is not reserved for this job")
+	}
+	expected, err := ChargeForUnits(job.PricePerMillionUnits, receipt.CumulativeComputeUnits)
+	if err != nil {
+		return err
+	}
+	if receipt.CumulativePaymentUnits != expected {
+		return errors.New("receipt payment does not match global network price")
+	}
+	if receipt.CumulativeComputeUnits > job.MaxComputeUnits || receipt.CumulativePaymentUnits > job.MaxChargeUnits {
+		return errors.New("receipt exceeds job limits")
+	}
+	return nil
+}
+
+// ValidateReceipt is called only after requester+provider signatures are verified.
+// It enforces replay, monotonic accounting and the single global network price.
+func ValidateReceipt(job JobReservation, previous *WorkReceipt, receipt WorkReceipt) error {
+	if err := validateReceiptSnapshot(job, receipt); err != nil {
+		return err
 	}
 
 	var oldSequence, oldCompute, oldPayment uint64
@@ -72,17 +89,6 @@ func ValidateReceipt(job JobReservation, previous *WorkReceipt, receipt WorkRece
 	}
 	if receipt.ComputeUnits != receipt.CumulativeComputeUnits-oldCompute {
 		return errors.New("receipt compute delta does not match cumulative compute")
-	}
-
-	expected, err := ChargeForUnits(job.PricePerMillionUnits, receipt.CumulativeComputeUnits)
-	if err != nil {
-		return err
-	}
-	if receipt.CumulativePaymentUnits != expected {
-		return errors.New("receipt payment does not match global network price")
-	}
-	if receipt.CumulativeComputeUnits > job.MaxComputeUnits || receipt.CumulativePaymentUnits > job.MaxChargeUnits {
-		return errors.New("receipt exceeds job limits")
 	}
 	return nil
 }
@@ -111,7 +117,7 @@ func BuildSettlement(job JobReservation, latestByPeer map[string]WorkReceipt) (S
 		if !ok {
 			return Settlement{}, errors.New("missing provider receipt")
 		}
-		if err := ValidateReceipt(job, nil, receipt); err != nil {
+		if err := validateReceiptSnapshot(job, receipt); err != nil {
 			return Settlement{}, err
 		}
 		if receipt.CumulativeComputeUnits > ^uint64(0)-totalCompute {
