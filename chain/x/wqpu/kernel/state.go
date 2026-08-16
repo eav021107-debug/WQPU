@@ -67,6 +67,7 @@ type State struct {
 	PeerOwners            map[string]string
 	Jobs                  map[string]JobReservation
 	ReservedByPeer        map[string]uint64
+	BondedCapacityByPeer  map[string]uint64
 	LatestReceipts        map[string]map[string]WorkReceipt
 	CompletedSettlements  map[string]Settlement
 }
@@ -84,6 +85,7 @@ func NewState(chainID string, initialPrice uint64) (*State, error) {
 		PeerOwners:            map[string]string{},
 		Jobs:                  map[string]JobReservation{},
 		ReservedByPeer:        map[string]uint64{},
+		BondedCapacityByPeer:  map[string]uint64{},
 		LatestReceipts:        map[string]map[string]WorkReceipt{},
 		CompletedSettlements:  map[string]Settlement{},
 	}, nil
@@ -179,6 +181,9 @@ func (s *State) PublishProvider(wallet, sessionAddress string, p Provider) error
 		if p.PeerID != old.PeerID {
 			if s.ReservedByPeer[old.PeerID] != 0 {
 				return errors.New("cannot change peer id while work is reserved")
+			}
+			if s.BondedCapacityByPeer[old.PeerID] != 0 {
+				return errors.New("cannot change peer id while price capacity is bonded")
 			}
 			delete(s.PeerOwners, old.PeerID)
 		}
@@ -401,7 +406,7 @@ func (s *State) expireProviders() {
 		if p.ExpiresHeight > s.Height {
 			continue
 		}
-		if s.ReservedByPeer[p.PeerID] != 0 {
+		if s.ReservedByPeer[p.PeerID] != 0 || s.BondedCapacityByPeer[p.PeerID] != 0 {
 			continue
 		}
 		delete(s.PeerOwners, p.PeerID)
@@ -426,16 +431,23 @@ func (s *State) AdvanceHeight(blocks uint64) error {
 	return nil
 }
 
+// ActiveCapacityUnits is intentionally price capacity, not raw advertised
+// capacity. Unbonded providers remain schedulable but cannot push the network
+// price down by claiming free supply.
 func (s *State) ActiveCapacityUnits() uint64 {
 	var total uint64
 	for _, p := range s.Providers {
 		if p.Validate(s.Height) != nil {
 			continue
 		}
-		if p.CapacityUnits > ^uint64(0)-total {
+		capacity := s.BondedCapacityByPeer[p.PeerID]
+		if capacity > p.CapacityUnits {
+			capacity = p.CapacityUnits
+		}
+		if capacity > ^uint64(0)-total {
 			return ^uint64(0)
 		}
-		total += p.CapacityUnits
+		total += capacity
 	}
 	return total
 }
