@@ -2,11 +2,15 @@
 
 ## Decision
 
-WQPU will be a sovereign application-specific L1. It will not deploy its token or settlement contracts onto Ethereum, Solana, or another external chain.
+WQPU is a sovereign application-specific L1. It does not deploy its token or settlement onto Ethereum, Solana, or another external chain.
 
-For the consensus/execution foundation, use **CometBFT + Cosmos SDK**, with **Cosmos EVM compatibility enabled only as a wallet/tooling interface**. These are software components, not external settlement networks. WQPU controls its own genesis, validator set, native coin, fees, protocol rules, upgrades and chain state.
+Consensus/execution uses **CometBFT + Cosmos SDK + Cosmos EVM** as open-source components. WQPU controls its own genesis, validator set, native coin, fees, protocol rules, upgrades and chain state.
 
-This avoids implementing Byzantine consensus, transaction ordering, validator slashing, state commitment and EVM wallet compatibility from scratch.
+WQPU-specific consensus state lives in `x/wqpu`. Wallet-facing access is exposed through a **native WQPU EVM precompile** added to `wqpud`, rather than a separately deployed upgradeable smart contract. This keeps one authoritative implementation of scheduling/payment rules while allowing ordinary EVM-compatible wallets to interact with the chain.
+
+The WQPU precompile has no owner/admin role. It is simply a deterministic interface into `x/wqpu` state. Its address is part of the WQPU protocol and cannot silently change per validator.
+
+This avoids implementing Byzantine consensus, transaction ordering, validator slashing, state commitment and wallet compatibility from scratch.
 
 ## Initial chain identity
 
@@ -26,7 +30,7 @@ Production genesis parameters are deliberately not fixed yet.
 
 ## External-chain independence
 
-The first public WQPU network should launch with:
+The first public WQPU network launches with:
 
 - no dependency on Ethereum/Solana for settlement;
 - no required bridge;
@@ -41,21 +45,21 @@ Optional bridges/interoperability may be added later but cannot be required for 
 
 Users connect an existing wallet. WQPU never generates or imports a user seed phrase or user private key.
 
-The wallet performs an explicit authorization for a short-lived WQPU session key. That delegation is chain-bound, replay-bounded by a revocation nonce, and has strict expiry, spend, per-job and permission limits.
+The wallet explicitly authorizes a short-lived local WQPU session key. The signed delegation is bound to both WQPU chain ID and EVM chain ID, has a revocation nonce, expiry, maximum total spend, maximum single-job spend and permission bits.
 
-The local WQPU client then uses the delegated session key for background provider heartbeats, job reservations and bounded settlement without repeatedly asking the wallet to pop up for every token or tensor operation.
+The chain cryptographically recovers the authorizing wallet from the EIP-712 signature before any session state is created. Changing the wallet, chain, limits or session key invalidates that signature.
+
+The session key is not the user's wallet key. The current client foundation keeps it only in process memory; closing WQPU destroys it. A future persistent session may use an OS keystore, but WQPU will not invent its own plaintext key store.
 
 ## Native WQPU coin
 
 WQPU is the native denomination of the WQPU chain, not an ERC-20 deployed on a foreign network.
 
-Normal inference does not mint coins. It transfers WQPU value from requester to providers according to accepted work receipts.
+Normal inference does not mint coins. It transfers existing WQPU value from requester to providers according to accepted work receipts.
 
 Initial supply/distribution and any future protocol emissions require a separate economics specification and cannot be silently added to compute accounting.
 
-## Custom chain module: x/wqpu
-
-The WQPU-specific application module owns the following consensus state.
+## `x/wqpu` consensus state
 
 ### 1. Session delegations
 
@@ -69,11 +73,13 @@ Keyed by wallet + session public key:
 - permissions bitset;
 - currently reserved and already settled spend.
 
+Payment capacity is reserved before work begins, so one session cannot promise the same balance to several concurrent jobs.
+
 ### 2. Provider registry
 
 Keyed by wallet/peer ID:
 
-- WQPU peer public key;
+- WQPU peer identity;
 - reachable transport endpoints;
 - protocol version;
 - model/capability commitments;
@@ -81,7 +87,7 @@ Keyed by wallet/peer ID:
 - signed local load telemetry;
 - heartbeat/expiry height.
 
-Provider entries expire automatically. The registry is the authoritative chain view of who is currently advertising compute.
+Provider entries expire automatically. Duplicate peer IDs cannot be claimed by another wallet. The registry is the authoritative chain view of currently advertised compute.
 
 ### 3. Job reservations
 
@@ -95,15 +101,15 @@ Before paid compute starts, the requester creates a bounded reservation containi
 - reserved capacity per provider;
 - timeout height.
 
-The maximum payment and provider capacity are reserved **before** work starts. A failed reservation must change no state. Completion settles only the verified actual charge; timeout releases unused payment and compute capacity.
+Maximum payment and provider capacity are reserved **before** work starts. A failed reservation changes no state.
 
-Reservations are what the chain uses as the authoritative demand/load floor. A provider cannot move the global price merely by claiming to be busy.
+Reservations are the authoritative demand/load floor used by the global price. A provider cannot raise the network price simply by claiming to be busy.
 
 ### 4. Global compute price
 
 There is one price for the whole WQPU network per epoch.
 
-The price controller uses chain-confirmed demand/reservations and active capacity, integer-only deterministic arithmetic, a target utilization and a strict maximum percentage move per epoch.
+The controller uses chain-confirmed demand/reservations and active capacity, integer-only deterministic arithmetic, a target utilization and a strict maximum percentage move per epoch.
 
 Provider-specific asking prices do not exist in v1.
 
@@ -113,19 +119,32 @@ Receipts bind:
 
 - job ID;
 - provider wallet/peer ID;
-- receipt sequence;
+- strictly increasing sequence;
 - accepted compute units;
 - cumulative compute;
-- cumulative payment;
+- cumulative payment at the immutable global job price;
 - result/work commitment.
 
-Old receipts cannot be replayed to duplicate payment.
+A job cannot be finalized by supplying an arbitrary charge. Normal finalization is derived only from the latest verified receipts. Replayed or price-manipulated receipts are rejected.
+
+If a job times out, providers with already accepted receipts are still paid for that accepted work; unused requester payment and unused compute reservations are released.
 
 ### 6. Settlement
 
-Settlement transfers native WQPU according to valid accepted receipts and releases reservations on completion/timeout.
+Settlement transfers native WQPU according to verified receipts and releases reservations atomically.
 
-Token-by-token generation stays off-chain; the chain sees reservations and aggregated/cumulative settlement so inference is not blocked on one transaction for every generated token.
+Token-by-token generation stays off-chain; the chain sees bounded reservations and cumulative settlement so inference is not blocked on a transaction for every generated token.
+
+## Native WQPU EVM precompile
+
+The wallet-facing precompile will be registered as an additional static precompile in `wqpud`. It will expose only narrow protocol operations such as:
+
+- read global price;
+- read active providers;
+- authorize/revoke a wallet session;
+- inspect a session/job/settlement.
+
+Background compute messages remain signed by the limited WQPU session identity and are validated against `x/wqpu` state. The precompile does not become a coordinator, registry server or privileged actor.
 
 ## Consensus versus compute equality
 
@@ -137,21 +156,22 @@ The intended public validator policy is open staking/delegation rather than a ha
 
 ## Chain state is discovery truth, not magic first-contact transport
 
-Once a WQPU client has synchronized chain state, it can discover active compute providers entirely from that state.
+Once a WQPU client has synchronized chain state, it discovers active compute providers entirely from that state. There are no manual `/invite` codes in the target UX.
 
-A completely new Internet host still needs a transport path to synchronize its first chain headers/peers. That bootstrap path has no authority over chain truth and must be replaceable. The production bootstrap mechanism will be designed separately and must not create a permanent privileged compute server.
+A brand-new Internet host still needs a transport path to synchronize its first chain headers/peers. That bootstrap path has no authority over chain truth and must be replaceable. Production chain bootstrap is separate from compute-provider discovery and must not create a permanent privileged compute server.
 
 ## Implementation order
 
-1. deterministic Python reference state machine and tests;
-2. define protobuf/message/state schema for `x/wqpu`;
-3. create local sovereign chain devnet;
-4. implement wallet session delegation verification;
-5. implement provider registry + expiry;
-6. implement reservation-backed global price;
-7. implement work receipts/settlement;
-8. connect Python WQPU client to chain queries/transactions;
-9. secure peer transport;
-10. distributed llama.cpp worker scheduling;
-11. multi-node failure/load tests;
-12. only then integrate one-command installer + wallet-connect UX.
+1. deterministic reference state machine and tests;
+2. sovereign WQPU devnet + pinned runtime;
+3. wallet session EIP-712 verification;
+4. provider registry + expiry;
+5. reservation-backed single global price;
+6. receipt-only settlement + timeout fairness;
+7. native WQPU precompile + `wqpud` integration;
+8. single Go WQPU client + local Connect Wallet;
+9. chain-driven provider discovery;
+10. secure peer transport;
+11. distributed llama.cpp scheduling across multiple workers;
+12. multi-node failure/load tests;
+13. one-command release installer.
