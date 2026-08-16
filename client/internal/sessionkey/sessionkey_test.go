@@ -1,26 +1,51 @@
 package sessionkey
 
-import "testing"
+import (
+	"strings"
+	"testing"
 
-func TestGenerateSignVerify(t *testing.T) {
+	"github.com/ethereum/go-ethereum/crypto"
+)
+
+func TestGenerateSignRecover(t *testing.T) {
 	key, err := Generate()
 	if err != nil {
 		t.Fatal(err)
 	}
-	message := []byte("wqpu-session-test")
-	sig, err := key.Sign(message)
+	digest := crypto.Keccak256([]byte("wqpu-session-test"))
+	sig, err := key.SignDigest(digest)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !Verify(key.Public(), message, sig) {
-		t.Fatal("valid session signature did not verify")
+	recovered, err := RecoverAddress(digest, sig)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if Verify(key.Public(), []byte("different"), sig) {
-		t.Fatal("signature verified for different message")
+	if recovered != key.Address() {
+		t.Fatalf("recovered=%s want=%s", recovered, key.Address())
 	}
 }
 
-func TestGeneratedKeysAreDifferent(t *testing.T) {
+func TestSignatureDoesNotRecoverForDifferentDigest(t *testing.T) {
+	key, err := Generate()
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := crypto.Keccak256([]byte("one"))
+	sig, err := key.SignDigest(digest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := RecoverAddress(crypto.Keccak256([]byte("two")), sig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == key.Address() {
+		t.Fatal("signature recovered the same session for a different digest")
+	}
+}
+
+func TestGeneratedSessionAddressesAreDifferentAndCanonical(t *testing.T) {
 	a, err := Generate()
 	if err != nil {
 		t.Fatal(err)
@@ -29,20 +54,20 @@ func TestGeneratedKeysAreDifferent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if a.PublicHex() == b.PublicHex() {
-		t.Fatal("independent sessions reused the same key")
+	if a.Address() == b.Address() {
+		t.Fatal("independent sessions reused the same address")
+	}
+	if len(a.Address()) != 42 || a.Address() != strings.ToLower(a.Address()) || !strings.HasPrefix(a.Address(), "0x") {
+		t.Fatalf("non-canonical session address: %s", a.Address())
 	}
 }
 
-func TestPrivateKeyIsNotExposedByAPI(t *testing.T) {
+func TestRejectsNonDigestSigning(t *testing.T) {
 	key, err := Generate()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(key.Public()) != 32 {
-		t.Fatalf("public key length=%d", len(key.Public()))
-	}
-	if len(key.PublicHex()) != 66 {
-		t.Fatalf("public hex length=%d", len(key.PublicHex()))
+	if _, err := key.SignDigest([]byte("not-32-bytes")); err == nil {
+		t.Fatal("non-digest input should be rejected")
 	}
 }
