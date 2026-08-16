@@ -131,6 +131,38 @@ def patch_app_toml(text: str, evm_chain_id: int) -> str:
     return "\n".join(out) + ("\n" if text.endswith("\n") else "")
 
 
+def patch_comet_toml(text: str) -> str:
+    """Configure CometBFT to delegate mempool ordering to the EVM application.
+
+    Cosmos EVM's application mempool is incompatible with CometBFT's default
+    flood mempool. Fail closed if the expected [mempool] type field is absent so
+    a future upstream config change cannot silently produce a non-booting devnet.
+    """
+    section = ""
+    replacements = 0
+    out: list[str] = []
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        match = re.fullmatch(r"\[([^]]+)\]", stripped)
+        if match:
+            section = match.group(1)
+            out.append(raw)
+            continue
+
+        key = stripped.split("=", 1)[0].strip() if "=" in stripped else ""
+        if section == "mempool" and key == "type":
+            out.append('type = "app"')
+            replacements += 1
+        else:
+            out.append(raw)
+
+    if replacements != 1:
+        raise ValueError(
+            f"expected exactly one [mempool] type field, found {replacements}"
+        )
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
 def _bech32_polymod(values: list[int]) -> int:
     generators = (0x3B6A57B2, 0x26508E6D, 0x1EA119FA, 0x3D4233DD, 0x2A1462B3)
     chk = 1
@@ -186,6 +218,10 @@ def patch_app_file(path: Path, evm_chain_id: int) -> None:
     path.write_text(patch_app_toml(path.read_text(encoding="utf-8"), evm_chain_id), encoding="utf-8")
 
 
+def patch_comet_file(path: Path) -> None:
+    path.write_text(patch_comet_toml(path.read_text(encoding="utf-8")), encoding="utf-8")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
@@ -200,6 +236,9 @@ def main() -> int:
     app.add_argument("path", type=Path)
     app.add_argument("--evm-chain-id", required=True, type=int)
 
+    comet = sub.add_parser("config-toml")
+    comet.add_argument("path", type=Path)
+
     bech32 = sub.add_parser("bech32")
     bech32.add_argument("address")
     bech32.add_argument("--prefix", default="cosmos")
@@ -209,6 +248,8 @@ def main() -> int:
         patch_genesis_file(args.path, args.base, args.display, args.exponent)
     elif args.command == "app-toml":
         patch_app_file(args.path, args.evm_chain_id)
+    elif args.command == "config-toml":
+        patch_comet_file(args.path)
     else:
         print(evm_hex_to_bech32(args.address, args.prefix))
     return 0
