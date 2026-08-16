@@ -34,6 +34,18 @@ func mulDivCeil(a, b, d uint64) (uint64, error) {
 	return q.Uint64(), nil
 }
 
+// floorDivSigned matches Python's // semantics for consensus math.
+func floorDivSigned(n, d int64) int64 {
+	if d <= 0 {
+		panic("floorDivSigned requires a positive divisor")
+	}
+	q := n / d
+	if n < 0 && n%d != 0 {
+		q--
+	}
+	return q
+}
+
 func AggregatePriceState(capacity, reserved, previousPrice, nextEpoch uint64) (GlobalPriceState, error) {
 	if previousPrice == 0 {
 		return GlobalPriceState{}, errors.New("previous price must be positive")
@@ -59,7 +71,7 @@ func AggregatePriceState(capacity, reserved, previousPrice, nextEpoch uint64) (G
 	}
 
 	deviation := int64(utilization) - int64(TargetUtilizationBPS)
-	move := deviation / 4
+	move := floorDivSigned(deviation, 4)
 	if move > int64(MaxPriceMoveBPS) {
 		move = int64(MaxPriceMoveBPS)
 	}
