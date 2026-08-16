@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	goruntime "runtime"
 	"strings"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 
 	"github.com/eav021107-debug/WQPU/client/internal/carrier"
 	"github.com/eav021107-debug/WQPU/client/internal/chainregistry"
+	"github.com/eav021107-debug/WQPU/client/internal/llamaruntime"
 	"github.com/eav021107-debug/WQPU/client/internal/peertransport"
 	"github.com/eav021107-debug/WQPU/client/internal/rpctunnel"
 	"github.com/eav021107-debug/WQPU/client/internal/sessionkey"
@@ -124,12 +126,30 @@ func run(cliPath, rpcTarget string) error {
 	return nil
 }
 
+func runManagedRuntime(baseDir string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	installed, err := (llamaruntime.Installer{}).InstallCPU(ctx, baseDir, goruntime.GOOS, goruntime.GOARCH)
+	if err != nil { return err }
+	const rpcPort = 50053
+	backend, err := llamaruntime.StartRPCServer(ctx, installed, rpcPort, 1, nil, false, os.Stderr, 30*time.Second)
+	if err != nil { return err }
+	defer backend.Close()
+	return run(installed.LlamaCLI, fmt.Sprintf("127.0.0.1:%d", rpcPort))
+}
+
 func main() {
-	if len(os.Args) != 3 {
-		fmt.Fprintln(os.Stderr, "usage: wqpu-llama-rpc-smoke /path/to/llama-cli 127.0.0.1:50053")
+	var err error
+	switch {
+	case len(os.Args) == 3 && os.Args[1] == "--runtime-base":
+		err = runManagedRuntime(os.Args[2])
+	case len(os.Args) == 3:
+		err = run(os.Args[1], os.Args[2])
+	default:
+		fmt.Fprintln(os.Stderr, "usage: wqpu-llama-rpc-smoke --runtime-base BASE_DIR | /path/to/llama-cli 127.0.0.1:50053")
 		os.Exit(2)
 	}
-	if err := run(os.Args[1], os.Args[2]); err != nil {
+	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
