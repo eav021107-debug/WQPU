@@ -7,8 +7,7 @@ on:
     paths:
       - 'wqpu_next/**'
       - 'chain/**'
-      - 'tests/test_next_foundation.py'
-      - 'tests/test_devnet_config.py'
+      - 'tests/**'
       - 'ARCHITECTURE_V1.md'
       - 'CHAIN_DESIGN.md'
       - 'SECURITY.md'
@@ -33,7 +32,7 @@ jobs:
       - name: Shell syntax
         run: bash -n chain/devnet.sh
       - name: Unit tests
-        run: python -m unittest -v tests.test_next_foundation tests.test_devnet_config
+        run: python -m unittest discover -v -s tests -p 'test_*.py'
 
   go-consensus-kernel:
     runs-on: ubuntu-latest
