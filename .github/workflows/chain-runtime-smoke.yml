@@ -36,4 +36,4 @@ jobs:
       - name: Verify daemon exists
         run: test -x "${{ runner.temp }}/wqpu-bin/wqpud"
       - name: Verify daemon starts as a CLI
-        run: "${{ runner.temp }}/wqpu-bin/wqpud" version
+        run: ${{ runner.temp }}/wqpu-bin/wqpud version
