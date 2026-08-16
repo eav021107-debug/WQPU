@@ -1,5 +1,6 @@
 #!/usr/bin/env sh
 set -eu
+
 PORT="${WQPU_RELAY_PORT:-7443}"
 HOST="${1:-}"
 ROOT="/opt/wqpu-relay"
@@ -14,9 +15,17 @@ need_pkg() {
   else echo "Install $* first." >&2; exit 1
   fi
 }
+
 need_pkg python3 python3
 need_pkg openssl openssl
 need_pkg curl curl ca-certificates
+
+if ! python3 -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,10) else 1)'; then
+  echo "WQPU relay requires Python 3.10 or newer." >&2
+  exit 1
+fi
+
+command -v systemctl >/dev/null 2>&1 || { echo "systemd is required by this installer." >&2; exit 1; }
 
 mkdir -p "$ROOT"
 curl -fsSL "$RAW/relay.py" -o "$ROOT/relay.py"
@@ -46,7 +55,7 @@ fi
 
 cat > /etc/systemd/system/wqpu-relay.service <<EOF
 [Unit]
-Description=WQPU relay
+Description=WQPU equal-peer relay
 After=network-online.target
 Wants=network-online.target
 
@@ -68,14 +77,22 @@ if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewa
   firewall-cmd --permanent --add-port="${PORT}/tcp" >/dev/null
   firewall-cmd --reload >/dev/null
 fi
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+  ufw allow "${PORT}/tcp" >/dev/null
+fi
 
 FP="$(openssl x509 -in "$ROOT/cert.pem" -outform DER | openssl dgst -sha256 | awk '{print $NF}')"
 SECRET="$(cat "$ROOT/secret")"
 TOKEN="$(python3 - "$HOST" "$PORT" "$SECRET" "$FP" <<'PY'
-import base64,json,sys
-d={"host":sys.argv[1],"port":int(sys.argv[2]),"secret":sys.argv[3],"fingerprint":sys.argv[4]}
-b=base64.urlsafe_b64encode(json.dumps(d,separators=(",",":")).encode()).decode().rstrip("=")
-print("WQPU1."+b)
+import base64, json, sys
+payload = {
+    "host": sys.argv[1],
+    "port": int(sys.argv[2]),
+    "secret": sys.argv[3],
+    "fingerprint": sys.argv[4],
+}
+raw = base64.urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode()).decode().rstrip("=")
+print("WQPU1." + raw)
 PY
 )"
 printf '%s\n' "$TOKEN" > "$ROOT/join-token"
@@ -83,11 +100,12 @@ chmod 600 "$ROOT/join-token"
 
 echo ""
 echo "WQPU relay is running on ${HOST}:${PORT}"
-echo "Copy this ONE command to every Linux/macOS contributor:"
+echo "The VPS is relay-only: it does not run or coordinate the model."
 echo ""
+echo "Linux/macOS contributor command:"
 echo "curl -fsSL $RAW/install-node.sh | sh -s -- '$TOKEN'"
 echo ""
-echo "Windows PowerShell:"
+echo "Windows PowerShell contributor command:"
 echo "\$env:WQPU_JOIN='$TOKEN'; irm $RAW/install-node.ps1 | iex"
 echo ""
-echo "The join token is a secret. Do not post it publicly."
+echo "Keep the join token private."
