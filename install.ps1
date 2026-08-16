@@ -66,7 +66,7 @@ if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
 }
 
 $script = Join-Path $root 'wqpu.py'
-Invoke-WebRequest -UseBasicParsing "$raw/wqpu.py?version=0.5.1" -OutFile $script
+Invoke-WebRequest -UseBasicParsing "$raw/wqpu.py?version=0.5.3" -OutFile $script
 
 $exe=$py.Exe; $extra=$py.Extra
 if ($extra) { & $exe $extra -m py_compile $script }
