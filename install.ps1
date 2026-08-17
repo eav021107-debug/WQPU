@@ -5,6 +5,7 @@ $bin = Join-Path $root 'bin'
 $join = $env:WQPU_JOIN
 $expectedWqpu = 'WQPU 0.6.0-dev'
 $cacheBuster = 'chain-0.6.0-dev-r1'
+$chainState = Join-Path $HOME '.wqpu\chain.json'
 
 New-Item -ItemType Directory -Force -Path $root,$bin | Out-Null
 
@@ -106,8 +107,11 @@ $env:Path="$bin;$env:Path"
 
 $ver = if ($extra) { (& $exe $extra --version 2>&1) } else { (& $exe --version 2>&1) }
 Write-Host "WQPU installed: $coreVersion with $ver." -ForegroundColor Green
-if ([string]::IsNullOrWhiteSpace($join)) {
+if (-not [string]::IsNullOrWhiteSpace($join)) {
+  & $launcher --join $join
+} elseif (($env:WQPU_RPC_URL -and $env:WQPU_REGISTRY) -or (Test-Path $chainState)) {
   & $launcher
 } else {
-  & $launcher --join $join
+  Write-Host 'WQPU public chain is not configured yet; starting the existing private mesh.'
+  & $launcher --legacy
 }
