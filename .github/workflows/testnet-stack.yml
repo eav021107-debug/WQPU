@@ -1,0 +1,81 @@
+name: WQPU testnet stack
+
+on:
+  push:
+    paths:
+      - 'scripts/testnet_stack.py'
+      - 'wqpu_rpc_gateway.py'
+      - 'wqpu_relayer.py'
+      - 'wqpu_transport_relay.py'
+      - 'contracts/**'
+      - 'tests/test_rpc_gateway.py'
+      - 'tests/test_testnet_stack.py'
+      - '.github/workflows/testnet-stack.yml'
+  pull_request:
+    paths:
+      - 'scripts/testnet_stack.py'
+      - 'wqpu_rpc_gateway.py'
+      - 'wqpu_relayer.py'
+      - 'wqpu_transport_relay.py'
+      - 'contracts/**'
+      - 'tests/test_rpc_gateway.py'
+      - 'tests/test_testnet_stack.py'
+      - '.github/workflows/testnet-stack.yml'
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.11']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile stack modules
+        run: python -m py_compile wqpu_rpc_gateway.py wqpu_relayer.py scripts/testnet_stack.py
+      - name: Test stack policy/config
+        run: python -m unittest tests.test_rpc_gateway tests.test_testnet_stack -v
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Start complete testnet stack
+        run: >-
+          python scripts/testnet_stack.py start
+          --public-host 127.0.0.1
+          --internal-rpc-port 28546
+          --rpc-port 18545
+          --relayer-port 18787
+          --relay-port 17443
+      - name: Check stack status and published config
+        run: |
+          python scripts/testnet_stack.py status
+          curl -fsS http://127.0.0.1:18545/health
+          curl -fsS http://127.0.0.1:18787/health
+          curl -fsS http://127.0.0.1:18787/network-config.json | grep -F '"enabled": true'
+          curl -fsS http://127.0.0.1:18787/join.sh | grep -F 'WQPU_NO_START=1'
+          curl -fsS http://127.0.0.1:18787/join.ps1 | grep -F "WQPU_NO_START = '1'"
+      - name: Verify public RPC is restricted
+        run: |
+          CHAIN=$(curl -fsS -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' http://127.0.0.1:18545)
+          echo "$CHAIN" | grep -F '0x7a69'
+          BLOCKED=$(curl -fsS -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":2,"method":"eth_accounts","params":[]}' http://127.0.0.1:18545)
+          echo "$BLOCKED" | grep -F 'blocked by WQPU testnet gateway'
+      - name: Faucet funds a fresh wallet through signed operator transactions
+        run: |
+          WALLET=0x1111111111111111111111111111111111111111
+          curl -fsS -H 'content-type: application/json' --data "{\"wallet\":\"$WALLET\"}" http://127.0.0.1:18787/faucet | grep -F 'transactions'
+          BALANCE=$(cast balance "$WALLET" --rpc-url http://127.0.0.1:18545)
+          test "$BALANCE" != "0"
+      - name: Stop testnet stack
+        if: always()
+        run: python scripts/testnet_stack.py stop || true

@@ -1,36 +1,41 @@
 #!/usr/bin/env python3
-"""Minimal WQPU gas relayer service.
+"""WQPU gas relayer and optional testnet faucet.
 
-The relayer pays only chain gas. It cannot choose provider payouts or requester limits:
-all meaningful values are verified by WQPU contracts against wallet/session signatures.
-Production deployments should keep the relayer account in a dedicated signer/HSM; this
-prototype can use an explicitly unlocked RPC account for devnet/operator testing.
+The relayer pays chain gas for funding/session/claim transactions. Production can use
+an unlocked dedicated RPC signer as before. Testnet operators may instead provide a
+private key via WQPU_RELAYER_PRIVATE_KEY; it is never sent to WQPU clients.
 """
-
 from __future__ import print_function
 
 import argparse
 import json
 import os
+import re
+import shutil
+import subprocess
 import threading
 import time
 from collections import defaultdict, deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 
 from wqpu_chain import RegistryClient, normalize_address
 from wqpu_claim import (
-    activate_via_rpc,
-    fund_via_rpc,
+    activation_calldata,
+    claim_calldata,
+    funding_calldata,
     normalize_activation,
     normalize_funding,
     normalize_package,
-    relay_via_rpc,
+    simulate_activation,
+    simulate_claim,
+    simulate_funding,
 )
-
 
 MAX_BODY = 64 * 1024
 DEFAULT_RATE = 30
 WINDOW_SECONDS = 60
+TRANSFER_SELECTOR = "a9059cbb"
 
 
 class RelayerError(RuntimeError):
@@ -44,12 +49,47 @@ def configured_market(client):
     return normalize_address(value)
 
 
-def configured_sender(client):
+def configured_token(client):
+    value = os.environ.get("WQPU_TOKEN") or client.network.get("token") or ""
+    return normalize_address(value) if value else ""
+
+
+def _run(cmd):
+    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+    if proc.returncode != 0:
+        raise RelayerError("relayer signer command failed: {}".format(proc.stdout.strip()))
+    return proc.stdout
+
+
+def _normalize_private_key(value):
+    value = str(value or "").strip().lower()
+    if not value:
+        return ""
+    if not re.match(r"^0x[0-9a-f]{64}$", value):
+        raise RelayerError("WQPU_RELAYER_PRIVATE_KEY must be a 32-byte hex key")
+    if int(value, 16) == 0:
+        raise RelayerError("invalid relayer private key")
+    return value
+
+
+def sender_from_private_key(private_key):
+    if not shutil.which("cast"):
+        raise RelayerError("cast is required for private-key relayer mode")
+    out = _run(["cast", "wallet", "address", "--private-key", private_key])
+    matches = re.findall(r"0x[0-9a-fA-F]{40}", out)
+    if not matches:
+        raise RelayerError("could not derive relayer address")
+    return normalize_address(matches[-1])
+
+
+def configured_sender(client, private_key=""):
+    if private_key:
+        return sender_from_private_key(private_key)
     explicit = os.environ.get("WQPU_RELAYER_FROM", "").strip()
     if explicit:
         return normalize_address(explicit)
     if os.environ.get("WQPU_RELAYER_ALLOW_RPC_ACCOUNT", "0") != "1":
-        raise RelayerError("set WQPU_RELAYER_FROM or explicitly allow an unlocked RPC account")
+        raise RelayerError("set WQPU_RELAYER_PRIVATE_KEY/WQPU_RELAYER_FROM or explicitly allow an unlocked RPC account")
     accounts = client.rpc("eth_accounts", [])
     if not accounts:
         raise RelayerError("RPC exposes no relayer account")
@@ -76,17 +116,66 @@ class RateLimiter(object):
 
 
 class Relayer(object):
-    def __init__(self, client=None, sender=None, market=None):
+    def __init__(self, client=None, sender=None, market=None, private_key=None):
         self.client = client or RegistryClient()
         if not self.client.configured:
             raise RelayerError("WQPU chain is not configured")
         self.market = normalize_address(market) if market else configured_market(self.client)
-        self.sender = normalize_address(sender) if sender else configured_sender(self.client)
+        self.private_key = _normalize_private_key(
+            private_key if private_key is not None else os.environ.get("WQPU_RELAYER_PRIVATE_KEY", "")
+        )
+        self.sender = normalize_address(sender) if sender else configured_sender(self.client, self.private_key)
+        self.token = configured_token(self.client)
+        self.faucet_enabled = os.environ.get("WQPU_TESTNET_FAUCET", "0") == "1"
+        self.faucet_native_wei = int(os.environ.get("WQPU_FAUCET_NATIVE_WEI", str(2 * 10 ** 18)))
+        self.faucet_token_wei = int(os.environ.get("WQPU_FAUCET_TOKEN_WEI", str(1000 * 10 ** 18)))
+        self.faucet_interval = int(os.environ.get("WQPU_FAUCET_INTERVAL", "3600"))
+        self._faucet_last = {}
+        self._faucet_lock = threading.Lock()
 
     def _market_guard(self, payload):
         market = normalize_address(payload.get("market"))
         if market != self.market:
             raise RelayerError("payload targets a different market")
+
+    def _cast_send(self, to, data="0x", value=0):
+        if not shutil.which("cast"):
+            raise RelayerError("cast is required for private-key relayer mode")
+        cmd = [
+            "cast", "send", normalize_address(to),
+            "--data", str(data),
+            "--rpc-url", self.client.rpc_url,
+            "--private-key", self.private_key,
+            "--json",
+        ]
+        if int(value) > 0:
+            cmd += ["--value", str(int(value))]
+        out = _run(cmd)
+        try:
+            parsed = json.loads(out)
+            for key in ("transactionHash", "transaction_hash", "txHash", "hash"):
+                found = parsed.get(key) if isinstance(parsed, dict) else None
+                if isinstance(found, str) and re.match(r"^0x[0-9a-fA-F]{64}$", found):
+                    return found
+        except Exception:
+            pass
+        matches = re.findall(r"0x[0-9a-fA-F]{64}", out)
+        if not matches:
+            raise RelayerError("could not parse relayer transaction hash")
+        return matches[-1]
+
+    def _send(self, to, data="0x", value=0):
+        if self.private_key:
+            return self._cast_send(to, data, value)
+        tx = {"from": self.sender, "to": normalize_address(to)}
+        if data and data != "0x":
+            tx["data"] = str(data)
+        if int(value) > 0:
+            tx["value"] = hex(int(value))
+        tx_hash = self.client.rpc("eth_sendTransaction", [tx])
+        if not isinstance(tx_hash, str) or not tx_hash.startswith("0x"):
+            raise RelayerError("bad relayer transaction hash")
+        return tx_hash
 
     def submit(self, body):
         if not isinstance(body, dict):
@@ -95,20 +184,47 @@ class Relayer(object):
         if kind == "wqpu-relay-funding":
             funding = normalize_funding(body.get("funding"))
             self._market_guard(funding)
-            return fund_via_rpc(self.client, funding, self.sender)
+            simulate_funding(self.client, funding)
+            return self._send(self.market, funding_calldata(self.client, funding))
         if kind == "wqpu-relay-activation":
             session = normalize_activation(body.get("session"))
             self._market_guard(session)
-            return activate_via_rpc(self.client, session, self.sender)
+            simulate_activation(self.client, session)
+            return self._send(self.market, activation_calldata(self.client, session))
         if kind == "wqpu-relay-claim":
             voucher = normalize_package(body.get("voucher"))
             self._market_guard(voucher)
-            return relay_via_rpc(self.client, voucher, self.sender)
+            simulate_claim(self.client, voucher)
+            return self._send(self.market, claim_calldata(self.client, voucher))
         raise RelayerError("unsupported relayer request")
+
+    def faucet(self, wallet):
+        if not self.faucet_enabled:
+            raise RelayerError("testnet faucet is disabled")
+        wallet = normalize_address(wallet)
+        now = time.time()
+        with self._faucet_lock:
+            last = float(self._faucet_last.get(wallet) or 0)
+            if last and now - last < self.faucet_interval:
+                return {"wallet": wallet, "already_funded": True, "transactions": []}
+            self._faucet_last[wallet] = now
+        txs = []
+        try:
+            if self.faucet_native_wei > 0:
+                txs.append(self._send(wallet, "0x", self.faucet_native_wei))
+            if self.token and self.faucet_token_wei > 0:
+                data = "0x" + TRANSFER_SELECTOR + wallet[2:].rjust(64, "0") + "{:064x}".format(self.faucet_token_wei)
+                txs.append(self._send(self.token, data, 0))
+        except Exception:
+            with self._faucet_lock:
+                self._faucet_last.pop(wallet, None)
+            raise
+        return {"wallet": wallet, "already_funded": False, "transactions": txs}
 
 
 class RelayerHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
+    allow_reuse_address = True
 
     def __init__(self, address, relayer, rate_limit=DEFAULT_RATE):
         self.relayer = relayer
@@ -117,29 +233,69 @@ class RelayerHTTPServer(ThreadingHTTPServer):
 
 
 class RelayerHandler(BaseHTTPRequestHandler):
-    server_version = "WQPURelayer/0.6"
+    server_version = "WQPURelayer/0.7"
 
     def log_message(self, fmt, *args):
         if os.environ.get("WQPU_RELAYER_QUIET", "0") != "1":
             super(RelayerHandler, self).log_message(fmt, *args)
+
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Headers", "content-type")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
 
     def _json(self, status, value):
         raw = json.dumps(value, separators=(",", ":")).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Cache-Control", "no-store")
+        self._cors()
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
 
+    def do_OPTIONS(self):
+        self.send_response(204)
+        self._cors()
+        self.end_headers()
+
     def do_GET(self):
         if self.path == "/health":
-            self._json(200, {"ok": True, "service": "wqpu-relayer"})
+            self._json(200, {"ok": True, "service": "wqpu-relayer", "faucet": self.server.relayer.faucet_enabled})
+            return
+        if self.path == "/network-config.json":
+            target = os.environ.get("WQPU_NETWORK_CONFIG", "").strip()
+            if not target:
+                self._json(404, {"error": "network config not published"})
+                return
+            try:
+                value = json.loads(Path(target).read_text())
+                self._json(200, value)
+            except Exception as exc:
+                self._json(500, {"error": "network config unavailable: {}".format(exc)})
+            return
+        if self.path in ("/join.sh", "/join.ps1"):
+            env_name = "WQPU_JOIN_SH" if self.path.endswith(".sh") else "WQPU_JOIN_PS1"
+            target = os.environ.get(env_name, "").strip()
+            if not target:
+                self._json(404, {"error": "join script not published"})
+                return
+            try:
+                raw = Path(target).read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/plain; charset=utf-8")
+                self.send_header("Cache-Control", "no-store")
+                self._cors()
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            except Exception as exc:
+                self._json(500, {"error": "join script unavailable: {}".format(exc)})
             return
         self._json(404, {"error": "not found"})
 
     def do_POST(self):
-        if self.path not in ("/", "/relay"):
+        if self.path not in ("/", "/relay", "/faucet"):
             self._json(404, {"error": "not found"})
             return
         peer = self.client_address[0] if self.client_address else "unknown"
@@ -151,6 +307,9 @@ class RelayerHandler(BaseHTTPRequestHandler):
             if length <= 0 or length > MAX_BODY:
                 raise RelayerError("invalid request size")
             body = json.loads(self.rfile.read(length).decode("utf-8"))
+            if self.path == "/faucet":
+                self._json(200, self.server.relayer.faucet(body.get("wallet")))
+                return
             tx_hash = self.server.relayer.submit(body)
             self._json(200, {"tx_hash": tx_hash})
         except Exception as exc:
