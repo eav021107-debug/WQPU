@@ -11,6 +11,7 @@ interface VmSessionEscrow {
         external
         returns (uint8 v, bytes32 r, bytes32 s);
     function prank(address sender) external;
+    function warp(uint256 timestamp) external;
 }
 
 contract WQPUSessionEscrowTest {
@@ -41,7 +42,22 @@ contract WQPUSessionEscrowTest {
         market.deposit(10 ether);
     }
 
-    function _auth(bytes32 sessionId, uint128 maxAmount, uint128 price, uint64 validUntil)
+    function _authData(bytes32 sessionId, uint128 maxAmount, uint128 price, uint64 validUntil)
+        private
+        view
+        returns (WQPUComputeMarket.SpendAuthorizationData memory auth)
+    {
+        auth = WQPUComputeMarket.SpendAuthorizationData({
+            requester: requester,
+            sessionKey: sessionKey,
+            sessionId: sessionId,
+            maxAmount: maxAmount,
+            pricePerMillionUnits: price,
+            validUntil: validUntil
+        });
+    }
+
+    function _authSignature(bytes32 sessionId, uint128 maxAmount, uint128 price, uint64 validUntil)
         private
         returns (bytes memory)
     {
@@ -50,6 +66,17 @@ contract WQPUSessionEscrowTest {
         );
         (uint8 v, bytes32 r, bytes32 s) = vm.sign(REQUESTER_KEY, digest);
         return abi.encodePacked(r, s, v);
+    }
+
+    function _activate(bytes32 sessionId, uint128 maxAmount, uint128 price, uint64 validUntil)
+        private
+        returns (bytes memory authorization)
+    {
+        WQPUComputeMarket.SpendAuthorizationData memory auth =
+            _authData(sessionId, maxAmount, price, validUntil);
+        authorization = _authSignature(sessionId, maxAmount, price, validUntil);
+        vm.prank(RELAYER);
+        market.activateSession(auth, authorization);
     }
 
     function _voucher(
@@ -65,159 +92,140 @@ contract WQPUSessionEscrowTest {
         return abi.encodePacked(r, s);
     }
 
-    function _data(
-        address provider,
-        bytes32 sessionId,
-        uint256 amount,
-        uint256 units,
-        uint128 maxAmount,
-        uint128 price,
-        uint64 validUntil
-    ) private view returns (
-        WQPUComputeMarket.SpendAuthorizationData memory auth,
-        WQPUComputeMarket.ProviderVoucherData memory voucher
-    ) {
-        auth = WQPUComputeMarket.SpendAuthorizationData({
-            requester: requester,
-            sessionKey: sessionKey,
-            sessionId: sessionId,
-            maxAmount: maxAmount,
-            pricePerMillionUnits: price,
-            validUntil: validUntil
-        });
-        voucher = WQPUComputeMarket.ProviderVoucherData({
-            provider: provider,
-            cumulativeAmount: amount,
-            cumulativeUnits: units
-        });
-    }
-
     function _claim(
         address provider,
         bytes32 sessionId,
         uint256 amount,
-        uint256 units,
-        uint128 maxAmount,
-        uint128 price,
-        uint64 validUntil,
-        bytes memory authorization
+        uint256 units
     ) private {
-        (WQPUComputeMarket.SpendAuthorizationData memory auth,
-         WQPUComputeMarket.ProviderVoucherData memory voucher) =
-            _data(provider, sessionId, amount, units, maxAmount, price, validUntil);
+        WQPUComputeMarket.ProviderVoucherData memory voucher = WQPUComputeMarket.ProviderVoucherData({
+            provider: provider,
+            cumulativeAmount: amount,
+            cumulativeUnits: units
+        });
         bytes memory voucherSignature = _voucher(provider, sessionId, amount, units);
         vm.prank(RELAYER);
-        market.claimEscrowWithSession(auth, voucher, voucherSignature, authorization);
+        market.claimEscrowWithSession(requester, sessionId, voucher, voucherSignature);
     }
 
     function _tryClaim(
         address provider,
         bytes32 sessionId,
         uint256 amount,
-        uint256 units,
-        uint128 maxAmount,
-        uint128 price,
-        uint64 validUntil,
-        bytes memory authorization
+        uint256 units
     ) private returns (bool ok) {
-        (WQPUComputeMarket.SpendAuthorizationData memory auth,
-         WQPUComputeMarket.ProviderVoucherData memory voucher) =
-            _data(provider, sessionId, amount, units, maxAmount, price, validUntil);
+        WQPUComputeMarket.ProviderVoucherData memory voucher = WQPUComputeMarket.ProviderVoucherData({
+            provider: provider,
+            cumulativeAmount: amount,
+            cumulativeUnits: units
+        });
         bytes memory voucherSignature = _voucher(provider, sessionId, amount, units);
         vm.prank(RELAYER);
         (ok,) = address(market).call(
             abi.encodeWithSelector(
                 market.claimEscrowWithSession.selector,
-                auth,
+                requester,
+                sessionId,
                 voucher,
-                voucherSignature,
-                authorization
+                voucherSignature
             )
         );
     }
 
-    function testOneDepositPaysMultipleProvidersWithoutNewWalletTransactions() public {
+    function testActivationReservesEscrowAndBlocksWithdrawal() public {
+        bytes32 sessionId = keccak256("reserved-session");
+        uint64 validUntil = uint64(block.timestamp + 1 days);
+        _activate(sessionId, uint128(6 ether), uint128(1 ether), validUntil);
+
+        require(market.reservedEscrow(requester) == 6 ether, "reserve missing");
+
+        vm.prank(requester);
+        (bool tooMuch,) = address(market).call(
+            abi.encodeWithSelector(market.withdraw.selector, 5 ether)
+        );
+        require(!tooMuch, "reserved funds withdrawn");
+
+        vm.prank(requester);
+        market.withdraw(4 ether);
+        require(market.escrowBalance(requester) == 6 ether, "free escrow withdrawal wrong");
+        require(market.reservedEscrow(requester) == 6 ether, "reserve changed by free withdrawal");
+    }
+
+    function testOneActivationPaysMultipleProvidersWithoutNewWalletTransactions() public {
         bytes32 sessionId = keccak256("shared-escrow-session");
         uint128 maxAmount = uint128(5 ether);
-        uint128 price = uint128(1 ether);
         uint64 validUntil = uint64(block.timestamp + 1 days);
-        bytes memory authorization = _auth(sessionId, maxAmount, price, validUntil);
+        _activate(sessionId, maxAmount, uint128(1 ether), validUntil);
 
-        _claim(PROVIDER_A, sessionId, 1 ether, 1_000_000, maxAmount, price, validUntil, authorization);
-        _claim(PROVIDER_B, sessionId, 2 ether, 2_000_000, maxAmount, price, validUntil, authorization);
+        _claim(PROVIDER_A, sessionId, 1 ether, 1_000_000);
+        _claim(PROVIDER_B, sessionId, 2 ether, 2_000_000);
 
         require(token.balanceOf(PROVIDER_A) == 1 ether, "provider A not paid");
         require(token.balanceOf(PROVIDER_B) == 2 ether, "provider B not paid");
         require(market.escrowBalance(requester) == 7 ether, "wrong remaining escrow");
+        require(market.reservedEscrow(requester) == 2 ether, "wrong remaining reserve");
         require(market.sessionSpent(requester, sessionId) == 3 ether, "wrong session spend");
         require(token.balanceOf(RELAYER) == 0, "relayer received provider funds");
     }
 
     function testCumulativeProviderVoucherCannotReplay() public {
         bytes32 sessionId = keccak256("replay-session");
-        uint128 maxAmount = uint128(5 ether);
-        uint128 price = uint128(1 ether);
-        uint64 validUntil = uint64(block.timestamp + 1 days);
-        bytes memory authorization = _auth(sessionId, maxAmount, price, validUntil);
+        _activate(sessionId, uint128(5 ether), uint128(1 ether), uint64(block.timestamp + 1 days));
 
-        _claim(PROVIDER_A, sessionId, 1 ether, 1_000_000, maxAmount, price, validUntil, authorization);
-        bool replay = _tryClaim(
-            PROVIDER_A, sessionId, 1 ether, 1_000_000,
-            maxAmount, price, validUntil, authorization
-        );
+        _claim(PROVIDER_A, sessionId, 1 ether, 1_000_000);
+        bool replay = _tryClaim(PROVIDER_A, sessionId, 1 ether, 1_000_000);
         require(!replay, "cumulative voucher replay succeeded");
         require(token.balanceOf(PROVIDER_A) == 1 ether, "provider double-paid");
     }
 
-    function testSessionCannotExceedWalletAuthorizedLimit() public {
+    function testSessionCannotExceedReservedLimit() public {
         bytes32 sessionId = keccak256("small-session");
-        uint128 maxAmount = uint128(1 ether);
-        uint128 price = uint128(1 ether);
-        uint64 validUntil = uint64(block.timestamp + 1 days);
-        bytes memory authorization = _auth(sessionId, maxAmount, price, validUntil);
+        _activate(sessionId, uint128(1 ether), uint128(1 ether), uint64(block.timestamp + 1 days));
 
-        bool ok = _tryClaim(
-            PROVIDER_A, sessionId, 2 ether, 2_000_000,
-            maxAmount, price, validUntil, authorization
-        );
-        require(!ok, "session exceeded authorized limit");
+        bool ok = _tryClaim(PROVIDER_A, sessionId, 2 ether, 2_000_000);
+        require(!ok, "session exceeded reserved limit");
         require(token.balanceOf(PROVIDER_A) == 0, "provider paid above limit");
         require(market.escrowBalance(requester) == 10 ether, "failed claim consumed escrow");
+        require(market.reservedEscrow(requester) == 1 ether, "failed claim consumed reserve");
     }
 
-    function testRequesterCanRevokeSharedSession() public {
-        bytes32 sessionId = keccak256("revoked-session");
-        uint128 maxAmount = uint128(5 ether);
-        uint128 price = uint128(1 ether);
-        uint64 validUntil = uint64(block.timestamp + 1 days);
-        bytes memory authorization = _auth(sessionId, maxAmount, price, validUntil);
+    function testActiveSessionCannotBeRevokedToCheatProvider() public {
+        bytes32 sessionId = keccak256("provider-guarantee");
+        _activate(sessionId, uint128(5 ether), uint128(1 ether), uint64(block.timestamp + 1 days));
 
         vm.prank(requester);
-        market.revokeSession(sessionId);
-
-        bool ok = _tryClaim(
-            PROVIDER_A, sessionId, 1 ether, 1_000_000,
-            maxAmount, price, validUntil, authorization
+        (bool revoked,) = address(market).call(
+            abi.encodeWithSelector(market.revokeSession.selector, sessionId)
         );
-        require(!ok, "revoked session still worked");
-        require(token.balanceOf(PROVIDER_A) == 0, "revoked session paid provider");
+        require(!revoked, "active session revoked early");
+
+        _claim(PROVIDER_A, sessionId, 1 ether, 1_000_000);
+        require(token.balanceOf(PROVIDER_A) == 1 ether, "provider lost earned voucher");
     }
 
-    function testPriceChangeStopsOldSessionInsteadOfChargingNewPrice() public {
-        bytes32 sessionId = keccak256("price-locked-session");
-        uint128 maxAmount = uint128(5 ether);
-        uint128 oldPrice = uint128(1 ether);
-        uint64 validUntil = uint64(block.timestamp + 1 days);
-        bytes memory authorization = _auth(sessionId, maxAmount, oldPrice, validUntil);
+    function testGlobalPriceChangeDoesNotRewriteActiveSessionPrice() public {
+        bytes32 sessionId = keccak256("price-snapshot-session");
+        _activate(sessionId, uint128(5 ether), uint128(1 ether), uint64(block.timestamp + 1 days));
 
         registry.setGlobalPrice(uint128(2 ether));
+        _claim(PROVIDER_A, sessionId, 1 ether, 1_000_000);
 
-        bool ok = _tryClaim(
-            PROVIDER_A, sessionId, 1 ether, 1_000_000,
-            maxAmount, oldPrice, validUntil, authorization
-        );
-        require(!ok, "old session survived network repricing");
-        require(token.balanceOf(PROVIDER_A) == 0, "provider paid at stale price");
-        require(market.escrowBalance(requester) == 10 ether, "failed claim changed escrow");
+        require(token.balanceOf(PROVIDER_A) == 1 ether, "active session repriced");
+    }
+
+    function testUnusedReserveReleasesOnlyAfterExpiryAndClaimGrace() public {
+        bytes32 sessionId = keccak256("release-session");
+        uint64 validUntil = uint64(block.timestamp + 1 hours);
+        _activate(sessionId, uint128(5 ether), uint128(1 ether), validUntil);
+        _claim(PROVIDER_A, sessionId, 1 ether, 1_000_000);
+
+        vm.warp(uint256(validUntil) + market.CLAIM_GRACE() + 1);
+        vm.prank(requester);
+        market.releaseSession(sessionId);
+
+        require(market.reservedEscrow(requester) == 0, "reserve not released");
+        vm.prank(requester);
+        market.withdraw(9 ether);
+        require(market.escrowBalance(requester) == 0, "released escrow not withdrawable");
     }
 }
