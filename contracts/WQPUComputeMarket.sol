@@ -140,7 +140,9 @@ contract WQPUComputeMarket {
     }
 
     /// @notice Claim the newest cumulative voucher signed by the requester.
-    /// @dev The amount must exactly match the network price captured at channel open.
+    /// @dev Anyone may relay a valid claim. Funds always go to the channel provider.
+    ///      This lets WQPU nodes stay non-custodial: the provider wallet key is not needed
+    ///      by the node merely to submit a claim transaction.
     function claim(
         bytes32 channelId,
         uint256 cumulativeAmount,
@@ -148,7 +150,7 @@ contract WQPUComputeMarket {
         bytes calldata signature
     ) external {
         Channel storage channel = channels[channelId];
-        require(channel.provider == msg.sender, "not provider");
+        require(channel.provider != address(0), "unknown channel");
         require(!channel.refunded, "refunded");
         require(block.timestamp <= uint256(channel.expiresAt) + CLAIM_GRACE, "claim closed");
         require(cumulativeUnits >= channel.cumulativeUnits, "units decreased");
