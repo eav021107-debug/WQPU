@@ -97,6 +97,9 @@ case "$(go version)" in
   *) fail "Go ${GO_VERSION} is required; got: $(go version)" ;;
 esac
 export GOTOOLCHAIN=local
+# Ignore a host-level GOFLAGS=-mod=readonly. This source tree is an isolated
+# disposable checkout and must be allowed to populate go.sum on first run.
+export GOFLAGS="-mod=mod"
 export GOMODCACHE="${GOMODCACHE:-$BASE/go/pkg/mod}"
 export GOCACHE="${GOCACHE:-$BASE/go/cache}"
 mkdir -p "$GOMODCACHE" "$GOCACHE"
@@ -119,8 +122,8 @@ fi
 [ -f "$SOURCE_DIR/chain/devnet.sh" ] || fail "WQPU source directory is invalid: $SOURCE_DIR"
 
 say "WQPU NEXT: resolving Go dependencies..."
-(cd "$SOURCE_DIR/chain" && GOWORK=off go mod tidy)
-(cd "$SOURCE_DIR/client" && GOWORK=off go mod tidy)
+(cd "$SOURCE_DIR/chain" && GOWORK=off go mod tidy && GOWORK=off go mod download all)
+(cd "$SOURCE_DIR/client" && GOWORK=off go mod tidy && GOWORK=off go mod download all)
 
 export WQPU_CHAIN_SRC="${WQPU_CHAIN_SRC:-$BASE/chain-src/cosmos-evm}"
 export WQPU_CHAIN_BIN_DIR="${WQPU_CHAIN_BIN_DIR:-$BASE/chain-bin}"
