@@ -199,7 +199,7 @@ contract WQPUComputeMarket {
         require(_recover(authDigest, authorizationSignature) == channel.requester, "bad session auth");
 
         bytes32 voucher = voucherDigest(channelId, cumulativeAmount, cumulativeUnits);
-        require(_recover(voucher, voucherSignature) == sessionKey, "bad session voucher");
+        require(_sessionSignatureMatches(voucher, voucherSignature, sessionKey), "bad session voucher");
 
         uint256 previousPaid = channel.paid;
         uint256 delta = _settle(channelId, cumulativeAmount, cumulativeUnits);
@@ -290,6 +290,28 @@ contract WQPUComputeMarket {
             cumulativeAmount,
             cumulativeUnits
         );
+    }
+
+    function _sessionSignatureMatches(
+        bytes32 digest,
+        bytes calldata signature,
+        address expected
+    ) internal pure returns (bool) {
+        if (signature.length == 65) {
+            return _recover(digest, signature) == expected;
+        }
+        require(signature.length == 64, "bad session signature length");
+        bytes32 r;
+        bytes32 s;
+        assembly {
+            r := calldataload(signature.offset)
+            s := calldataload(add(signature.offset, 32))
+        }
+        require(uint256(s) <= HALF_ORDER, "bad signature s");
+        address first = ecrecover(digest, 27, r, s);
+        if (first == expected) return true;
+        address second = ecrecover(digest, 28, r, s);
+        return second == expected;
     }
 
     function _recover(bytes32 digest, bytes calldata signature) internal pure returns (address) {
