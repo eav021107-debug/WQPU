@@ -7,6 +7,7 @@ on:
       - 'wqpu_chain.py'
       - 'wqpu_runtime.py'
       - 'wqpu_autopay.py'
+      - 'wqpu_multistream.py'
       - 'wqpu_meter.py'
       - 'wqpu_accounting.py'
       - 'wqpu_attestation.py'
@@ -31,6 +32,7 @@ on:
       - 'wqpu_chain.py'
       - 'wqpu_runtime.py'
       - 'wqpu_autopay.py'
+      - 'wqpu_multistream.py'
       - 'wqpu_meter.py'
       - 'wqpu_accounting.py'
       - 'wqpu_attestation.py'
@@ -64,7 +66,7 @@ jobs:
       - name: Compile measured-payment two-client path
         run: >-
           python -m py_compile
-          wqpu.py wqpu_chain.py wqpu_runtime.py wqpu_autopay.py
+          wqpu.py wqpu_chain.py wqpu_runtime.py wqpu_autopay.py wqpu_multistream.py
           wqpu_meter.py wqpu_accounting.py wqpu_attestation.py
           wqpu_session.py wqpu_payments.py wqpu_claim.py wqpu_vouchers.py
           wqpu_network_guard.py wqpu_node_identity.py wqpu_node_status.py
