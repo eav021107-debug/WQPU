@@ -7,6 +7,7 @@ BIN="${HOME}/.local/bin"
 JOIN="${WQPU_JOIN:-${1:-}}"
 EXPECTED_WQPU="WQPU 0.6.0-dev"
 CACHE_BUSTER="chain-0.6.0-dev-r1"
+CHAIN_STATE="${HOME}/.wqpu/chain.json"
 
 need() { command -v "$1" >/dev/null 2>&1; }
 python_ok() { "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,6) else 1)' >/dev/null 2>&1; }
@@ -114,6 +115,9 @@ fi
 echo "WQPU installed: $CORE_VERSION with $($PYTHON --version 2>&1)."
 if [ -n "$JOIN" ]; then
   exec "$BIN/wqpu" --join "$JOIN"
-else
+elif { [ -n "${WQPU_RPC_URL:-}" ] && [ -n "${WQPU_REGISTRY:-}" ]; } || [ -f "$CHAIN_STATE" ]; then
   exec "$BIN/wqpu"
+else
+  echo "WQPU public chain is not configured yet; starting the existing private mesh."
+  exec "$BIN/wqpu" --legacy
 fi
