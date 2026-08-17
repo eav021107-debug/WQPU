@@ -1,61 +1,88 @@
-# VPS Control MCP
+# VPS Control — Living Project
 
-Минимальный MCP-сервер: ChatGPT получает терминал и файлы VPS почти как Codex CLI.
+VPS Control делает проект на VPS «живым» для ChatGPT: код заранее индексируется на сервере, а ChatGPT получает не отдельные файлы по одному, а готовый рабочий контекст задачи.
 
-## Инструменты
+## Как работает
 
-- `status`
-- `list_dir`
-- `read_file`
-- `search_text`
-- `write_file`
-- `apply_patch`
-- `git_status`
-- `git_diff`
-- `run_command`
+`openProject(task)` одним вызовом возвращает:
 
-## Установка на VPS одной командой
+- обязательную инженерную конституцию;
+- карту проекта;
+- Git-состояние;
+- код, наиболее связанный с задачей;
+- хэши выбранных файлов для проверки свежести.
 
-Пока PR не слит:
+После записи, patch или shell-команды индекс автоматически помечается устаревшим и обновляется перед следующим чтением.
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/agent/vps-control-mcp/install-vps-control.sh | sudo bash -s -- agent/vps-control-mcp
-```
+Конституция встроена в сервер и требует: чистую архитектуру, удаление старой реализации при замене, отсутствие секретов/костылей/дублирования, тесты, поиск остатков старого решения и финальный review Git diff.
 
-После слияния в `next-foundation`:
+## Два входа
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/next-foundation/install-vps-control.sh | sudo bash
-```
+### ChatGPT Plus — GPT Actions
 
-По умолчанию рабочая папка:
+Это вариант без платного OpenAI API на VPS. Custom GPT вызывает наш собственный HTTPS API на VPS. Нужен только секрет доступа к VPS Control — это НЕ OpenAI API key и за него нет платы.
+
+Локальный Action endpoint после установки:
 
 ```text
-/srv/vps-control-workspace
+http://127.0.0.1:8766
 ```
 
-MCP слушает только VPS локально:
+OpenAPI schema:
+
+```text
+https://YOUR-PUBLIC-HTTPS-HOST/openapi.json
+```
+
+В GPT Builder добавьте Action по этой схеме, а в Authentication выберите API key / custom header:
+
+```text
+X-VPS-Control-Key
+```
+
+Инструкции для Custom GPT лежат в `GPT_INSTRUCTIONS.md`.
+
+### Business / Enterprise / Edu — MCP
+
+Полный MCP endpoint:
 
 ```text
 http://127.0.0.1:8765/mcp
 ```
 
-## Подключение ChatGPT
+Его можно подключить через поддерживаемый безопасный туннель.
 
-1. ChatGPT → `Settings → Security and login → Developer mode`.
-2. OpenAI Platform → создать Secure MCP Tunnel.
-3. На VPS запустить `tunnel-client` и направить его на `http://127.0.0.1:8765/mcp`.
-4. ChatGPT Plugins → `+` → Connection: `Tunnel` → выбрать tunnel.
-5. В чате включить Developer mode и выбрать `VPS Control`.
+## Установка WQPU одной командой
 
-После этого можно написать:
+Пока изменения находятся в ветке:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/agent/vps-control-mcp/install-vps-control.sh | sudo bash -s -- agent/vps-control-mcp
+```
+
+По умолчанию WQPU будет жить постоянно в:
 
 ```text
-Проверь проект на VPS, найди ошибку, исправь её, запусти тесты и перезапусти сервис.
+/srv/wqpu
 ```
+
+Чтобы подключить другой уже существующий Git-проект:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/agent/vps-control-mcp/install-vps-control.sh | sudo VPS_CONTROL_ROOT=/path/to/project bash -s -- agent/vps-control-mcp
+```
+
+Установщик выводит секрет `VPS_CONTROL_ACTION_TOKEN`. Храните его приватно; копия лежит в `/etc/vps-control.env` с правами root-only.
+
+## Главные инструменты
+
+- `openProject` / `open_project` — главное начало любой задачи;
+- `applyProjectPatch` / `apply_patch` — точные изменения кода;
+- `writeProjectFile` / `write_file` — полная замена файла;
+- `runProjectCommand` / `run_command` — тесты, build, lint, Git и проектные команды;
+- `getGitDiff` / `git_diff` — обязательная финальная проверка;
+- targeted search/read — только как запасной вариант.
 
 ## Безопасность
 
-Сервис по умолчанию работает от отдельного пользователя `vpscontrol`, не от `root`. Файловые инструменты не выходят за `VPS_CONTROL_ROOT`.
-
-`run_command` намеренно мощный: команда выполняется с системными правами пользователя `vpscontrol`. ChatGPT также показывает подтверждение для write-действий в Developer mode.
+Сервис не запускается от root по умолчанию. Файловые операции не выходят за `VPS_CONTROL_ROOT`. Action API требует секретный заголовок. Сервисы слушают только localhost; наружу их нужно публиковать через защищённый HTTPS-туннель/reverse proxy.
