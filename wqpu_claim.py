@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Provider-side WQPU claim helpers.
+"""Gasless activation and provider-claim helpers for WQPU.
 
-A worker never needs its wallet private key. It receives a cumulative claim package
-signed by the requester's bounded session key, simulates it against the market, then
-hands the same calldata to any gas-paying relayer. The contract always pays the
-registered provider address contained in the signed voucher.
+The wallet signs a bounded SpendAuthorization once. A relayer activates that session,
+which reserves its maximum spend on-chain. Workers later receive compact cumulative
+vouchers signed only by the local session key and can relay claims without holding a
+wallet private key.
 """
 
 from __future__ import print_function
@@ -15,10 +15,11 @@ import time
 import urllib.request
 
 
+ACTIVATE_SIGNATURE = (
+    "activateSession((address,address,bytes32,uint128,uint128,uint64),bytes)"
+)
 CLAIM_SIGNATURE = (
-    "claimEscrowWithSession("
-    "(address,address,bytes32,uint128,uint128,uint64),"
-    "(address,uint256,uint256),bytes,bytes)"
+    "claimEscrowWithSession(address,bytes32,(address,uint256,uint256),bytes)"
 )
 
 
@@ -107,65 +108,119 @@ def normalize_package(package):
     if p["cumulative_amount"] <= 0 or p["cumulative_units"] <= 0:
         raise ClaimError("empty provider voucher")
     voucher_sig = "0x" + _strip0x(p.get("voucher_signature")).lower()
-    auth_sig = "0x" + _strip0x(p.get("authorization_signature")).lower()
     if len(voucher_sig) != 2 + 64 * 2:
         raise ClaimError("provider voucher signature must be compact r||s")
+    try:
+        int(voucher_sig[2:], 16)
+    except ValueError:
+        raise ClaimError("invalid provider voucher signature")
+    p["voucher_signature"] = voucher_sig
+    return p
+
+
+def normalize_activation(session):
+    s = dict(session or {})
+    s["market"] = _address(s.get("market"), "market")
+    s["requester"] = _address(s.get("requester"), "requester")
+    s["session_key"] = _address(s.get("session_key"), "session key")
+    s["session_id"] = "0x" + _bytes32_word(s.get("session_id"), "session id")
+    s["max_amount"] = int(s.get("max_amount") or 0)
+    s["price_per_million_units"] = int(s.get("price_per_million_units") or 0)
+    s["valid_until"] = int(s.get("valid_until") or 0)
+    if s["max_amount"] <= 0 or s["max_amount"] >= 2 ** 128:
+        raise ClaimError("invalid session max amount")
+    if s["price_per_million_units"] <= 0 or s["price_per_million_units"] >= 2 ** 128:
+        raise ClaimError("invalid session price")
+    if s["valid_until"] <= 0 or s["valid_until"] >= 2 ** 64:
+        raise ClaimError("invalid session expiry")
+    auth_sig = "0x" + _strip0x(s.get("authorization_signature")).lower()
     if len(auth_sig) != 2 + 65 * 2:
         raise ClaimError("wallet authorization signature must be 65 bytes")
-    int(voucher_sig[2:], 16)
-    int(auth_sig[2:], 16)
-    p["voucher_signature"] = voucher_sig
-    p["authorization_signature"] = auth_sig
-    return p
+    try:
+        int(auth_sig[2:], 16)
+    except ValueError:
+        raise ClaimError("invalid wallet authorization signature")
+    s["authorization_signature"] = auth_sig
+    return s
+
+
+def activation_calldata(client, session):
+    s = normalize_activation(session)
+    auth_tail = _dynamic_bytes(s["authorization_signature"], "authorization signature")
+    # Static authorization tuple = six words; dynamic signature offset = seventh word.
+    head = "".join([
+        _address_word(s["requester"], "requester"),
+        _address_word(s["session_key"], "session key"),
+        _bytes32_word(s["session_id"], "session id"),
+        _word(s["max_amount"]),
+        _word(s["price_per_million_units"]),
+        _word(s["valid_until"]),
+        _word(7 * 32),
+    ])
+    return "0x" + _selector(client, ACTIVATE_SIGNATURE) + head + auth_tail
 
 
 def claim_calldata(client, package):
     p = normalize_package(package)
     voucher_tail = _dynamic_bytes(p["voucher_signature"], "voucher signature")
-    auth_tail = _dynamic_bytes(p["authorization_signature"], "authorization signature")
-
-    # Both structs are fully static. The top-level ABI head is therefore
-    # 6 words (authorization) + 3 words (provider voucher) + 2 dynamic offsets.
-    head_words = 11
-    first_offset = head_words * 32
-    second_offset = first_offset + len(voucher_tail) // 2
+    # requester + sessionId + static ProviderVoucher tuple (3 words) + bytes offset.
     head = "".join([
         _address_word(p["requester"], "requester"),
-        _address_word(p["session_key"], "session key"),
         _bytes32_word(p["session_id"], "session id"),
-        _word(p["max_amount"]),
-        _word(p["price_per_million_units"]),
-        _word(p["valid_until"]),
         _address_word(p["provider"], "provider"),
         _word(p["cumulative_amount"]),
         _word(p["cumulative_units"]),
-        _word(first_offset),
-        _word(second_offset),
+        _word(6 * 32),
     ])
-    return "0x" + _selector(client, CLAIM_SIGNATURE) + head + voucher_tail + auth_tail
+    return "0x" + _selector(client, CLAIM_SIGNATURE) + head + voucher_tail
+
+
+def _simulate(client, market, data):
+    result = client.rpc("eth_call", [{"to": market, "data": data}, "latest"])
+    if not isinstance(result, str) or not result.startswith("0x"):
+        raise ClaimError("bad EVM simulation result")
+    return True
+
+
+def simulate_activation(client, session):
+    s = normalize_activation(session)
+    return _simulate(client, s["market"], activation_calldata(client, s))
 
 
 def simulate_claim(client, package):
     p = normalize_package(package)
-    data = claim_calldata(client, p)
-    result = client.rpc("eth_call", [{"to": p["market"], "data": data}, "latest"])
-    if not isinstance(result, str) or not result.startswith("0x"):
-        raise ClaimError("bad claim simulation result")
-    return True
+    return _simulate(client, p["market"], claim_calldata(client, p))
 
 
-def relay_via_rpc(client, package, sender=None):
-    """Use only with an RPC that deliberately exposes an unlocked relayer account."""
-    p = normalize_package(package)
-    simulate_claim(client, p)
+def _unlocked_sender(client, sender=None):
     if sender is None:
         accounts = client.rpc("eth_accounts", [])
         if not accounts:
             raise ClaimError("RPC exposes no relayer account")
         sender = accounts[0]
-    sender = _address(sender, "relayer")
+    return _address(sender, "relayer")
+
+
+def activate_via_rpc(client, session, sender=None):
+    """Dev/test helper for an RPC that deliberately exposes an unlocked relayer."""
+    s = normalize_activation(session)
+    simulate_activation(client, s)
     tx_hash = client.rpc("eth_sendTransaction", [{
-        "from": sender,
+        "from": _unlocked_sender(client, sender),
+        "to": s["market"],
+        "data": activation_calldata(client, s),
+    }])
+    if not isinstance(tx_hash, str) or not tx_hash.startswith("0x"):
+        raise ClaimError("bad activation transaction hash")
+    return tx_hash
+
+
+def relay_via_rpc(client, package, sender=None):
+    """Dev/test helper for an RPC that deliberately exposes an unlocked relayer."""
+    p = normalize_package(package)
+    simulate_claim(client, p)
+    tx_hash = client.rpc("eth_sendTransaction", [{
+        "from": _unlocked_sender(client, sender),
         "to": p["market"],
         "data": claim_calldata(client, p),
     }])
@@ -180,19 +235,25 @@ def wait_receipt(client, tx_hash, timeout=60):
         receipt = client.rpc("eth_getTransactionReceipt", [tx_hash])
         if receipt:
             if int(receipt.get("status", "0x0"), 16) != 1:
-                raise ClaimError("claim transaction reverted")
+                raise ClaimError("transaction reverted")
             return receipt
         time.sleep(0.25)
-    raise ClaimError("claim transaction confirmation timed out")
+    raise ClaimError("transaction confirmation timed out")
 
 
-def relay_via_http(url, package, timeout=20):
-    p = normalize_package(package)
-    payload = json.dumps({"kind": "wqpu-relay-claim", "voucher": p}).encode("utf-8")
+def _relayer_url(client):
+    return (
+        os.environ.get("WQPU_RELAYER_URL", "").strip()
+        or str(getattr(client, "network", {}).get("relayer_url") or "").strip()
+    )
+
+
+def _relay_http(url, kind, field, value, timeout=20):
+    payload = json.dumps({"kind": kind, field: value}).encode("utf-8")
     request = urllib.request.Request(
         str(url),
         data=payload,
-        headers={"Content-Type": "application/json", "User-Agent": "WQPU-claim/0.6"},
+        headers={"Content-Type": "application/json", "User-Agent": "WQPU-relay/0.6"},
     )
     try:
         with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -205,15 +266,27 @@ def relay_via_http(url, package, timeout=20):
     return tx_hash
 
 
-def relay(client, package):
-    """Relay through configured service; local unlocked RPC relay is dev-only opt-in."""
-    simulate_claim(client, package)
-    url = os.environ.get("WQPU_RELAYER_URL", "").strip()
+def relay_activation(client, session):
+    s = normalize_activation(session)
+    simulate_activation(client, s)
+    url = _relayer_url(client)
     if url:
-        return relay_via_http(url, package)
+        return _relay_http(url, "wqpu-relay-activation", "session", s)
     if os.environ.get("WQPU_ALLOW_UNLOCKED_RPC_RELAYER", "0") == "1":
-        return relay_via_rpc(client, package)
+        return activate_via_rpc(client, s)
     raise ClaimError(
-        "claim is valid but no relayer is configured; set WQPU_RELAYER_URL "
-        "or use WQPU_ALLOW_UNLOCKED_RPC_RELAYER=1 only on a local devnet"
+        "session authorization is valid but no relayer is configured; set WQPU_RELAYER_URL"
+    )
+
+
+def relay(client, package):
+    p = normalize_package(package)
+    simulate_claim(client, p)
+    url = _relayer_url(client)
+    if url:
+        return _relay_http(url, "wqpu-relay-claim", "voucher", p)
+    if os.environ.get("WQPU_ALLOW_UNLOCKED_RPC_RELAYER", "0") == "1":
+        return relay_via_rpc(client, p)
+    raise ClaimError(
+        "claim is valid but no relayer is configured; set WQPU_RELAYER_URL"
     )
