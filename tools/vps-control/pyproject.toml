@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vps-control-mcp"
+version = "0.1.0"
+description = "Private MCP server that lets ChatGPT operate a VPS workspace through files, shell and git."
+requires-python = ">=3.10"
+dependencies = ["mcp>=2.0,<3"]
+
+[project.scripts]
+vps-control = "vps_control.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
