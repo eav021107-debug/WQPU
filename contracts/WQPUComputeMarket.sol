@@ -11,7 +11,7 @@ interface IWQPURegistryPrice {
 }
 
 /// @title WQPU Compute Market
-/// @notice Escrow + bounded payment sessions for permissionless compute providers.
+/// @notice Shared escrow + bounded payment sessions for permissionless compute providers.
 contract WQPUComputeMarket {
     uint256 public constant CLAIM_GRACE = 1 days;
     uint256 public constant PRICE_UNITS = 1_000_000;
@@ -21,9 +21,6 @@ contract WQPUComputeMarket {
     );
     bytes32 private constant VOUCHER_TYPEHASH = keccak256(
         "Voucher(bytes32 channelId,uint256 cumulativeAmount,uint256 cumulativeUnits)"
-    );
-    bytes32 private constant SESSION_TYPEHASH = keccak256(
-        "SessionAuthorization(address requester,address sessionKey,bytes32 sessionId,uint128 maxAmount,uint64 validUntil)"
     );
     bytes32 private constant SPEND_AUTH_TYPEHASH = keccak256(
         "SpendAuthorization(address requester,address sessionKey,bytes32 sessionId,uint128 maxAmount,uint128 pricePerMillionUnits,uint64 validUntil)"
@@ -104,13 +101,6 @@ contract WQPUComputeMarket {
         uint256 cumulativePaid,
         uint256 cumulativeUnits
     );
-    event SessionClaimed(
-        bytes32 indexed sessionId,
-        address indexed requester,
-        address indexed sessionKey,
-        uint256 paidNow,
-        uint256 sessionSpent
-    );
     event SessionRevoked(address indexed requester, bytes32 indexed sessionId);
     event ChannelRefunded(bytes32 indexed channelId, address indexed requester, uint256 amount);
 
@@ -151,7 +141,7 @@ contract WQPUComputeMarket {
     }
 
     /// @notice Anyone may relay a provider voucher signed by a bounded local session key.
-    /// @dev A single authorization can pay many providers from one requester escrow.
+    /// @dev One authorization can pay many providers from one requester escrow.
     function claimEscrowWithSession(
         SpendAuthorizationData calldata auth,
         ProviderVoucherData calldata voucher,
@@ -163,7 +153,7 @@ contract WQPUComputeMarket {
         _settleEscrowSession(auth, voucher);
     }
 
-    /// @notice Legacy/provider-specific channel path kept during migration.
+    /// @notice Legacy provider-specific channel retained for direct wallet-signed vouchers.
     function openChannel(address provider, uint256 amount, uint64 expiresAt)
         external
         returns (bytes32 channelId)
@@ -233,48 +223,6 @@ contract WQPUComputeMarket {
         _settle(channelId, cumulativeAmount, cumulativeUnits);
     }
 
-    function claimWithSession(
-        bytes32 channelId,
-        uint256 cumulativeAmount,
-        uint256 cumulativeUnits,
-        bytes calldata voucherSignature,
-        address sessionKey,
-        bytes32 sessionId,
-        uint128 maxAmount,
-        uint64 validUntil,
-        bytes calldata authorizationSignature
-    ) external {
-        Channel storage channel = channels[channelId];
-        require(channel.requester != address(0), "unknown channel");
-        require(sessionKey != address(0), "zero session key");
-        require(maxAmount != 0, "zero session limit");
-        require(block.timestamp <= validUntil, "session expired");
-        require(!revokedSessions[channel.requester][sessionId], "session revoked");
-
-        bytes32 authDigest = sessionAuthorizationDigest(
-            channel.requester,
-            sessionKey,
-            sessionId,
-            maxAmount,
-            validUntil
-        );
-        require(_recover(authDigest, authorizationSignature) == channel.requester, "bad session auth");
-
-        bytes32 voucher = voucherDigest(channelId, cumulativeAmount, cumulativeUnits);
-        require(_sessionSignatureMatches(voucher, voucherSignature, sessionKey), "bad session voucher");
-
-        uint256 previousPaid = channel.paid;
-        uint256 delta = _settle(channelId, cumulativeAmount, cumulativeUnits);
-        require(delta == cumulativeAmount - previousPaid, "bad delta");
-
-        uint256 spent = uint256(sessionSpent[channel.requester][sessionId]) + delta;
-        require(spent <= maxAmount, "session limit");
-        require(spent <= type(uint128).max, "session spend overflow");
-        sessionSpent[channel.requester][sessionId] = uint128(spent);
-
-        emit SessionClaimed(sessionId, channel.requester, sessionKey, delta, spent);
-    }
-
     function revokeSession(bytes32 sessionId) external {
         revokedSessions[msg.sender][sessionId] = true;
         emit SessionRevoked(msg.sender, sessionId);
@@ -301,26 +249,6 @@ contract WQPUComputeMarket {
     ) public view returns (bytes32) {
         bytes32 structHash = keccak256(
             abi.encode(VOUCHER_TYPEHASH, channelId, cumulativeAmount, cumulativeUnits)
-        );
-        return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
-    }
-
-    function sessionAuthorizationDigest(
-        address requester,
-        address sessionKey,
-        bytes32 sessionId,
-        uint128 maxAmount,
-        uint64 validUntil
-    ) public view returns (bytes32) {
-        bytes32 structHash = keccak256(
-            abi.encode(
-                SESSION_TYPEHASH,
-                requester,
-                sessionKey,
-                sessionId,
-                maxAmount,
-                validUntil
-            )
         );
         return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
     }
@@ -491,9 +419,6 @@ contract WQPUComputeMarket {
         bytes calldata signature,
         address expected
     ) internal pure returns (bool) {
-        if (signature.length == 65) {
-            return _recover(digest, signature) == expected;
-        }
         require(signature.length == 64, "bad session signature length");
         bytes32 r;
         bytes32 s;
@@ -504,8 +429,7 @@ contract WQPUComputeMarket {
         require(uint256(s) <= HALF_ORDER, "bad signature s");
         address first = ecrecover(digest, 27, r, s);
         if (first == expected) return true;
-        address second = ecrecover(digest, 28, r, s);
-        return second == expected;
+        return ecrecover(digest, 28, r, s) == expected;
     }
 
     function _recover(bytes32 digest, bytes calldata signature) internal pure returns (address) {
