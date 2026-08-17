@@ -12,6 +12,7 @@ from __future__ import print_function
 import base64
 import hashlib
 import json
+import secrets
 import shutil
 import subprocess
 import tempfile
@@ -85,8 +86,16 @@ def certificate_fingerprint(pem):
 
 def sign_report(report):
     openssl = _openssl()
-    cert_path, key_path = _identity_for_report(report)
-    payload = _canonical(report)
+    body = dict(report or {})
+    # RSA PKCS#1 v1.5 signatures are deterministic. Two distinct physical RPC sockets
+    # can legitimately end with identical counters; without a signed per-report nonce
+    # their signatures would also be identical and the replay guard could under-count
+    # the second stream. The nonce is part of the canonical signed body, so replaying the
+    # same packet remains idempotent while independently created reports stay distinct.
+    if body.get("kind") == "wqpu-worker-usage-attestation" and not body.get("report_nonce"):
+        body["report_nonce"] = secrets.token_hex(16)
+    cert_path, key_path = _identity_for_report(body)
+    payload = _canonical(body)
     proc = subprocess.run(
         [openssl, "dgst", "-sha256", "-sign", str(key_path)],
         input=payload,
@@ -95,7 +104,7 @@ def sign_report(report):
     )
     if proc.returncode != 0:
         raise AttestationError("could not sign worker usage report")
-    signed = dict(report)
+    signed = dict(body)
     signed["certificate"] = cert_path.read_text()
     signed["signature"] = base64.b64encode(proc.stdout).decode("ascii")
     return signed
