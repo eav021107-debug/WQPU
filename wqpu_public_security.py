@@ -91,6 +91,13 @@ def _hub_for_route(mesh, route_key):
 
 def install(cls):
     """Patch one public ChainMesh class once."""
+    # Public security and accounting must travel together: real llama.cpp opens several
+    # physical RPC sockets per logical request. The multistream layer aggregates only
+    # reports that have passed the existing TLS/Registry signature verifier.
+    if hasattr(cls, "_receive_usage_report"):
+        import wqpu_multistream
+        wqpu_multistream.install(cls)
+
     if getattr(cls, "_wqpu_public_security_installed", False):
         return cls
 
@@ -139,9 +146,6 @@ def install(cls):
                     verified_ids.add(node_id)
             nodes = accepted
         result = original_merge_nodes(self, route_key, nodes)
-        # Direct peers used to be verified by route address. For a relay route, the route
-        # address belongs to the relay, so the end-to-end signed Registry proof above is
-        # the stronger criterion and is what makes the worker schedulable.
         verified = getattr(self, "verified_node_ids", None)
         if verified is not None:
             verified.update(verified_ids)
