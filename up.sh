@@ -5,6 +5,7 @@ REPO="eav021107-debug/WQPU"
 REF="${WQPU_REF:-next-foundation}"
 BASE="${WQPU_NETWORK_HOME:-$HOME/.local/share/wqpu-network}"
 SOURCE_DIR="${WQPU_SOURCE_DIR:-$BASE/source}"
+BOOTSTRAP_CACHE="${WQPU_BOOTSTRAP_CACHE:-$BASE/bootstrap/verified-rpcs.txt}"
 GO_VERSION="1.25.9"
 CHAIN_PID=""
 NODE_PID=""
@@ -31,12 +32,15 @@ Run the SAME command on every Linux/macOS machine:
   curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/next-foundation/up.sh | bash
 
 Normal mode has no host/join role, peer IP, RPC, or compute slot arguments.
-Bootstrap is intentionally invisible: the client tries only repository-shipped
-trusted bootstrap RPCs, verifies the WQPU chain id and native protocol before
-using one, then discovers compute peers only from the on-chain registry.
+Bootstrap is intentionally invisible: the client first tries its locally saved
+verified WQPU RPC addrbook, then repository-shipped trusted bootstrap RPCs. Every
+candidate is re-verified against the WQPU chain id and native protocol before use.
+After blockchain access, compute peers are discovered only from the on-chain registry.
 
-There is no LAN broadcast discovery and no arbitrary network-supplied RPC.
-Local-chain fallback exists only when WQPU_DEV_LOCAL_FALLBACK=1 is explicitly set.
+WQPU chain nodes use CometBFT PEX + persistent addrbook.json so public seed nodes
+are only first-contact helpers, never permanent coordinators. There is no LAN
+broadcast discovery and no arbitrary network-supplied RPC. Local-chain fallback
+exists only when WQPU_DEV_LOCAL_FALLBACK=1 is explicitly set.
 EOF
 }
 
@@ -46,7 +50,7 @@ need curl
 need tar
 need git
 need python3
-mkdir -p "$BASE"
+mkdir -p "$BASE" "$(dirname "$BOOTSTRAP_CACHE")"
 
 sha256_file() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -122,6 +126,7 @@ tar -xzf "$archive" -C "$stage" --strip-components=1
 rm -f "$archive"
 [ -f "$stage/chain/devnet.sh" ] || fail "downloaded source is incomplete"
 [ -f "$stage/bootstrap-rpcs.txt" ] || fail "trusted bootstrap manifest is missing"
+[ -f "$stage/bootstrap-p2p.txt" ] || fail "P2P bootstrap manifest is missing"
 rm -rf "$SOURCE_DIR"
 mv "$stage" "$SOURCE_DIR"
 
@@ -183,18 +188,9 @@ verify_wqpu_rpc() {
   (cd "$SOURCE_DIR/client" && GOWORK=off go run ./cmd/wqpu-rpc-verify "$candidate") >/dev/null 2>&1
 }
 
-find_trusted_rpc() {
-  local candidate line
-
-  # Manual RPC injection is disabled in normal mode. It exists only for explicit
-  # local development and still has to pass WQPU chain verification.
-  if [ "${WQPU_DEV_MODE:-0}" = "1" ] && [ -n "${WQPU_CHAIN_RPC:-}" ]; then
-    if verify_wqpu_rpc "$WQPU_CHAIN_RPC"; then
-      printf '%s\n' "$WQPU_CHAIN_RPC"
-      return 0
-    fi
-  fi
-
+try_rpc_file() {
+  local file="$1" line candidate
+  [ -f "$file" ] || return 1
   while IFS= read -r line || [ -n "$line" ]; do
     line="${line%%#*}"
     line="$(printf '%s' "$line" | tr -d '[:space:]')"
@@ -204,7 +200,46 @@ find_trusted_rpc() {
       printf '%s\n' "$candidate"
       return 0
     fi
-  done < "$SOURCE_DIR/bootstrap-rpcs.txt"
+  done < "$file"
+  return 1
+}
+
+remember_verified_rpc() {
+  local candidate="$1"
+  python3 - "$BOOTSTRAP_CACHE" "$candidate" <<'PY'
+from pathlib import Path
+import os, sys
+path = Path(sys.argv[1])
+candidate = sys.argv[2]
+path.parent.mkdir(parents=True, exist_ok=True)
+existing = []
+if path.exists():
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        value = raw.strip()
+        if value and value != candidate and value not in existing:
+            existing.append(value)
+entries = [candidate] + existing[:31]
+tmp = path.with_suffix(path.suffix + ".tmp")
+tmp.write_text("\n".join(entries) + "\n", encoding="utf-8")
+os.chmod(tmp, 0o600)
+tmp.replace(path)
+PY
+}
+
+find_trusted_rpc() {
+  # Manual RPC injection is disabled in normal mode. It exists only for explicit
+  # local development and still has to pass WQPU chain verification.
+  if [ "${WQPU_DEV_MODE:-0}" = "1" ] && [ -n "${WQPU_CHAIN_RPC:-}" ]; then
+    if verify_wqpu_rpc "$WQPU_CHAIN_RPC"; then
+      printf '%s\n' "$WQPU_CHAIN_RPC"
+      return 0
+    fi
+  fi
+
+  # Bitcoin/Cosmos-style behavior: prefer peers/gateways this machine already
+  # verified successfully, then fall back to the shipped first-contact set.
+  try_rpc_file "$BOOTSTRAP_CACHE" && return 0
+  try_rpc_file "$SOURCE_DIR/bootstrap-rpcs.txt" && return 0
   return 1
 }
 
@@ -261,6 +296,7 @@ start_provider_background() {
 
 rpc=""
 if rpc="$(find_trusted_rpc 2>/dev/null)"; then
+  remember_verified_rpc "$rpc"
   say "WQPU UP: connected to verified WQPU network."
 elif [ "${WQPU_DEV_LOCAL_FALLBACK:-0}" = "1" ]; then
   say "WQPU UP: development fallback enabled; starting isolated local WQPU devnet."
