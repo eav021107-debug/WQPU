@@ -109,6 +109,7 @@ func startNode(ctx context.Context, baseDir string, chain *chainclient.Client, i
 		MaxConnections: 8,
 		RPCPort: rpcPort,
 		RPCThreads: 1,
+		RPCDevices: []string{"CPU"},
 		RPCOutput: output,
 		BackendReady: 30 * time.Second,
 	})
