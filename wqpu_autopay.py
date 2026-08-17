@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""WQPU runtime extension: gasless funding, session activation and provider payments."""
+"""WQPU runtime extension: NAT relays, gasless funding and provider payments."""
 
 from __future__ import print_function
 
 import asyncio
+import hashlib
+import json
 import os
 
 import wqpu
@@ -19,9 +21,47 @@ PAYMENT_SERVICE = "payment"
 MAX_PAYMENT_HOPS = 4
 
 
+def configured_relays(chain):
+    raw = os.environ.get("WQPU_RELAYS_JSON", "").strip()
+    if raw:
+        try:
+            values = json.loads(raw)
+        except Exception as exc:
+            raise RuntimeError("invalid WQPU_RELAYS_JSON: {}".format(exc))
+    else:
+        values = (getattr(chain, "network", {}) or {}).get("relays") or []
+    if not isinstance(values, list):
+        raise RuntimeError("WQPU relays must be a list")
+
+    out = []
+    seen = set()
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        host = str(value.get("host") or "").strip()
+        port = int(value.get("port") or wqpu.PORT)
+        fp = str(value.get("fingerprint") or "").lower().replace("0x", "")
+        if not host or port < 1 or port > 65535 or len(fp) != 64:
+            continue
+        try:
+            int(fp, 16)
+        except ValueError:
+            continue
+        key = wqpu.peer_key(host, port)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"host": host, "port": port, "fingerprint": fp, "relay": True})
+    return out
+
+
 class AutoPayChainMesh(runtime.ChainMesh):
     def __init__(self, cfg, chain, wallet):
+        relays = configured_relays(chain)
+        cfg = dict(cfg)
+        cfg["peers"] = relays
         super(AutoPayChainMesh, self).__init__(cfg, chain, wallet)
+        self.bootstrap_relays = relays
         self._ensure_payment_session_active()
 
     def _free_escrow(self, market, requester):
@@ -35,8 +75,7 @@ class AutoPayChainMesh(runtime.ChainMesh):
         market = str(session.get("market") or "").lower()
         requester = str(session.get("requester") or "").lower()
         maximum = int(session.get("max_amount") or 0)
-        free = self._free_escrow(market, requester)
-        needed = max(0, maximum - free)
+        needed = max(0, maximum - self._free_escrow(market, requester))
         if needed == 0:
             clear_funding_permit()
             return True
@@ -61,14 +100,11 @@ class AutoPayChainMesh(runtime.ChainMesh):
             session["funding_tx"] = tx_hash
             save_session(session)
             clear_funding_permit()
-            free = self._free_escrow(market, requester)
-            if free < maximum:
+            if self._free_escrow(market, requester) < maximum:
                 raise RuntimeError("funding confirmed but free escrow is still below session limit")
             print("[WQPU escrow funded through wallet permit]")
             return True
         except Exception as exc:
-            # Permit remains stored. A reverted permit+deposit transaction consumes neither
-            # permit nonce nor funds, so it can be retried after tokens/relayer become available.
             print("[WQPU escrow funding pending: {}]".format(exc))
             return False
 
@@ -105,7 +141,6 @@ class AutoPayChainMesh(runtime.ChainMesh):
             return
         if not self._fund_if_needed(session):
             return
-
         try:
             tx_hash = relay_activation(self.chain, session)
             wait_receipt(self.chain, tx_hash, 120)
@@ -119,28 +154,128 @@ class AutoPayChainMesh(runtime.ChainMesh):
         except Exception as exc:
             print("[WQPU payment session pending activation: {}]".format(exc))
 
+    async def _open_tls_peer(self, peer):
+        host, port = peer["host"], int(peer.get("port", wqpu.PORT))
+        reader, writer = await asyncio.open_connection(
+            host, port, ssl=wqpu.client_ssl(), server_hostname=host
+        )
+        sslobj = writer.get_extra_info("ssl_object")
+        cert = sslobj.getpeercert(binary_form=True) if sslobj else b""
+        actual = hashlib.sha256(cert).hexdigest()
+        expected = str(peer.get("fingerprint") or "").lower().replace("0x", "")
+        if not expected or actual.lower() != expected:
+            await wqpu.close_writer(writer)
+            raise RuntimeError("TLS fingerprint mismatch for relay {}:{}".format(host, port))
+        return reader, writer
+
+    def _hub_for_route(self, route_key):
+        candidates = list(self.bootstrap_relays) + list(self.chain_peers.values())
+        try:
+            candidates += list(wqpu.load_peer_cache().values())
+        except Exception:
+            pass
+        for peer in candidates:
+            try:
+                if wqpu.peer_key(peer["host"], peer.get("port", wqpu.PORT)) == route_key:
+                    return peer
+            except Exception:
+                continue
+        return None
+
+    async def open_accept(self, hub, sid):
+        reader, writer = await self._open_tls_peer(hub)
+        hello = {
+            "role": "accept", "secret": self.secret,
+            "node_id": self.me, "stream": sid,
+        }
+        writer.write((json.dumps(hello, separators=(",", ":")) + "\n").encode())
+        await writer.drain()
+        line = await asyncio.wait_for(reader.readline(), 15)
+        if line != b"WQPU-READY\n":
+            await wqpu.close_writer(writer)
+            raise RuntimeError("relay accept failed")
+        return reader, writer
+
+    async def open_rpc(self, target):
+        routes = list(self.routes.get(target) or [])
+        for route_key in routes:
+            hub = self._hub_for_route(route_key)
+            if not hub:
+                continue
+            try:
+                reader, writer = await self._open_tls_peer(hub)
+                hello = {
+                    "role": "dial", "secret": self.secret,
+                    "node_id": self.me, "target": target,
+                }
+                writer.write((json.dumps(hello, separators=(",", ":")) + "\n").encode())
+                await writer.drain()
+                line = await asyncio.wait_for(reader.readline(), 15)
+                if line == b"WQPU-READY\n":
+                    return reader, writer
+                await wqpu.close_writer(writer)
+            except Exception:
+                pass
+        raise RuntimeError("no route to peer")
+
+    def merge_nodes(self, route_key, nodes):
+        # A relay is only transport. Worker identity still comes from the on-chain
+        # wallet -> TLS fingerprint registry entry.
+        for node in nodes:
+            wallet = str(node.get("wallet") or "").lower()
+            nid = str(node.get("node_id") or "")
+            fp = str(node.get("fingerprint") or "").lower().replace("0x", "")
+            registered = self.chain_nodes.get(wallet)
+            expected = str((registered or {}).get("fingerprint") or "").lower().replace("0x", "")
+            if nid and expected and fp == expected:
+                self.verified_node_ids.add(nid)
+        super(AutoPayChainMesh, self).merge_nodes(route_key, nodes)
+
+    async def connector_loop(self):
+        tick = 0
+        while not self.stop.is_set():
+            if tick % 4 == 0:
+                await self.refresh_chain()
+
+            # If bootstrap relays exist, use outbound-only relay connectivity by default.
+            # This makes home/CGNAT nodes work without waiting on dead inbound endpoints.
+            candidates = {}
+            source = self.bootstrap_relays if self.bootstrap_relays else list(self.chain_peers.values())
+            for peer in source:
+                candidates[wqpu.peer_key(peer["host"], peer.get("port", wqpu.PORT))] = peer
+            for key, peer in list(candidates.items()):
+                if key in self.outbound:
+                    continue
+                try:
+                    await asyncio.wait_for(self.connect_control(peer), 5)
+                except Exception:
+                    pass
+
+            try:
+                await self.broadcast_nodes()
+            except Exception:
+                pass
+            for ctrl in list(self.outbound.values()):
+                try:
+                    await self.send(ctrl, {"type": "ping"})
+                except Exception:
+                    pass
+            tick += 1
+            await asyncio.sleep(5)
+
     async def _route_payment(self, target, voucher, ttl=MAX_PAYMENT_HOPS, trace=None):
         target = str(target or "")
         ttl = int(ttl)
         trace = list(trace or [])
-        if not target or ttl < 0:
-            return False
-        if self.me in trace:
+        if not target or ttl < 0 or self.me in trace:
             return False
         trace.append(self.me)
-
         if target == self.me:
             return await self._receive_payment(voucher)
-
         message = {
-            "type": "open",
-            "service": PAYMENT_SERVICE,
-            "target": target,
-            "voucher": voucher,
-            "ttl": ttl,
-            "trace": trace,
+            "type": "open", "service": PAYMENT_SERVICE, "target": target,
+            "voucher": voucher, "ttl": ttl, "trace": trace,
         }
-
         direct = self.controls.get(target)
         if direct:
             try:
@@ -148,7 +283,6 @@ class AutoPayChainMesh(runtime.ChainMesh):
                 return True
             except Exception:
                 pass
-
         for route_key in list(self.routes.get(target) or []):
             ctrl = self.outbound.get(route_key)
             if not ctrl:
@@ -167,7 +301,6 @@ class AutoPayChainMesh(runtime.ChainMesh):
             return False
         if not changed:
             return True
-
         if os.environ.get("WQPU_AUTO_CLAIM", "0") != "1":
             return True
         try:
@@ -191,9 +324,8 @@ class AutoPayChainMesh(runtime.ChainMesh):
             if target == self.me:
                 await self._receive_payment(voucher)
                 return
-            if ttl <= 0:
-                return
-            await self._route_payment(target, voucher, ttl - 1, trace)
+            if ttl > 0:
+                await self._route_payment(target, voucher, ttl - 1, trace)
             return
         await super(AutoPayChainMesh, self).handle_open_request(msg, via=via)
 
