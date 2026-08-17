@@ -19,6 +19,8 @@ BUILD_SRC="${WQPU_PUBLIC_CHAIN_SRC:-/opt/wqpu/cosmos-evm}"
 SERVICE="wqpu-public-testnet.service"
 SERVICE_PATH="/etc/systemd/system/$SERVICE"
 KEYRING="test" # PUBLIC TESTNET ONLY. Never use this backend for mainnet funds.
+GO_VERSION="1.25.9"
+GO_ROOT="/opt/wqpu/go${GO_VERSION}"
 
 fail() { printf 'WQPU PUBLIC TESTNET: %s\n' "$*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
@@ -62,6 +64,49 @@ elif command -v apt-get >/dev/null 2>&1; then
 else
   fail "supported package manager not found (dnf/apt-get)"
 fi
+
+install_private_go() {
+  local arch asset expected archive tmp actual
+  case "$(uname -s)" in
+    Linux) ;;
+    *) fail "first public bootstrap currently supports Linux only" ;;
+  esac
+  case "$(uname -m)" in
+    x86_64|amd64)
+      arch=amd64
+      expected="00859d7bd6defe8bf84d9db9e57b9a4467b2887c18cd93ae7460e713db774bc1"
+      ;;
+    arm64|aarch64)
+      arch=arm64
+      expected="ec342e7389b7f489564ed5463c63b16cf8040023dabc7861256677165a8c0e2b"
+      ;;
+    *) fail "unsupported bootstrap CPU architecture: $(uname -m)" ;;
+  esac
+  asset="go${GO_VERSION}.linux-${arch}.tar.gz"
+  if [ ! -x "$GO_ROOT/bin/go" ]; then
+    mkdir -p /opt/wqpu
+    archive="/opt/wqpu/$asset"
+    tmp="/opt/wqpu/go.tmp.$$"
+    say "WQPU PUBLIC TESTNET: installing private Go ${GO_VERSION}..."
+    curl -fL --retry 3 "https://go.dev/dl/$asset" -o "$archive"
+    actual="$(sha256sum "$archive" | awk '{print $1}')"
+    [ "$actual" = "$expected" ] || fail "Go archive checksum mismatch"
+    rm -rf "$tmp"
+    mkdir -p "$tmp"
+    tar -xzf "$archive" -C "$tmp"
+    rm -f "$archive"
+    [ -x "$tmp/go/bin/go" ] || fail "private Go extraction failed"
+    rm -rf "$GO_ROOT"
+    mv "$tmp/go" "$GO_ROOT"
+    rm -rf "$tmp"
+  fi
+  export GOROOT="$GO_ROOT"
+  export PATH="$GOROOT/bin:$PATH"
+  export GOTOOLCHAIN=local
+}
+
+install_private_go
+[ "$(go version | awk '{print $3}')" = "go${GO_VERSION}" ] || fail "wrong Go toolchain"
 
 # Reuse the reviewed pinned-runtime builder, but install the resulting binary
 # outside the devnet home. devnet.sh --build-only never creates or starts a chain.
