@@ -156,7 +156,9 @@ run_wqpu "$BIN" genesis add-genesis-account validator \
   --home "$CHAIN_HOME" >/dev/null
 
 # Fund only the already-public test compute wallet. These are TESTNET coins.
-DEV_EVM_ADDRESS="$(cd "$HERE" && GOWORK=off go run ./cmd/wqpu-compute-bootstrap address)"
+# -mod=mod is explicit because this small helper module intentionally does not
+# commit a giant generated go.sum; the pinned Go toolchain resolves its sums here.
+DEV_EVM_ADDRESS="$(cd "$HERE" && GOWORK=off go run -mod=mod ./cmd/wqpu-compute-bootstrap address)"
 DEV_BECH32="$(python3 "$HERE/devnet_config.py" bech32 "$DEV_EVM_ADDRESS" --prefix cosmos)"
 run_wqpu "$BIN" genesis add-genesis-account "$DEV_BECH32" \
   "10000000000000000000000${BASE_DENOM}" \
