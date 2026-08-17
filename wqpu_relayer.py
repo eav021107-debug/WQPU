@@ -12,6 +12,7 @@ import json
 import os
 import re
 import shutil
+import ssl
 import subprocess
 import threading
 import time
@@ -96,6 +97,24 @@ def configured_sender(client, private_key=""):
     return normalize_address(accounts[0])
 
 
+def validate_tls_pair(cert, key):
+    cert = str(cert or "").strip()
+    key = str(key or "").strip()
+    if bool(cert) != bool(key):
+        raise RelayerError("both TLS certificate and key are required")
+    return cert, key
+
+
+def enable_tls(server, cert, key):
+    cert, key = validate_tls_pair(cert, key)
+    if not cert:
+        return False
+    context = ssl.SSLContext(getattr(ssl, "PROTOCOL_TLS_SERVER", ssl.PROTOCOL_TLS))
+    context.load_cert_chain(certfile=cert, keyfile=key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    return True
+
+
 class RateLimiter(object):
     def __init__(self, limit=DEFAULT_RATE):
         self.limit = max(1, int(limit))
@@ -143,7 +162,6 @@ class Relayer(object):
             raise RelayerError("cast is required for private-key relayer mode")
         cmd = ["cast", "send", normalize_address(to)]
         if data and str(data) != "0x":
-            # Current Cast accepts raw encoded calldata as the positional SIG argument.
             cmd.append(str(data))
         cmd += [
             "--rpc-url", self.client.rpc_url,
@@ -235,7 +253,7 @@ class RelayerHTTPServer(ThreadingHTTPServer):
 
 
 class RelayerHandler(BaseHTTPRequestHandler):
-    server_version = "WQPURelayer/0.7"
+    server_version = "WQPURelayer/0.8"
 
     def log_message(self, fmt, *args):
         if os.environ.get("WQPU_RELAYER_QUIET", "0") != "1":
@@ -318,12 +336,16 @@ class RelayerHandler(BaseHTTPRequestHandler):
             self._json(400, {"error": str(exc)})
 
 
-def serve(host=None, port=None):
+def serve(host=None, port=None, tls_cert=None, tls_key=None):
     host = host or os.environ.get("WQPU_RELAYER_HOST", "127.0.0.1")
     port = int(port or os.environ.get("WQPU_RELAYER_PORT", "8787"))
     rate = int(os.environ.get("WQPU_RELAYER_RATE_LIMIT", str(DEFAULT_RATE)))
+    tls_cert = tls_cert or os.environ.get("WQPU_RELAYER_TLS_CERT", "")
+    tls_key = tls_key or os.environ.get("WQPU_RELAYER_TLS_KEY", "")
     server = RelayerHTTPServer((host, port), Relayer(), rate)
-    print("WQPU relayer listening on http://{}:{}".format(host, server.server_port))
+    secure = enable_tls(server, tls_cert, tls_key)
+    scheme = "https" if secure else "http"
+    print("WQPU relayer listening on {}://{}:{}".format(scheme, host, server.server_port))
     try:
         server.serve_forever()
     finally:
@@ -334,8 +356,10 @@ def main():
     parser = argparse.ArgumentParser(prog="wqpu-relayer")
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
+    parser.add_argument("--tls-cert", default=None)
+    parser.add_argument("--tls-key", default=None)
     args = parser.parse_args()
-    serve(args.host, args.port)
+    serve(args.host, args.port, args.tls_cert, args.tls_key)
     return 0
 
 
