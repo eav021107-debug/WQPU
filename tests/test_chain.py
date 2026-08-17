@@ -30,6 +30,39 @@ def encode_member(wallet, endpoint, fingerprint, capacity, load_bps, updated_at,
     return wallet_word + tuple_offset + tuple_head + tuple_tail
 
 
+def v3_config(registry=None, **public_overrides):
+    token = "0x" + "11" * 20
+    registry = registry or ("0x" + "22" * 20)
+    market = "0x" + "33" * 20
+    chain_id = "0x7a69"
+    public = {
+        "enabled": True,
+        "testnet": True,
+        "protocol": wqpu_chain.PUBLIC_PROTOCOL,
+        "network_uid": wqpu_chain.compute_network_uid(chain_id, token, registry, market),
+        "chain_id": chain_id,
+        "chain_name": "WQPU Testnet",
+        "native_symbol": "ETH",
+        "rpc_url": "https://rpc.example",
+        "token": token,
+        "registry": registry,
+        "market": market,
+        "relayer_url": "https://relay.example/relay",
+        "faucet_url": "https://relay.example/faucet",
+        "relays": [{
+            "host": "relay.example",
+            "port": 7443,
+            "fingerprint": "ab" * 32,
+        }],
+        "payments_enabled": False,
+        "llama_cpp_tag": wqpu_chain.EXPECTED_LLAMA_CPP_TAG,
+        "llama_rpc_protocol_major": wqpu_chain.EXPECTED_LLAMA_RPC_PROTOCOL_MAJOR,
+        "llama_rpc_op_count": wqpu_chain.EXPECTED_LLAMA_RPC_OP_COUNT,
+    }
+    public.update(public_overrides)
+    return {"version": 3, "public": public}
+
+
 class DecodeClient(wqpu_chain.RegistryClient):
     def __init__(self, encoded):
         self.rpc_url = "mock"
@@ -107,6 +140,8 @@ class ChainTests(unittest.TestCase):
             }))
             self.assertEqual(wqpu_chain.load_network_config(path), {})
 
+            # Legacy config without a root version remains readable for old/private
+            # workflows; strict compatibility begins at published v3.
             path.write_text(json.dumps({
                 "public": {
                     "enabled": True,
@@ -118,6 +153,70 @@ class ChainTests(unittest.TestCase):
             loaded = wqpu_chain.load_network_config(path)
             self.assertEqual(loaded["chain_id"], 31337)
             self.assertEqual(loaded["rpc_url"], "https://rpc.example")
+
+    def test_valid_v3_network_config_loads(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "network.json"
+            config = v3_config()
+            path.write_text(json.dumps(config))
+            loaded = wqpu_chain.load_network_config(path)
+            self.assertEqual(loaded["protocol"], wqpu_chain.PUBLIC_PROTOCOL)
+            self.assertEqual(
+                loaded["network_uid"],
+                wqpu_chain.compute_network_uid(
+                    loaded["chain_id"], loaded["token"], loaded["registry"], loaded["market"]
+                ),
+            )
+
+    def test_v3_wrong_network_uid_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "network.json"
+            config = v3_config(network_uid="wqpu-" + "00" * 16)
+            path.write_text(json.dumps(config))
+            with self.assertRaises(wqpu_chain.ChainError):
+                wqpu_chain.load_network_config(path)
+
+    def test_v3_incompatible_llama_runtime_is_rejected(self):
+        cases = [
+            {"llama_cpp_tag": "b99999"},
+            {"llama_rpc_protocol_major": wqpu_chain.EXPECTED_LLAMA_RPC_PROTOCOL_MAJOR + 1},
+            {"llama_rpc_op_count": wqpu_chain.EXPECTED_LLAMA_RPC_OP_COUNT + 1},
+        ]
+        for override in cases:
+            with tempfile.TemporaryDirectory() as tmp:
+                path = Path(tmp) / "network.json"
+                path.write_text(json.dumps(v3_config(**override)))
+                with self.assertRaises(wqpu_chain.ChainError, msg=override):
+                    wqpu_chain.load_network_config(path)
+
+    def test_future_network_config_version_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "network.json"
+            config = v3_config()
+            config["version"] = wqpu_chain.NETWORK_CONFIG_VERSION + 1
+            path.write_text(json.dumps(config))
+            with self.assertRaises(wqpu_chain.ChainError):
+                wqpu_chain.load_network_config(path)
+
+    def test_v3_bad_relay_fingerprint_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "network.json"
+            path.write_text(json.dumps(v3_config(relays=[{
+                "host": "relay.example",
+                "port": 7443,
+                "fingerprint": "not-a-fingerprint",
+            }])))
+            with self.assertRaises(wqpu_chain.ChainError):
+                wqpu_chain.load_network_config(path)
+
+    def test_network_uid_is_deterministic_and_contract_bound(self):
+        token = "0x" + "11" * 20
+        registry = "0x" + "22" * 20
+        market = "0x" + "33" * 20
+        uid = wqpu_chain.compute_network_uid(31337, token, registry, market)
+        self.assertEqual(uid, wqpu_chain.compute_network_uid("0x7A69", token.upper().replace("0X", "0x"), registry, market))
+        changed = wqpu_chain.compute_network_uid(31337, token, "0x" + "44" * 20, market)
+        self.assertNotEqual(uid, changed)
 
     def test_find_wallet(self):
         wanted = "0x" + "22" * 20
