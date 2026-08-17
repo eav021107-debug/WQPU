@@ -16,6 +16,13 @@ from wqpu_payments import PaymentSession
 USAGE_DIR = wqpu.HOME / "usage"
 
 
+def _flag(env_name, network, config_name, default=False):
+    raw = os.environ.get(env_name)
+    if raw is not None:
+        return str(raw).strip().lower() in ("1", "true", "yes", "on")
+    return bool((network or {}).get(config_name, default))
+
+
 def meter_is_eligible(stats):
     """Fail closed: malformed/partial/unknown RPC work must never become a voucher."""
     try:
@@ -32,6 +39,8 @@ def meter_is_eligible(stats):
 
 
 def save_usage_receipt(mesh, snapshot):
+    network = getattr(getattr(mesh, "chain", None), "network", {}) or {}
+    auto_vouchers = _flag("WQPU_AUTO_VOUCHERS", network, "payments_enabled", False)
     receipt = {
         "version": 2,
         "kind": "wqpu-rpc-usage-receipt",
@@ -39,11 +48,10 @@ def save_usage_receipt(mesh, snapshot):
         "model": wqpu.model_name(),
         "meter": "llama.cpp-rpc-estimated-scalar-ops-v2",
         "prototype_accounting": True,
-        "automatic_real_value_payments_default": False,
+        "automatic_real_value_payments_default": bool(network.get("payments_enabled", False)),
+        "auto_vouchers_requested": auto_vouchers,
         "workers": [],
     }
-    auto_vouchers = os.environ.get("WQPU_AUTO_VOUCHERS", "0") == "1"
-    receipt["auto_vouchers_requested"] = auto_vouchers
     payments = None
     if auto_vouchers:
         try:
