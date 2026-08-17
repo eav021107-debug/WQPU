@@ -24,12 +24,29 @@ jobs:
       - name: Validate published network JSON
         run: python -c "import json; json.load(open('network-config.json'))"
 
-  installers:
+  installer-linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - name: Validate POSIX installer syntax
         run: sh -n install.sh
+      - name: Run installer against this commit
+        env:
+          WQPU_NO_START: '1'
+        run: |
+          REF="${{ github.event.pull_request.head.sha || github.sha }}"
+          TEST_HOME="$RUNNER_TEMP/wqpu-home"
+          mkdir -p "$TEST_HOME"
+          HOME="$TEST_HOME" \
+          WQPU_NO_START=1 \
+          WQPU_RAW_BASE="https://raw.githubusercontent.com/eav021107-debug/WQPU/$REF" \
+          sh install.sh
+          "$TEST_HOME/.local/bin/wqpu" --version | grep -F 'WQPU 0.6.0-dev'
+
+  installer-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
       - name: Validate PowerShell installer syntax
         shell: pwsh
         run: |
@@ -39,6 +56,19 @@ jobs:
           if ($errors.Count -gt 0) {
             $errors | ForEach-Object { Write-Error $_.Message }
             exit 1
+          }
+      - name: Run installer against this commit
+        shell: pwsh
+        run: |
+          $ref = '${{ github.event.pull_request.head.sha || github.sha }}'
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'wqpu-localappdata'
+          $env:WQPU_NO_START = '1'
+          $env:WQPU_RAW_BASE = "https://raw.githubusercontent.com/eav021107-debug/WQPU/$ref"
+          .\install.ps1
+          $launcher = Join-Path $env:LOCALAPPDATA 'WQPU\bin\wqpu.cmd'
+          $version = (& $launcher --version | Out-String).Trim()
+          if ($version -ne 'WQPU 0.6.0-dev') {
+            throw "Unexpected installed version: $version"
           }
 
   solidity:
