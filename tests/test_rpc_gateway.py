@@ -33,6 +33,14 @@ class GatewayPolicyTests(unittest.TestCase):
         result = g.handle([{}] * (gateway.MAX_BATCH + 1))
         self.assertEqual(result["error"]["code"], -32600)
 
+    def test_tls_requires_certificate_and_key_together(self):
+        self.assertEqual(gateway.validate_tls_pair("", ""), ("", ""))
+        with self.assertRaises(RuntimeError):
+            gateway.validate_tls_pair("cert.pem", "")
+        with self.assertRaises(RuntimeError):
+            gateway.validate_tls_pair("", "key.pem")
+        self.assertEqual(gateway.validate_tls_pair("cert.pem", "key.pem"), ("cert.pem", "key.pem"))
+
 
 if __name__ == "__main__":
     unittest.main()
