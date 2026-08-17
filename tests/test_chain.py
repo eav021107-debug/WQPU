@@ -10,7 +10,6 @@ def word(value):
 
 
 def encode_member(wallet, endpoint, fingerprint, capacity, load_bps, updated_at, active=True):
-    # Return encoding for (address wallet, Node node), where Node contains a dynamic string.
     wallet_word = word(int(wallet, 16))
     tuple_offset = word(64)
     endpoint_bytes = endpoint.encode("utf-8")
@@ -59,6 +58,38 @@ class ChainTests(unittest.TestCase):
         self.assertEqual(wqpu_chain.parse_endpoint("[::1]:7443"), ("::1", 7443))
         with self.assertRaises(wqpu_chain.ChainError):
             wqpu_chain.parse_endpoint("missing-port")
+
+    def test_chain_id_is_validated(self):
+        class Client(wqpu_chain.RegistryClient):
+            def __init__(self):
+                self.rpc_url = "mock"
+                self.registry = "0x" + "11" * 20
+                self.timeout = 1
+                self._rpc_id = 0
+
+            def rpc(self, method, params):
+                self.assertion = (method, params)
+                return "0x7a69"
+
+        client = Client()
+        self.assertEqual(client.chain_id(), "0x7a69")
+        self.assertEqual(client.assertion, ("eth_chainId", []))
+
+    def test_find_wallet(self):
+        wanted = "0x" + "22" * 20
+
+        class Client(wqpu_chain.RegistryClient):
+            def __init__(self):
+                pass
+
+            def member_count(self):
+                return 3
+
+            def member_at(self, index):
+                wallets = ["0x" + "11" * 20, wanted, "0x" + "33" * 20]
+                return {"wallet": wallets[index], "active": True}
+
+        self.assertEqual(Client().find_wallet(wanted)["wallet"], wanted)
 
     def test_choose_workers_can_split_one_request(self):
         class Scheduler(wqpu_chain.RegistryClient):
