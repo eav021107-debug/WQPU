@@ -5,7 +5,8 @@ This module is intentionally separate from the legacy mesh. For a v3 public netw
 - publishes the deterministic network UID;
 - signs short-lived load/capacity status with the node TLS private key;
 - verifies received status against the worker TLS fingerprint registered on-chain;
-- signs control/dial/accept transport hellos for relay-side Registry authentication.
+- signs control/dial/accept transport hellos for relay-side Registry authentication;
+- sends signed status heartbeats over existing outbound relay control connections.
 
 Legacy/v1/v2 networks without a network_uid keep the existing transport behavior.
 """
@@ -82,6 +83,7 @@ def install(cls):
 
     original_my_info = cls.my_info
     original_merge_nodes = cls.merge_nodes
+    original_broadcast_nodes = cls.broadcast_nodes
 
     def my_info(self):
         info = dict(original_my_info(self))
@@ -90,8 +92,6 @@ def install(cls):
             return info
         info["network"] = PUBLIC_PROTOCOL
         info["network_uid"] = uid
-        # The signed body includes node_id/wallet/load/capacity and therefore makes
-        # tampering with scheduler inputs fail closed at the requester.
         info["status_attestation"] = build_status_attestation(info)
         return info
 
@@ -115,6 +115,23 @@ def install(cls):
                 accepted.append(node)
             nodes = accepted
         return original_merge_nodes(self, route_key, nodes)
+
+    async def broadcast_nodes(self):
+        await original_broadcast_nodes(self)
+        if not _network_uid(self):
+            return
+        info = self.my_info()
+        msg = {
+            "type": "open",
+            "service": "status",
+            "source": self.me,
+            "info": info,
+        }
+        for ctrl in list(self.outbound.values()):
+            try:
+                await self.send(ctrl, msg)
+            except Exception:
+                pass
 
     async def connect_control(self, peer):
         host, port = peer["host"], int(peer.get("port", wqpu.PORT))
@@ -198,6 +215,7 @@ def install(cls):
 
     cls.my_info = my_info
     cls.merge_nodes = merge_nodes
+    cls.broadcast_nodes = broadcast_nodes
     cls.connect_control = connect_control
     cls.open_accept = open_accept
     cls.open_rpc = open_rpc
