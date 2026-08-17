@@ -89,6 +89,37 @@ def _hub_for_route(mesh, route_key):
     return None
 
 
+def _dispatch_open(mesh, message, via):
+    """Run one long-lived control service without blocking the control reader.
+
+    Real llama.cpp may open several RPC sockets to one provider at the same time. Awaiting
+    the first `service=rpc` handler in the relay control loop creates head-of-line blocking:
+    subsequent `open` messages cannot be read until the first model RPC socket closes.
+    Keep a task reference for observability/cleanup, but let the control loop immediately
+    continue reading the next authenticated message.
+    """
+    async def runner():
+        try:
+            await mesh.handle_open_request(message, via=via)
+        except Exception:
+            # The service owns its stream-level failure semantics. A failed RPC/payment/
+            # status service must not tear down the authenticated control channel.
+            pass
+
+    task = asyncio.ensure_future(runner())
+    pending = getattr(mesh, "_wqpu_control_service_tasks", None)
+    if pending is None:
+        pending = set()
+        mesh._wqpu_control_service_tasks = pending
+    pending.add(task)
+
+    def done(_task):
+        pending.discard(_task)
+
+    task.add_done_callback(done)
+    return task
+
+
 def install(cls):
     """Patch one public ChainMesh class once."""
     # Public security and accounting must travel together: real llama.cpp opens several
@@ -196,7 +227,7 @@ def install(cls):
                     if msg.get("type") == "nodes":
                         self.merge_nodes(key, msg.get("nodes") or [])
                     elif msg.get("type") == "open":
-                        await self.handle_open_request(msg, via=peer)
+                        _dispatch_open(self, msg, peer)
                     elif msg.get("type") == "pong":
                         pass
             finally:
