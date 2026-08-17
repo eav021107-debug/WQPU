@@ -23,6 +23,9 @@ contract WQPUComputeMarket {
     bytes32 private constant VOUCHER_TYPEHASH = keccak256(
         "Voucher(bytes32 channelId,uint256 cumulativeAmount,uint256 cumulativeUnits)"
     );
+    bytes32 private constant SESSION_TYPEHASH = keccak256(
+        "SessionAuthorization(address requester,address sessionKey,bytes32 sessionId,uint128 maxAmount,uint64 validUntil)"
+    );
     bytes32 private constant NAME_HASH = keccak256("WQPU Compute Market");
     bytes32 private constant VERSION_HASH = keccak256("1");
 
@@ -34,6 +37,8 @@ contract WQPUComputeMarket {
     bytes32 public immutable DOMAIN_SEPARATOR;
 
     mapping(address => uint256) public nonces;
+    mapping(address => mapping(bytes32 => uint128)) public sessionSpent;
+    mapping(address => mapping(bytes32 => bool)) public revokedSessions;
 
     struct Channel {
         address requester;
@@ -64,6 +69,14 @@ contract WQPUComputeMarket {
         uint256 cumulativePaid,
         uint256 cumulativeUnits
     );
+    event SessionClaimed(
+        bytes32 indexed sessionId,
+        address indexed requester,
+        address indexed sessionKey,
+        uint256 paidNow,
+        uint256 sessionSpent
+    );
+    event SessionRevoked(address indexed requester, bytes32 indexed sessionId);
     event ChannelRefunded(bytes32 indexed channelId, address indexed requester, uint256 amount);
 
     constructor(address tokenAddress, address registryAddress) {
@@ -139,10 +152,8 @@ contract WQPUComputeMarket {
         return (cumulativeUnits * uint256(channel.pricePerMillionUnits)) / PRICE_UNITS;
     }
 
-    /// @notice Claim the newest cumulative voucher signed by the requester.
-    /// @dev Anyone may relay a valid claim. Funds always go to the channel provider.
-    ///      This lets WQPU nodes stay non-custodial: the provider wallet key is not needed
-    ///      by the node merely to submit a claim transaction.
+    /// @notice Claim a voucher signed directly by the requester wallet.
+    /// @dev Anyone may relay the transaction; payout always goes to channel.provider.
     function claim(
         bytes32 channelId,
         uint256 cumulativeAmount,
@@ -150,30 +161,61 @@ contract WQPUComputeMarket {
         bytes calldata signature
     ) external {
         Channel storage channel = channels[channelId];
-        require(channel.provider != address(0), "unknown channel");
-        require(!channel.refunded, "refunded");
-        require(block.timestamp <= uint256(channel.expiresAt) + CLAIM_GRACE, "claim closed");
-        require(cumulativeUnits >= channel.cumulativeUnits, "units decreased");
-        require(cumulativeUnits <= type(uint128).max, "units too large");
-        require(cumulativeAmount == amountForUnits(channelId, cumulativeUnits), "wrong network price");
-        require(cumulativeAmount <= channel.deposited, "over deposit");
-        require(cumulativeAmount > channel.paid, "nothing new");
-
+        require(channel.requester != address(0), "unknown channel");
         bytes32 digest = voucherDigest(channelId, cumulativeAmount, cumulativeUnits);
         require(_recover(digest, signature) == channel.requester, "bad voucher");
+        _settle(channelId, cumulativeAmount, cumulativeUnits);
+    }
 
-        uint256 delta = cumulativeAmount - channel.paid;
-        channel.paid = uint128(cumulativeAmount);
-        channel.cumulativeUnits = uint128(cumulativeUnits);
+    /// @notice Claim a voucher signed by a bounded local session key.
+    /// @dev The requester wallet signs SessionAuthorization once. The local session key can
+    ///      then sign vouchers until validUntil or maxAmount is reached. No wallet private key
+    ///      is stored by WQPU and no wallet popup is required for each voucher.
+    function claimWithSession(
+        bytes32 channelId,
+        uint256 cumulativeAmount,
+        uint256 cumulativeUnits,
+        bytes calldata voucherSignature,
+        address sessionKey,
+        bytes32 sessionId,
+        uint128 maxAmount,
+        uint64 validUntil,
+        bytes calldata authorizationSignature
+    ) external {
+        Channel storage channel = channels[channelId];
+        require(channel.requester != address(0), "unknown channel");
+        require(sessionKey != address(0), "zero session key");
+        require(maxAmount != 0, "zero session limit");
+        require(block.timestamp <= validUntil, "session expired");
+        require(!revokedSessions[channel.requester][sessionId], "session revoked");
 
-        require(token.transfer(channel.provider, delta), "payment failed");
-        emit VoucherClaimed(
-            channelId,
-            channel.provider,
-            delta,
-            cumulativeAmount,
-            cumulativeUnits
+        bytes32 authDigest = sessionAuthorizationDigest(
+            channel.requester,
+            sessionKey,
+            sessionId,
+            maxAmount,
+            validUntil
         );
+        require(_recover(authDigest, authorizationSignature) == channel.requester, "bad session auth");
+
+        bytes32 voucher = voucherDigest(channelId, cumulativeAmount, cumulativeUnits);
+        require(_recover(voucher, voucherSignature) == sessionKey, "bad session voucher");
+
+        uint256 previousPaid = channel.paid;
+        uint256 delta = _settle(channelId, cumulativeAmount, cumulativeUnits);
+        require(delta == cumulativeAmount - previousPaid, "bad delta");
+
+        uint256 spent = uint256(sessionSpent[channel.requester][sessionId]) + delta;
+        require(spent <= maxAmount, "session limit");
+        require(spent <= type(uint128).max, "session spend overflow");
+        sessionSpent[channel.requester][sessionId] = uint128(spent);
+
+        emit SessionClaimed(sessionId, channel.requester, sessionKey, delta, spent);
+    }
+
+    function revokeSession(bytes32 sessionId) external {
+        revokedSessions[msg.sender][sessionId] = true;
+        emit SessionRevoked(msg.sender, sessionId);
     }
 
     function refundExpired(bytes32 channelId) external {
@@ -199,6 +241,55 @@ contract WQPUComputeMarket {
             abi.encode(VOUCHER_TYPEHASH, channelId, cumulativeAmount, cumulativeUnits)
         );
         return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+    }
+
+    function sessionAuthorizationDigest(
+        address requester,
+        address sessionKey,
+        bytes32 sessionId,
+        uint128 maxAmount,
+        uint64 validUntil
+    ) public view returns (bytes32) {
+        bytes32 structHash = keccak256(
+            abi.encode(
+                SESSION_TYPEHASH,
+                requester,
+                sessionKey,
+                sessionId,
+                maxAmount,
+                validUntil
+            )
+        );
+        return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+    }
+
+    function _settle(
+        bytes32 channelId,
+        uint256 cumulativeAmount,
+        uint256 cumulativeUnits
+    ) internal returns (uint256 delta) {
+        Channel storage channel = channels[channelId];
+        require(channel.provider != address(0), "unknown channel");
+        require(!channel.refunded, "refunded");
+        require(block.timestamp <= uint256(channel.expiresAt) + CLAIM_GRACE, "claim closed");
+        require(cumulativeUnits >= channel.cumulativeUnits, "units decreased");
+        require(cumulativeUnits <= type(uint128).max, "units too large");
+        require(cumulativeAmount == amountForUnits(channelId, cumulativeUnits), "wrong network price");
+        require(cumulativeAmount <= channel.deposited, "over deposit");
+        require(cumulativeAmount > channel.paid, "nothing new");
+
+        delta = cumulativeAmount - channel.paid;
+        channel.paid = uint128(cumulativeAmount);
+        channel.cumulativeUnits = uint128(cumulativeUnits);
+
+        require(token.transfer(channel.provider, delta), "payment failed");
+        emit VoucherClaimed(
+            channelId,
+            channel.provider,
+            delta,
+            cumulativeAmount,
+            cumulativeUnits
+        );
     }
 
     function _recover(bytes32 digest, bytes calldata signature) internal pure returns (address) {
