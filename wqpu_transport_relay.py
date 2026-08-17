@@ -163,6 +163,24 @@ def _install_network_uid_transport_guard():
 class TransportRelayMesh(wqpu.Mesh):
     async def handle_open_request(self, msg, via=None):
         service = str(msg.get("service") or "")
+        if service == "status":
+            source = str(msg.get("source") or "")
+            info = msg.get("info")
+            if not source or source == self.me or not isinstance(info, dict):
+                return
+            snapshot = dict(info)
+            snapshot["node_id"] = source
+            forwarded = {"type": "nodes", "nodes": [snapshot]}
+            # The relay does not trust scheduler fields itself; every requester verifies
+            # the TLS-signed snapshot against the on-chain Registry before accepting it.
+            for node_id, ctrl in list(self.controls.items()):
+                if node_id == source:
+                    continue
+                try:
+                    await self.send(ctrl, forwarded)
+                except Exception:
+                    pass
+            return
         if service in FORWARDED_SERVICES:
             target = str(msg.get("target") or "")
             if not target or target == self.me:
