@@ -21,6 +21,25 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Runtime version
         run: python wqpu_runtime.py --version
+      - name: Validate published network JSON
+        run: python -c "import json; json.load(open('network-config.json'))"
+
+  installers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate POSIX installer syntax
+        run: sh -n install.sh
+      - name: Validate PowerShell installer syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'install.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
 
   solidity:
     runs-on: ubuntu-latest
