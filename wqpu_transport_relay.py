@@ -18,9 +18,15 @@ import asyncio
 import json
 import os
 import signal
+from pathlib import Path
 
 import wqpu
-from wqpu_chain import load_network_config, normalize_chain_id
+from wqpu_chain import (
+    RegistryClient,
+    compute_network_uid,
+    load_network_config,
+    normalize_chain_id,
+)
 from wqpu_node_identity import RegistryIdentityVerifier
 from wqpu_runtime import public_secret
 
@@ -58,11 +64,51 @@ class _ReplayReader(object):
         return getattr(self.reader, name)
 
 
+def _raw_operator_network():
+    """Read generated operator config even before client-side v3 normalization exists."""
+    candidates = []
+    explicit = str(os.environ.get("WQPU_NETWORK_CONFIG") or "").strip()
+    if explicit:
+        candidates.append(Path(explicit).expanduser())
+    home = str(os.environ.get("WQPU_HOME") or "").strip()
+    if home:
+        candidates.append(Path(home).expanduser().parent / "network-config.json")
+    for path in candidates:
+        try:
+            root = json.loads(path.read_text())
+            public = root.get("public") if isinstance(root, dict) else None
+            if isinstance(public, dict) and public.get("enabled"):
+                return dict(public)
+        except Exception:
+            continue
+    try:
+        return dict(load_network_config())
+    except Exception:
+        return {}
+
+
+def _network_uid(public):
+    explicit = str((public or {}).get("network_uid") or "").strip().lower()
+    if explicit:
+        return explicit
+    try:
+        return compute_network_uid(
+            public.get("chain_id"), public.get("token"),
+            public.get("registry"), public.get("market")
+        )
+    except Exception:
+        return ""
+
+
 def registry_identity_verifier(network_uid):
     uid = str(network_uid or "").strip().lower()
     verifier = _IDENTITY_VERIFIERS.get(uid)
     if verifier is None:
-        verifier = RegistryIdentityVerifier(uid)
+        public = _raw_operator_network()
+        rpc_url = str(os.environ.get("WQPU_RPC_URL") or public.get("rpc_url") or "").strip()
+        registry = str(os.environ.get("WQPU_REGISTRY") or public.get("registry") or "").strip()
+        client = RegistryClient(rpc_url=rpc_url, registry=registry) if rpc_url and registry else None
+        verifier = RegistryIdentityVerifier(uid, client=client)
         _IDENTITY_VERIFIERS[uid] = verifier
     return verifier
 
@@ -71,11 +117,7 @@ def expected_network_uid():
     explicit = str(os.environ.get("WQPU_NETWORK_UID") or "").strip().lower()
     if explicit:
         return explicit
-    try:
-        network = load_network_config()
-        return str(network.get("network_uid") or "").strip().lower()
-    except Exception:
-        return ""
+    return _network_uid(_raw_operator_network())
 
 
 async def _reject_transport(writer, message):
@@ -134,7 +176,7 @@ class TransportRelayMesh(wqpu.Mesh):
 
 
 def relay_network():
-    network = load_network_config()
+    network = _raw_operator_network()
     chain_id = os.environ.get("WQPU_CHAIN_ID") or network.get("chain_id")
     registry = os.environ.get("WQPU_REGISTRY") or network.get("registry")
     if chain_id in (None, "") or not registry:
