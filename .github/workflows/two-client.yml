@@ -1,0 +1,70 @@
+name: WQPU two-client relay
+
+on:
+  push:
+    paths:
+      - 'wqpu.py'
+      - 'wqpu_chain.py'
+      - 'wqpu_runtime.py'
+      - 'wqpu_network_guard.py'
+      - 'wqpu_node_identity.py'
+      - 'wqpu_node_status.py'
+      - 'wqpu_public_config.py'
+      - 'wqpu_public_security.py'
+      - 'wqpu_transport_relay.py'
+      - 'scripts/testnet_stack.py'
+      - 'scripts/testnet_doctor.py'
+      - 'scripts/check_two_client_relay.py'
+      - '.github/workflows/two-client.yml'
+  pull_request:
+    paths:
+      - 'wqpu.py'
+      - 'wqpu_chain.py'
+      - 'wqpu_runtime.py'
+      - 'wqpu_network_guard.py'
+      - 'wqpu_node_identity.py'
+      - 'wqpu_node_status.py'
+      - 'wqpu_public_config.py'
+      - 'wqpu_public_security.py'
+      - 'wqpu_transport_relay.py'
+      - 'scripts/testnet_stack.py'
+      - 'scripts/testnet_doctor.py'
+      - 'scripts/check_two_client_relay.py'
+      - '.github/workflows/two-client.yml'
+
+jobs:
+  two-client-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Compile two-client path
+        run: >-
+          python -m py_compile
+          wqpu.py wqpu_chain.py wqpu_runtime.py wqpu_network_guard.py
+          wqpu_node_identity.py wqpu_node_status.py wqpu_public_config.py
+          wqpu_public_security.py wqpu_transport_relay.py
+          scripts/testnet_stack.py scripts/testnet_doctor.py scripts/check_two_client_relay.py
+      - name: Start isolated operator stack
+        shell: bash
+        run: |
+          unset RUNNER_TRACKING_ID
+          python scripts/testnet_stack.py reset --yes
+          python scripts/testnet_stack.py start \
+            --public-host 127.0.0.1 \
+            --internal-rpc-port 30546 \
+            --rpc-port 20545 \
+            --relayer-port 20787 \
+            --relay-port 20443
+      - name: Two distinct wallets and TLS identities through relay
+        run: python scripts/check_two_client_relay.py
+      - name: Operator remains healthy
+        run: python scripts/testnet_doctor.py
+      - name: Stop operator stack
+        if: always()
+        run: python scripts/testnet_stack.py stop || true
