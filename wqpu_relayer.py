@@ -37,6 +37,7 @@ MAX_BODY = 64 * 1024
 DEFAULT_RATE = 30
 WINDOW_SECONDS = 60
 TRANSFER_SELECTOR = "a9059cbb"
+BALANCE_OF_SELECTOR = "70a08231"
 
 
 class RelayerError(RuntimeError):
@@ -71,6 +72,20 @@ def _normalize_private_key(value):
     if int(value, 16) == 0:
         raise RelayerError("invalid relayer private key")
     return value
+
+
+def top_up_amount(target, current):
+    target = max(0, int(target))
+    current = max(0, int(current))
+    return max(0, target - current)
+
+
+def _hex_uint(value):
+    value = str(value or "0x0")
+    try:
+        return int(value, 16) if value.startswith("0x") else int(value)
+    except Exception:
+        raise RelayerError("invalid uint result from RPC")
 
 
 def sender_from_private_key(private_key):
@@ -146,8 +161,10 @@ class Relayer(object):
         self.sender = normalize_address(sender) if sender else configured_sender(self.client, self.private_key)
         self.token = configured_token(self.client)
         self.faucet_enabled = os.environ.get("WQPU_TESTNET_FAUCET", "0") == "1"
-        self.faucet_native_wei = int(os.environ.get("WQPU_FAUCET_NATIVE_WEI", str(2 * 10 ** 18)))
-        self.faucet_token_wei = int(os.environ.get("WQPU_FAUCET_TOKEN_WEI", str(1000 * 10 ** 18)))
+        old_native = os.environ.get("WQPU_FAUCET_NATIVE_WEI", str(2 * 10 ** 18))
+        old_token = os.environ.get("WQPU_FAUCET_TOKEN_WEI", str(1000 * 10 ** 18))
+        self.faucet_native_target = int(os.environ.get("WQPU_FAUCET_NATIVE_TARGET_WEI", old_native))
+        self.faucet_token_target = int(os.environ.get("WQPU_FAUCET_TOKEN_TARGET_WEI", old_token))
         self.faucet_interval = int(os.environ.get("WQPU_FAUCET_INTERVAL", "3600"))
         self._faucet_last = {}
         self._faucet_lock = threading.Lock()
@@ -197,6 +214,15 @@ class Relayer(object):
             raise RelayerError("bad relayer transaction hash")
         return tx_hash
 
+    def _native_balance(self, wallet):
+        return _hex_uint(self.client.rpc("eth_getBalance", [wallet, "latest"]))
+
+    def _token_balance(self, wallet):
+        if not self.token:
+            return 0
+        data = "0x" + BALANCE_OF_SELECTOR + wallet[2:].rjust(64, "0")
+        return _hex_uint(self.client.rpc("eth_call", [{"to": self.token, "data": data}, "latest"]))
+
     def submit(self, body):
         if not isinstance(body, dict):
             raise RelayerError("JSON object required")
@@ -227,19 +253,33 @@ class Relayer(object):
             last = float(self._faucet_last.get(wallet) or 0)
             if last and now - last < self.faucet_interval:
                 return {"wallet": wallet, "already_funded": True, "transactions": []}
+            # Reserve the cooldown immediately so concurrent requests for one wallet cannot
+            # race and each send a full top-up. Roll it back if a transaction fails.
             self._faucet_last[wallet] = now
         txs = []
         try:
-            if self.faucet_native_wei > 0:
-                txs.append(self._send(wallet, "0x", self.faucet_native_wei))
-            if self.token and self.faucet_token_wei > 0:
-                data = "0x" + TRANSFER_SELECTOR + wallet[2:].rjust(64, "0") + "{:064x}".format(self.faucet_token_wei)
+            native_before = self._native_balance(wallet)
+            token_before = self._token_balance(wallet) if self.token else 0
+            native_needed = top_up_amount(self.faucet_native_target, native_before)
+            token_needed = top_up_amount(self.faucet_token_target, token_before) if self.token else 0
+            if native_needed > 0:
+                txs.append(self._send(wallet, "0x", native_needed))
+            if self.token and token_needed > 0:
+                data = "0x" + TRANSFER_SELECTOR + wallet[2:].rjust(64, "0") + "{:064x}".format(token_needed)
                 txs.append(self._send(self.token, data, 0))
         except Exception:
             with self._faucet_lock:
                 self._faucet_last.pop(wallet, None)
             raise
-        return {"wallet": wallet, "already_funded": False, "transactions": txs}
+        return {
+            "wallet": wallet,
+            "already_funded": not bool(txs),
+            "transactions": txs,
+            "native_before": native_before,
+            "native_target": self.faucet_native_target,
+            "token_before": token_before,
+            "token_target": self.faucet_token_target if self.token else 0,
+        }
 
 
 class RelayerHTTPServer(ThreadingHTTPServer):
@@ -253,7 +293,7 @@ class RelayerHTTPServer(ThreadingHTTPServer):
 
 
 class RelayerHandler(BaseHTTPRequestHandler):
-    server_version = "WQPURelayer/0.8"
+    server_version = "WQPURelayer/0.9"
 
     def log_message(self, fmt, *args):
         if os.environ.get("WQPU_RELAYER_QUIET", "0") != "1":
