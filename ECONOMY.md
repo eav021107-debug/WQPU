@@ -1,101 +1,78 @@
-# WQPU compute economy prototype
+# WQPU compute economy
 
-This document defines the first economic layer for WQPU. It is deliberately separate from the current networking core until the two-peer transport is stable.
-
-## Goal
-
-A user should eventually do only this:
+## Target UX
 
 ```text
-install WQPU -> connect wallet -> wqpu>
+install WQPU -> connect existing wallet -> node appears in WQPU registry -> wqpu>
 ```
 
-No WQPU account database and no privileged WQPU server are required.
+WQPU never asks for a seed phrase or private key. The browser wallet submits transactions and signs payment vouchers.
 
-## Identity
+## What the blockchain does
 
-The wallet address is the public identity of a WQPU participant.
+The chain is a shared discovery/accounting layer only. Prompts, model tensors and llama.cpp RPC traffic stay off-chain and move directly between WQPU peers.
 
-WQPU must never ask for a seed phrase or private key. Wallet ownership is proven by signing messages in the wallet. Compute vouchers use EIP-712 typed signatures so the wallet can show structured data instead of an opaque private-key operation.
+`WQPURegistry.sol` publishes:
 
-## Discovery
-
-`WQPURegistry.sol` is a permissionless public directory.
-
-Every participant may publish:
-
-- wallet address (implicitly `msg.sender`);
+- wallet identity (`msg.sender`);
 - reachable P2P endpoint;
-- asking price per million compute units;
-- currently offered capacity.
+- TLS certificate fingerprint;
+- offered capacity;
+- coarse load/heartbeat;
+- one global WQPU compute price.
 
-There is no privileged registry operator. A newly installed client can read the same registry state as every other client and then connect directly to peers.
+The runtime supplements the coarse on-chain load with fresher P2P load snapshots and prefers less-busy workers.
 
-The blockchain is only a shared discovery/accounting layer. LLM tensors and prompts must continue to move directly through the WQPU P2P network, not through the blockchain.
+## One network price
+
+All users use the same compute price. Providers do not set independent prices.
+
+`WQPURegistry.globalPricePerMillionUnits` is the network price. A payment channel snapshots that value when it opens, so a price update cannot change the cost of work already in progress.
+
+The prototype currently has a `priceController`. On a production WQPU chain that authority must be transferred to the chosen chain-governance mechanism; it must not remain a privileged application server.
 
 ## Token
 
-`WQPUToken.sol` is a fixed-supply ERC-20 prototype.
-
-There is no post-deployment mint function. Therefore fake requests cannot manufacture new WQPU. Payment moves existing WQPU from requesters to providers.
-
-Initial distribution is intentionally not fixed in the protocol yet. The constructor receives an initial holder so test deployments can choose a test treasury, DAO, faucet, or other distribution mechanism without changing the token code.
-
-## Price
-
-There is no central price setter.
-
-Each compute provider publishes an asking price. A requester can choose cheaper providers first, subject to latency, model compatibility, capacity and reputation.
-
-That creates the desired feedback loop:
-
-```text
-high demand + little free compute
-        -> providers can ask more
-        -> contributing compute becomes more attractive
-        -> more compute appears
-        -> competition pushes prices down
-```
-
-The external fiat/exchange price of WQPU is separate from the internal compute price and, if a market exists, is determined by that market.
+`WQPUToken.sol` is fixed supply. There is no post-deployment mint function. Compute rewards transfer already-existing WQPU from requesters to providers; fake requests cannot mint new WQPU.
 
 ## Payment channels
 
-Putting every token-generation step on-chain would be too slow and expensive for inference. `WQPUComputeMarket.sol` therefore uses escrowed payment channels:
+`WQPUComputeMarket.sol` uses escrowed cumulative vouchers:
 
-1. requester selects a provider;
-2. requester deposits WQPU into a channel;
-3. provider performs small pieces of work;
-4. requester signs increasing cumulative EIP-712 vouchers;
-5. provider periodically claims the newest voucher on-chain;
-6. unused deposit can be refunded after channel expiry plus a claim grace period.
+1. requester chooses a provider;
+2. requester opens a channel and deposits WQPU;
+3. the channel snapshots the current global price;
+4. provider performs metered work;
+5. requester signs cumulative EIP-712 vouchers;
+6. contract accepts a voucher only when its amount exactly matches the channel price and cumulative compute units;
+7. provider claims the newest voucher;
+8. unused deposit is refundable after expiry plus the claim grace period.
 
-A voucher contains cumulative payment and cumulative compute units. Replaying an old voucher cannot reduce the amount already paid.
-
-A requester sending work to their own machines does not create tokens: it only moves already-existing tokens.
+Old vouchers cannot reduce already-paid amounts, and a voucher with a different price is rejected.
 
 ## Compute units
 
-The smart contract intentionally does not define how compute is measured. That belongs to the WQPU transport/runtime layer.
+The contracts intentionally do not decide how llama.cpp work is measured. The runtime must measure useful work consistently enough that a requester can produce a cumulative voucher for each provider.
 
-The production protocol must pay for verifiable useful work, not simply for "number of requests". Otherwise fake/self-generated requests would be an obvious farming attack.
+This metering layer is the next economic-runtime milestone. Until it is implemented and adversarially tested, the contracts are test-network prototypes and should not hold real-value funds.
 
-The next runtime milestone is a metering protocol that attributes actual llama.cpp RPC work to each peer and produces signed cumulative vouchers while a request is running.
+## Runtime integration status
 
-Until that metering is implemented and audited, this economic layer is a prototype and must not be used with real-value funds.
+Implemented in the `agent/blockchain-runtime` prototype:
 
-## Contracts
+- browser wallet connector without private-key custody;
+- on-chain node discovery at startup;
+- TLS fingerprint binding;
+- one global price;
+- live P2P load ranking;
+- multiple reachable workers can participate in one llama.cpp request;
+- legacy private join-code mode remains available.
 
-- `contracts/WQPUToken.sol` — fixed-supply token.
-- `contracts/WQPURegistry.sol` — permissionless peer/price/capacity directory.
-- `contracts/WQPUComputeMarket.sol` — escrow + cumulative signed compute vouchers.
+Still required before a real public launch:
 
-## Integration order
-
-1. Stabilize two-peer WQPU networking.
-2. Deploy contracts to an EVM test network.
-3. Add browser wallet connection to the CLI; never accept seed phrases.
-4. Read peer discovery from `WQPURegistry` automatically at startup.
-5. Add provider bids and automatic provider selection.
-6. Add runtime compute metering and EIP-712 vouchers.
-7. Test adversarial cases before any main-network deployment.
+- deploy token/registry/market to the chosen WQPU EVM chain or test network;
+- publish the chain RPC + contract addresses as the default network configuration;
+- automatic NAT traversal / relay policy for nodes that cannot accept inbound Internet connections;
+- per-provider compute metering;
+- requester EIP-712 voucher generation and provider claiming;
+- adversarial/security testing and contract audit.
