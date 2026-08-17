@@ -59,6 +59,34 @@ def capacity_units():
 
 
 def system_load_bps():
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class FILETIME(ctypes.Structure):
+                _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+            def value(ft):
+                return (int(ft.high) << 32) | int(ft.low)
+
+            def sample():
+                idle, kernel, user = FILETIME(), FILETIME(), FILETIME()
+                ok = ctypes.windll.kernel32.GetSystemTimes(
+                    ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+                )
+                if not ok:
+                    raise OSError("GetSystemTimes failed")
+                return value(idle), value(kernel), value(user)
+
+            a = sample()
+            time.sleep(0.05)
+            b = sample()
+            idle = b[0] - a[0]
+            total = (b[1] - a[1]) + (b[2] - a[2])
+            if total > 0:
+                return max(0, min(10000, int(((total - idle) * 10000) / total)))
+        except Exception:
+            return 0
     try:
         load = os.getloadavg()[0]
         cpus = max(1, os.cpu_count() or 1)
@@ -95,6 +123,8 @@ class ChainMesh(wqpu.Mesh):
         self.wallet = (wallet or "").lower()
         self.chain_price = None
         self.chain_nodes = {}
+        self.chain_peers = {}
+        self.verified_node_ids = set()
 
     def my_info(self):
         info = super(ChainMesh, self).my_info()
@@ -107,8 +137,8 @@ class ChainMesh(wqpu.Mesh):
         return info
 
     def merge_chain_nodes(self, nodes):
-        cache = wqpu.load_peer_cache()
         found = {}
+        peers_by_key = {}
         for node in nodes:
             wallet = str(node.get("wallet") or "").lower()
             if not wallet or wallet == self.wallet:
@@ -118,17 +148,23 @@ class ChainMesh(wqpu.Mesh):
             except Exception:
                 continue
             key = wqpu.peer_key(peer["host"], peer["port"])
-            cache[key] = {
-                "host": peer["host"],
-                "port": peer["port"],
-                "fingerprint": peer["fingerprint"],
-                "wallet": wallet,
-                "capacity": peer["capacity"],
-                "load_bps": peer["load_bps"],
-            }
+            peers_by_key[key] = peer
             found[wallet] = peer
         self.chain_nodes = found
-        wqpu.save_peer_cache(cache)
+        self.chain_peers = peers_by_key
+
+    def merge_nodes(self, route_key, nodes):
+        candidate = self.chain_peers.get(route_key)
+        if candidate:
+            expected_wallet = str(candidate.get("wallet") or "").lower()
+            expected_fp = str(candidate.get("fingerprint") or "").lower().replace("0x", "")
+            for node in nodes:
+                wallet = str(node.get("wallet") or "").lower()
+                fp = str(node.get("fingerprint") or "").lower().replace("0x", "")
+                nid = str(node.get("node_id") or "")
+                if nid and wallet == expected_wallet and fp == expected_fp:
+                    self.verified_node_ids.add(nid)
+        super(ChainMesh, self).merge_nodes(route_key, nodes)
 
     async def refresh_chain(self):
         try:
@@ -144,11 +180,7 @@ class ChainMesh(wqpu.Mesh):
             if tick % 4 == 0:
                 await self.refresh_chain()
 
-            candidates = {}
-            for p in self.cfg.get("peers") or []:
-                if p.get("host"):
-                    candidates[wqpu.peer_key(p["host"], p.get("port", wqpu.PORT))] = p
-            candidates.update(wqpu.load_peer_cache())
+            candidates = dict(self.chain_peers)
 
             for key, peer in list(candidates.items()):
                 if key in self.outbound:
@@ -172,7 +204,7 @@ class ChainMesh(wqpu.Mesh):
             await asyncio.sleep(5)
 
     def peers(self):
-        peers = super(ChainMesh, self).peers()
+        peers = [item for item in super(ChainMesh, self).peers() if item[0] in self.verified_node_ids]
 
         def rank(item):
             _, info = item
