@@ -7,6 +7,7 @@ on:
       - 'up.sh'
       - 'bootstrap-rpcs.txt'
       - 'bootstrap-p2p.txt'
+      - 'chain-checkpoint.txt'
       - 'network.sh'
       - 'chain/devnet.sh'
       - 'chain/devnet_config.py'
@@ -65,6 +66,8 @@ jobs:
           ! grep -Eq 'WQPU_CHAIN_DISCOVER|255\.255\.255\.255|start_lan_beacon|find_lan_rpc' ./up.sh
           grep -Fq 'BOOTSTRAP_CACHE' ./up.sh
           grep -Fq 'bootstrap-p2p.txt' ./up.sh
+          grep -Fq 'chain-checkpoint.txt' ./up.sh
+          grep -Fq 'load_chain_checkpoint' ./up.sh
           grep -Fq 'WQPU_DEV_LOCAL_FALLBACK' ./up.sh
           grep -Fq 'wqpu-rpc-verify' ./up.sh
 
@@ -74,10 +77,11 @@ jobs:
           cd chain
           python3 -m unittest test_p2p_config.py test_node_id.py
 
-      - name: Build strict bootstrap verifier
+      - name: Test strict bootstrap verifier
         shell: bash
         run: |
           cd client
+          GOWORK=off go test -mod=mod ./cmd/wqpu-rpc-verify
           GOWORK=off go build -mod=mod ./cmd/wqpu-rpc-verify
 
       - name: Run shared-chain blockchain-registry distributed inference proof
