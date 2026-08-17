@@ -6,45 +6,48 @@ REF="${WQPU_REF:-next-foundation}"
 BASE="${WQPU_NETWORK_HOME:-$HOME/.local/share/wqpu-network}"
 SOURCE_DIR="${WQPU_SOURCE_DIR:-$BASE/source}"
 GO_VERSION="1.25.9"
-HOST_PID=""
+DISCOVERY_PORT=37117
+CHAIN_PID=""
+NODE_PID=""
+BEACON_PID=""
 
 say() { printf '%s\n' "$*"; }
 fail() { printf 'WQPU UP: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || fail "requires '$1'"; }
 
 cleanup() {
-  if [ -n "$HOST_PID" ]; then
-    kill "$HOST_PID" 2>/dev/null || true
-    wait "$HOST_PID" 2>/dev/null || true
-  fi
+  for pid in "$BEACON_PID" "$NODE_PID" "$CHAIN_PID"; do
+    if [ -n "$pid" ]; then kill "$pid" 2>/dev/null || true; fi
+  done
+  for pid in "$BEACON_PID" "$NODE_PID" "$CHAIN_PID"; do
+    if [ -n "$pid" ]; then wait "$pid" 2>/dev/null || true; fi
+  done
 }
 trap cleanup EXIT INT TERM
 
 usage() {
   cat <<'EOF'
-One-command WQPU physical-machine startup
+WQPU one-command physical-machine devnet
 
-Run the SAME command on every machine, starting with the bootstrap machine:
-  curl -fsSL RAW_UP_SH_URL | bash -s -- BOOTSTRAP_IP
+Run the SAME command on every Linux/macOS machine:
+  curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/next-foundation/up.sh | bash
 
-The machine that owns BOOTSTRAP_IP becomes the shared devnet host. Every other
-machine waits for it, chooses a free compute slot, registers on-chain and starts
-its compute node. When the second provider appears, the host automatically runs
-a distributed inference proof across the two physical providers.
+No host/join role, peer IP or compute slot is supplied by the user.
+The client first locates the WQPU blockchain. Compute peers are then enumerated
+only from the WQPU on-chain registry (peerCount/peerAt/provider records).
 
-This devnet mode is for a private LAN/VPN. Do not expose ports 8545 or 17443-17450
-directly to the public Internet.
+For development only: if no configured blockchain RPC is reachable, machines on
+the same LAN can use a small UDP bootstrap exchange to locate the chain itself.
+That UDP exchange never supplies compute peers. Provider discovery remains
+blockchain-only.
 EOF
 }
 
-[ "$#" -eq 1 ] || { usage >&2; exit 2; }
-BOOTSTRAP="$1"
-case "$BOOTSTRAP" in
-  ""|*[!A-Za-z0-9.-]*) fail "bootstrap must be an IPv4 address or DNS hostname" ;;
-esac
+[ "$#" -eq 0 ] || { usage >&2; exit 2; }
 
 need curl
 need tar
+need git
 need python3
 mkdir -p "$BASE"
 
@@ -120,119 +123,237 @@ mkdir -p "$stage"
 curl -fL --retry 3 "https://codeload.github.com/${REPO}/tar.gz/${REF}" -o "$archive"
 tar -xzf "$archive" -C "$stage" --strip-components=1
 rm -f "$archive"
-[ -f "$stage/network.sh" ] || fail "downloaded source is incomplete"
+[ -f "$stage/chain/devnet.sh" ] || fail "downloaded source is incomplete"
 rm -rf "$SOURCE_DIR"
 mv "$stage" "$SOURCE_DIR"
 
+say "WQPU UP: resolving Go dependencies..."
+(cd "$SOURCE_DIR/chain" && GOWORK=off go mod tidy && GOWORK=off go mod download all)
+(cd "$SOURCE_DIR/client" && GOWORK=off go mod tidy && GOWORK=off go mod download all)
+
 export WQPU_SOURCE_DIR="$SOURCE_DIR"
 export WQPU_USE_SYSTEM_GO=1
+export WQPU_CHAIN_SRC="${WQPU_CHAIN_SRC:-$BASE/chain-src/cosmos-evm}"
+export WQPU_CHAIN_BIN_DIR="${WQPU_CHAIN_BIN_DIR:-$BASE/chain-bin}"
+export WQPU_CHAIN_HOME="${WQPU_CHAIN_HOME:-$BASE/devnet-home}"
+export WQPU_RUNTIME_BASE="${WQPU_RUNTIME_BASE:-$BASE/llama-runtime}"
+mkdir -p "$WQPU_CHAIN_BIN_DIR" "$WQPU_RUNTIME_BASE"
 
 local_ip="${WQPU_ADVERTISE_IP:-}"
 if [ -z "$local_ip" ]; then
-  local_ip="$(python3 - "$BOOTSTRAP" <<'PY'
-import socket, sys
-host = sys.argv[1]
-s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+  local_ip="$(python3 - <<'PY'
+import socket
+candidates = [("1.1.1.1", 53), ("8.8.8.8", 53)]
+for target in candidates:
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(target)
+        ip = s.getsockname()[0]
+        if ip and not ip.startswith("127."):
+            print(ip)
+            raise SystemExit(0)
+    except OSError:
+        pass
+    finally:
+        s.close()
 try:
-    s.connect((host, 9))
-    print(s.getsockname()[0])
-finally:
-    s.close()
+    ip = socket.gethostbyname(socket.gethostname())
+    if ip and not ip.startswith("127."):
+        print(ip)
+        raise SystemExit(0)
+except OSError:
+    pass
+raise SystemExit(1)
 PY
-)"
+)" || fail "could not determine this machine IPv4 address"
 fi
 case "$local_ip" in
-  ""|*[!0-9.]*) fail "could not determine this machine IPv4 address; set WQPU_ADVERTISE_IP" ;;
+  ""|*[!0-9.]*) fail "invalid local IPv4 address: $local_ip" ;;
 esac
 
-bootstrap_ip="$(python3 - "$BOOTSTRAP" <<'PY'
-import socket, sys
-print(socket.gethostbyname(sys.argv[1]))
-PY
-)"
-rpc="http://$BOOTSTRAP:8545"
-
 rpc_ready() {
-  curl -fsS --connect-timeout 2 -H 'content-type: application/json' \
+  local candidate="$1"
+  curl -fsS --connect-timeout 2 --max-time 4 -H 'content-type: application/json' \
     --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
-    "$rpc" >/dev/null 2>&1
+    "$candidate" 2>/dev/null | python3 -c 'import json,sys; d=json.load(sys.stdin); int(d["result"],16)' >/dev/null 2>&1
 }
 
 wait_rpc() {
-  local i=0
-  while [ "$i" -lt 600 ]; do
-    if rpc_ready; then return 0; fi
+  local candidate="$1" pid="${2:-}" i=0
+  while [ "$i" -lt 900 ]; do
+    if rpc_ready "$candidate"; then return 0; fi
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+      cat "$BASE/devnet.log" >&2 2>/dev/null || true
+      fail "WQPU chain exited before becoming ready"
+    fi
     i=$((i + 1))
     sleep 1
   done
-  fail "bootstrap WQPU chain did not become reachable at $rpc"
+  fail "WQPU chain RPC did not become ready: $candidate"
 }
 
-is_bootstrap_machine=0
-if [ "${WQPU_FORCE_ROLE:-}" = "host" ]; then
-  is_bootstrap_machine=1
-elif [ "${WQPU_FORCE_ROLE:-}" = "join" ]; then
-  is_bootstrap_machine=0
-elif [ "$local_ip" = "$bootstrap_ip" ] || [ "$BOOTSTRAP" = "127.0.0.1" ] || [ "$BOOTSTRAP" = "localhost" ]; then
-  is_bootstrap_machine=1
-fi
+find_seed_rpc() {
+  local candidate line
+  if [ -n "${WQPU_CHAIN_RPC:-}" ] && rpc_ready "$WQPU_CHAIN_RPC"; then
+    printf '%s\n' "$WQPU_CHAIN_RPC"
+    return 0
+  fi
+  if [ -f "$SOURCE_DIR/bootstrap-rpcs.txt" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      line="${line%%#*}"
+      line="$(printf '%s' "$line" | tr -d '[:space:]')"
+      [ -n "$line" ] || continue
+      candidate="$line"
+      if rpc_ready "$candidate"; then
+        printf '%s\n' "$candidate"
+        return 0
+      fi
+    done < "$SOURCE_DIR/bootstrap-rpcs.txt"
+  fi
+  return 1
+}
+
+find_lan_rpc() {
+  python3 - "$DISCOVERY_PORT" <<'PY'
+import socket, sys, time
+port = int(sys.argv[1])
+message = b"WQPU_CHAIN_DISCOVER_V1"
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("", 0))
+s.settimeout(0.25)
+deadline = time.time() + 3.0
+while time.time() < deadline:
+    try:
+        s.sendto(message, ("255.255.255.255", port))
+    except OSError:
+        pass
+    until = min(deadline, time.time() + 0.5)
+    while time.time() < until:
+        try:
+            data, _ = s.recvfrom(2048)
+        except socket.timeout:
+            break
+        text = data.decode("utf-8", "ignore")
+        prefix = "WQPU_CHAIN_V1 "
+        if text.startswith(prefix):
+            rpc = text[len(prefix):].strip()
+            if rpc.startswith("http://") or rpc.startswith("https://"):
+                print(rpc)
+                raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+start_lan_beacon() {
+  python3 - "$local_ip" "$DISCOVERY_PORT" <<'PY' &
+import socket, sys
+ip, port = sys.argv[1], int(sys.argv[2])
+request = b"WQPU_CHAIN_DISCOVER_V1"
+reply = ("WQPU_CHAIN_V1 http://%s:8545" % ip).encode()
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("", port))
+while True:
+    data, addr = s.recvfrom(2048)
+    if data == request:
+        s.sendto(reply, addr)
+PY
+  BEACON_PID=$!
+}
 
 slot_helper() {
   (cd "$SOURCE_DIR/chain" && GOWORK=off go run ./cmd/wqpu-slot-helper "$@")
 }
 
-if [ "$is_bootstrap_machine" -eq 1 ]; then
-  say "WQPU UP: this machine is bootstrap host ($local_ip)."
-  say "WQPU UP: starting shared chain + provider automatically..."
-  bash "$SOURCE_DIR/network.sh" host "$local_ip" 1 &
-  HOST_PID=$!
+publish_slot() {
+  local rpc="$1" slot="$2" endpoint="$3"
+  (cd "$SOURCE_DIR/chain" && GOWORK=off go run ./cmd/wqpu-compute-bootstrap publish-one "$rpc" "$slot" "$endpoint")
+}
 
-  local_rpc="http://127.0.0.1:8545"
-  i=0
-  while [ "$i" -lt 900 ]; do
-    if curl -fsS --connect-timeout 2 -H 'content-type: application/json' \
-      --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
-      "$local_rpc" >/dev/null 2>&1; then break; fi
-    if ! kill -0 "$HOST_PID" 2>/dev/null; then
-      wait "$HOST_PID" || true
-      fail "bootstrap host exited before chain became ready"
+provider_port() { printf '%d' "$((17443 + $1))"; }
+
+wait_node_ready() {
+  local pid="$1" log="$2" i=0
+  while [ "$i" -lt 180 ]; do
+    if grep -Fq 'WQPU PHYSICAL NODE READY' "$log" 2>/dev/null; then return 0; fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+      cat "$log" >&2 2>/dev/null || true
+      fail "physical compute node exited before ready"
     fi
-    i=$((i + 1)); sleep 1
+    i=$((i + 1))
+    sleep 1
   done
-  [ "$i" -lt 900 ] || fail "local bootstrap chain did not become ready"
+  cat "$log" >&2 2>/dev/null || true
+  fail "physical compute node did not become ready"
+}
 
-  say "WQPU UP: host ready. Waiting for another physical compute machine..."
-  remote_slots=""
+start_provider_background() {
+  local rpc="$1" slot="$2" port log
+  port="$(provider_port "$slot")"
+  log="$BASE/node-$slot.log"
+  publish_slot "$rpc" "$slot" "wqpu://$local_ip:$port"
+  say "WQPU UP: registered this computer in blockchain: peer-slot=$slot endpoint=wqpu://$local_ip:$port"
+  (cd "$SOURCE_DIR/client" && GOWORK=off go run ./cmd/wqpu-dev-node "$rpc" "$slot" "wqpu://0.0.0.0:$port" "$WQPU_RUNTIME_BASE") >"$log" 2>&1 &
+  NODE_PID=$!
+  wait_node_ready "$NODE_PID" "$log"
+}
+
+rpc=""
+if rpc="$(find_seed_rpc 2>/dev/null)"; then
+  say "WQPU UP: found configured WQPU blockchain: $rpc"
+elif rpc="$(find_lan_rpc 2>/dev/null)"; then
+  if rpc_ready "$rpc"; then
+    say "WQPU UP: found WQPU blockchain bootstrap on LAN: $rpc"
+  else
+    rpc=""
+  fi
+fi
+
+if [ -z "$rpc" ]; then
+  say "WQPU UP: no WQPU blockchain bootstrap is reachable; starting local shared devnet."
+  WQPU_DEVNET_TEST_ADDRESS="$(cd "$SOURCE_DIR/chain" && GOWORK=off go run ./cmd/wqpu-compute-bootstrap address)"
+  export WQPU_DEVNET_TEST_ADDRESS
+  export WQPU_DEVNET_PUBLIC_RPC=1
+  bash "$SOURCE_DIR/chain/devnet.sh" --reset >"$BASE/devnet.log" 2>&1 &
+  CHAIN_PID=$!
+  rpc="http://127.0.0.1:8545"
+  wait_rpc "$rpc" "$CHAIN_PID"
+  start_lan_beacon
+
+  slot="$(slot_helper free "$rpc")"
+  [ -n "$slot" ] || fail "could not allocate local compute identity"
+  start_provider_background "$rpc" "$slot"
+  say "WQPU UP: chain + local provider ready. Waiting for another computer to register on-chain..."
+
   i=0
   while [ "$i" -lt 1800 ]; do
-    slots="$(slot_helper active "$local_rpc" 2>/dev/null || true)"
+    slots="$(slot_helper active "$rpc" 2>/dev/null || true)"
     count=0
-    for slot in $slots; do count=$((count + 1)); done
-    if [ "$count" -ge 2 ]; then
-      remote_slots="$slots"
-      break
+    for candidate in $slots; do count=$((count + 1)); done
+    if [ "$count" -ge 2 ]; then break; fi
+    if ! kill -0 "$CHAIN_PID" 2>/dev/null || ! kill -0 "$NODE_PID" 2>/dev/null; then
+      fail "WQPU host stopped while waiting for another provider"
     fi
-    if ! kill -0 "$HOST_PID" 2>/dev/null; then
-      wait "$HOST_PID" || true
-      fail "bootstrap host exited while waiting for providers"
-    fi
-    i=$((i + 1)); sleep 2
+    i=$((i + 1))
+    sleep 2
   done
-  [ -n "$remote_slots" ] || fail "no second WQPU provider joined within the wait window"
+  [ "$count" -ge 2 ] || fail "no second compute provider registered in the wait window"
 
-  set -- $remote_slots
-  first="$1"
-  second="$2"
-  say "WQPU UP: providers $first and $second are online; running distributed inference automatically..."
-  bash "$SOURCE_DIR/network.sh" infer 127.0.0.1 "$local_ip" "$first" "$second"
-  say "WQPU AUTO NETWORK PASSED: two physical providers + shared chain + distributed inference"
-  wait "$HOST_PID"
+  say "WQPU UP: blockchain registry now contains at least two active compute providers."
+  publish_slot "$rpc" 0 "wqpu://$local_ip:17443"
+  say "WQPU UP: running distributed inference; executors will be selected from blockchain registry..."
+  (cd "$SOURCE_DIR/client" && GOWORK=off go run ./cmd/wqpu-dev-infer "$rpc" 0 "wqpu://0.0.0.0:17443" "$WQPU_RUNTIME_BASE")
+  say "WQPU AUTO NETWORK PASSED: executor discovery came from blockchain registry"
+  wait "$NODE_PID"
 else
-  say "WQPU UP: this machine is a compute joiner ($local_ip)."
-  say "WQPU UP: waiting for bootstrap $rpc..."
-  wait_rpc
   slot="$(slot_helper free "$rpc")"
-  [ -n "$slot" ] || fail "could not allocate a free compute slot"
-  say "WQPU UP: automatically assigned compute slot $slot."
-  exec bash "$SOURCE_DIR/network.sh" join "$BOOTSTRAP" "$local_ip" "$slot"
+  [ -n "$slot" ] || fail "no free devnet compute identity is available"
+  port="$(provider_port "$slot")"
+  publish_slot "$rpc" "$slot" "wqpu://$local_ip:$port"
+  say "WQPU UP: this computer registered itself on-chain as compute provider."
+  say "WQPU UP: peer discovery is now blockchain-only."
+  exec bash -c 'cd "$1" && exec env GOWORK=off go run ./cmd/wqpu-dev-node "$2" "$3" "$4" "$5"' _ \
+    "$SOURCE_DIR/client" "$rpc" "$slot" "wqpu://0.0.0.0:$port" "$WQPU_RUNTIME_BASE"
 fi
