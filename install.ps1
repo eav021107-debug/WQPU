@@ -59,6 +59,37 @@ function Download-WithRetry([string]$Url, [string]$OutFile, [int]$Attempts = 4) 
   }
   throw $last
 }
+function Copy-WqpuFiles([string]$SourceRoot, $FileList, [string]$DestinationRoot) {
+  foreach ($file in $FileList) {
+    $sourceFile = Join-Path $SourceRoot $file
+    if (-not (Test-Path $sourceFile)) { throw "WQPU source is missing $file." }
+  }
+  foreach ($file in $FileList) {
+    Copy-Item -Force (Join-Path $SourceRoot $file) (Join-Path $DestinationRoot $file)
+  }
+}
+function Install-FromGit([string]$Repository, [string]$Ref, $FileList, [string]$DestinationRoot) {
+  $gitCommand = Get-Command git -ErrorAction SilentlyContinue
+  if (-not $gitCommand) { return $false }
+  $tmpGit = Join-Path $env:TEMP ("wqpu-git-" + [Guid]::NewGuid().ToString('N'))
+  try {
+    New-Item -ItemType Directory -Force -Path $tmpGit | Out-Null
+    & $gitCommand.Source -C $tmpGit init -q
+    if ($LASTEXITCODE -ne 0) { return $false }
+    & $gitCommand.Source -C $tmpGit remote add origin "https://github.com/$Repository.git"
+    if ($LASTEXITCODE -ne 0) { return $false }
+    & $gitCommand.Source -C $tmpGit fetch --depth=1 origin $Ref 2>$null
+    if ($LASTEXITCODE -ne 0) { return $false }
+    & $gitCommand.Source -C $tmpGit checkout -q --detach FETCH_HEAD
+    if ($LASTEXITCODE -ne 0) { return $false }
+    Copy-WqpuFiles $tmpGit $FileList $DestinationRoot
+    return $true
+  } catch {
+    return $false
+  } finally {
+    Remove-Item $tmpGit -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
 
 $py = Find-Python
 if (-not $py) { Install-PrivatePython; $py = Find-Python }
@@ -75,13 +106,10 @@ if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
 if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) { throw 'WQPU needs OpenSSL. Install Git for Windows or OpenSSL, then run the same command again.' }
 
 Write-Host 'WQPU: downloading runtime...'
-$pythonFiles = @('wqpu.py','wqpu_chain.py','wqpu_wallet.py','wqpu_session.py','wqpu_meter.py','wqpu_accounting.py','wqpu_attestation.py','wqpu_payments.py','wqpu_claim.py','wqpu_vouchers.py','wqpu_runtime.py','wqpu_autopay.py','wqpu_multistream.py','wqpu_runtime_pin.py','wqpu_network_guard.py','wqpu_node_identity.py','wqpu_node_status.py','wqpu_public_config.py','wqpu_public_security.py','wqpu_entry.py')
+$pythonFiles = @('wqpu.py','wqpu_accel.py','wqpu_gpu_patch.py','wqpu_chain.py','wqpu_wallet.py','wqpu_session.py','wqpu_meter.py','wqpu_accounting.py','wqpu_attestation.py','wqpu_payments.py','wqpu_claim.py','wqpu_vouchers.py','wqpu_runtime.py','wqpu_autopay.py','wqpu_multistream.py','wqpu_runtime_pin.py','wqpu_network_guard.py','wqpu_node_identity.py','wqpu_node_status.py','wqpu_public_config.py','wqpu_public_security.py','wqpu_entry.py')
 $files = $pythonFiles + @('network-config.json')
 
-# One immutable source archive avoids dozens of raw.githubusercontent.com requests and
-# therefore avoids rate-limit failures during one-command Windows installs. Keep the old
-# raw-file path only as a compatibility fallback for custom mirrors that are not GitHub.
-$archiveInstalled = $false
+$sourceInstalled = $false
 if ($repo -and $sourceRef) {
   $tmpRoot = Join-Path $env:TEMP ("wqpu-source-" + [Guid]::NewGuid().ToString('N'))
   $archive = Join-Path $tmpRoot 'wqpu.tar.gz'
@@ -94,19 +122,20 @@ if ($repo -and $sourceRef) {
     if ($LASTEXITCODE -ne 0) { throw 'Could not extract WQPU source archive.' }
     $source = Get-ChildItem -Path $extract -Directory | Select-Object -First 1
     if (-not $source) { throw 'WQPU source archive is empty.' }
-    foreach ($file in $files) {
-      $sourceFile = Join-Path $source.FullName $file
-      if (-not (Test-Path $sourceFile)) { throw "WQPU source archive is missing $file." }
-      Copy-Item -Force $sourceFile (Join-Path $root $file)
-    }
-    $archiveInstalled = $true
+    Copy-WqpuFiles $source.FullName $files $root
+    $sourceInstalled = $true
   } catch {
-    Write-Host "WQPU: source archive unavailable; falling back to individual files ($($_.Exception.Message))"
+    Write-Host "WQPU: source archive unavailable ($($_.Exception.Message)); trying git transport..."
   } finally {
     Remove-Item $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
   }
 }
-if (-not $archiveInstalled) {
+if (-not $sourceInstalled -and $repo -and $sourceRef) {
+  $sourceInstalled = Install-FromGit $repo $sourceRef $files $root
+  if ($sourceInstalled) { Write-Host 'WQPU: source installed through git fallback.' }
+}
+if (-not $sourceInstalled) {
+  Write-Host 'WQPU: git source unavailable; falling back to individual files.'
   foreach ($file in $files) { Download-WithRetry "$raw/$file" (Join-Path $root $file) }
 }
 

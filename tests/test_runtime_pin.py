@@ -29,7 +29,7 @@ class RuntimePinTests(unittest.TestCase):
              mock.patch.dict(os.environ, {}, clear=True):
             self.assertEqual(wqpu_runtime_pin.desired_tag(), wqpu_runtime_pin.DEFAULT_LLAMA_TAG)
 
-    def test_exact_cached_tag_never_queries_github(self):
+    def test_exact_cached_tag_and_variant_never_query_github(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             server = root / "llama-server"
@@ -38,6 +38,7 @@ class RuntimePinTests(unittest.TestCase):
             rpc.write_bytes(b"rpc")
             (root / "current.json").write_text(json.dumps({
                 "tag": "b10456",
+                "variant": "cpu",
                 "server": str(server),
                 "rpc": str(rpc),
             }))
@@ -46,6 +47,7 @@ class RuntimePinTests(unittest.TestCase):
             try:
                 wqpu_runtime_pin.wqpu.RUNTIME = root
                 with mock.patch.object(wqpu_runtime_pin, "desired_tag", return_value="b10456"), \
+                     mock.patch.object(wqpu_runtime_pin, "desired_variant", return_value="cpu"), \
                      mock.patch.object(wqpu_runtime_pin.wqpu, "ensure_home"), \
                      mock.patch.object(wqpu_runtime_pin.wqpu, "api_json", side_effect=AssertionError("network lookup")):
                     actual_server, actual_rpc, tag = wqpu_runtime_pin.ensure_runtime()
@@ -55,34 +57,73 @@ class RuntimePinTests(unittest.TestCase):
             finally:
                 wqpu_runtime_pin.wqpu.RUNTIME = old_runtime
 
-    def test_pinned_b10456_asset_never_needs_release_api(self):
+    def test_variant_change_invalidates_cached_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            server = root / "llama-server"
+            rpc = root / "ggml-rpc-server"
+            server.write_bytes(b"server")
+            rpc.write_bytes(b"rpc")
+            (root / "current.json").write_text(json.dumps({
+                "tag": "b10456", "variant": "cpu",
+                "server": str(server), "rpc": str(rpc),
+            }))
+            old_runtime = wqpu_runtime_pin.wqpu.RUNTIME
+            try:
+                wqpu_runtime_pin.wqpu.RUNTIME = root
+                with mock.patch.object(wqpu_runtime_pin, "desired_tag", return_value="b10456"), \
+                     mock.patch.object(wqpu_runtime_pin, "desired_variant", return_value="vulkan"), \
+                     mock.patch.object(wqpu_runtime_pin.wqpu, "ensure_home"), \
+                     mock.patch.object(wqpu_runtime_pin.wqpu, "asset_suffix", return_value="-bin-ubuntu-x64.tar.gz"), \
+                     mock.patch.object(wqpu_runtime_pin.wqpu_accel, "main_asset_suffix", return_value="-missing-test.tar.gz"), \
+                     mock.patch.object(wqpu_runtime_pin.wqpu, "api_json", return_value={"tag_name": "b10456", "assets": []}):
+                    with self.assertRaises(RuntimeError):
+                        wqpu_runtime_pin.ensure_runtime()
+            finally:
+                wqpu_runtime_pin.wqpu.RUNTIME = old_runtime
+
+    def test_pinned_b10456_assets_never_need_release_api(self):
         with mock.patch.object(
             wqpu_runtime_pin.wqpu, "api_json", side_effect=AssertionError("release API")
         ):
-            asset = wqpu_runtime_pin._asset_for("b10456", "-bin-ubuntu-x64.tar.gz")
-        self.assertEqual(asset["name"], "llama-b10456-bin-ubuntu-x64.tar.gz")
-        self.assertEqual(
-            asset["digest"],
-            "sha256:d07b3f80f3a1ed1de46bfba5671b4af40a87417e1dbf35d0603ad2d623ddc577",
-        )
-        self.assertEqual(asset["source"], "wqpu-pinned-manifest")
-        self.assertIn("/releases/download/b10456/", asset["browser_download_url"])
+            cpu = wqpu_runtime_pin._asset_for("b10456", "-bin-ubuntu-x64.tar.gz")
+            vulkan = wqpu_runtime_pin._asset_for("b10456", "-bin-ubuntu-vulkan-x64.tar.gz")
+            cuda = wqpu_runtime_pin._asset_for("b10456", "-bin-win-cuda-12.4-x64.zip")
+            cudart = wqpu_runtime_pin._named_asset_for(
+                "b10456", "cudart-llama-bin-win-cuda-12.4-x64.zip"
+            )
+        self.assertEqual(cpu["name"], "llama-b10456-bin-ubuntu-x64.tar.gz")
+        self.assertEqual(vulkan["name"], "llama-b10456-bin-ubuntu-vulkan-x64.tar.gz")
+        self.assertEqual(cuda["name"], "llama-b10456-bin-win-cuda-12.4-x64.zip")
+        self.assertEqual(cudart["name"], "cudart-llama-bin-win-cuda-12.4-x64.zip")
+        for asset in (cpu, vulkan, cuda, cudart):
+            self.assertEqual(asset["source"], "wqpu-pinned-manifest")
+            self.assertTrue(asset["digest"].startswith("sha256:"))
+            self.assertIn("/releases/download/b10456/", asset["browser_download_url"])
 
-    def test_manifest_covers_every_client_platform_suffix(self):
+    def test_manifest_covers_cpu_and_accelerator_builds(self):
         suffixes = {
             "-bin-ubuntu-x64.tar.gz",
             "-bin-ubuntu-arm64.tar.gz",
+            "-bin-ubuntu-vulkan-x64.tar.gz",
+            "-bin-ubuntu-vulkan-arm64.tar.gz",
             "-bin-macos-arm64.tar.gz",
             "-bin-macos-x64.tar.gz",
             "-bin-win-cpu-x64.zip",
             "-bin-win-cpu-arm64.zip",
+            "-bin-win-vulkan-x64.zip",
+            "-bin-win-cuda-12.4-x64.zip",
         }
         self.assertEqual(set(wqpu_runtime_pin.PINNED_ASSETS["b10456"]), suffixes)
         for suffix in suffixes:
-            self.assertEqual(len(wqpu_runtime_pin.PINNED_ASSETS["b10456"][suffix]), 64)
-            int(wqpu_runtime_pin.PINNED_ASSETS["b10456"][suffix], 16)
+            digest = wqpu_runtime_pin.PINNED_ASSETS["b10456"][suffix]
+            self.assertEqual(len(digest), 64)
+            int(digest, 16)
+        companions = wqpu_runtime_pin.PINNED_NAMED_ASSETS["b10456"]
+        self.assertIn("cudart-llama-bin-win-cuda-12.4-x64.zip", companions)
+        self.assertEqual(len(companions["cudart-llama-bin-win-cuda-12.4-x64.zip"]), 64)
 
-    def test_wrong_cached_tag_forces_exact_release_lookup(self):
+    def test_wrong_cached_tag_forces_exact_release_lookup_for_unknown_asset(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             server = root / "old-server"
@@ -90,20 +131,21 @@ class RuntimePinTests(unittest.TestCase):
             server.write_bytes(b"server")
             rpc.write_bytes(b"rpc")
             (root / "current.json").write_text(json.dumps({
-                "tag": "b-old",
-                "server": str(server),
-                "rpc": str(rpc),
+                "tag": "b-old", "variant": "cpu",
+                "server": str(server), "rpc": str(rpc),
             }))
 
             old_runtime = wqpu_runtime_pin.wqpu.RUNTIME
             try:
                 wqpu_runtime_pin.wqpu.RUNTIME = root
                 with mock.patch.object(wqpu_runtime_pin, "desired_tag", return_value="b10456"), \
+                     mock.patch.object(wqpu_runtime_pin, "desired_variant", return_value="cpu"), \
                      mock.patch.object(wqpu_runtime_pin.wqpu, "ensure_home"), \
                      mock.patch.object(wqpu_runtime_pin.wqpu, "asset_suffix", return_value="-test.zip"), \
+                     mock.patch.object(wqpu_runtime_pin.wqpu_accel, "main_asset_suffix", side_effect=lambda suffix: suffix), \
+                     mock.patch.object(wqpu_runtime_pin.wqpu_accel, "companion_asset_names", return_value=[]), \
                      mock.patch.object(wqpu_runtime_pin.wqpu, "api_json", return_value={
-                         "tag_name": "b10456",
-                         "assets": [],
+                         "tag_name": "b10456", "assets": [],
                      }) as lookup:
                     with self.assertRaises(RuntimeError):
                         wqpu_runtime_pin.ensure_runtime()

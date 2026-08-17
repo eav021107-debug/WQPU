@@ -19,29 +19,27 @@ def install_public_config_compat():
 
 
 def force_tunneled_rpc_transport():
-    """Prevent llama.cpp RPC from negotiating a direct RDMA path around WQPU.
-
-    b10456 may enable RDMA automatically when libibverbs is present. A transport proxy
-    cannot safely forward that negotiated out-of-band path, and using it would also
-    bypass WQPU TLS identity, relay routing and dual metering. An impossible device name
-    makes llama.cpp's RDMA probe fail closed so child llama/rpc processes stay on TCP
-    inside the authenticated WQPU tunnel.
-    """
+    """Prevent llama.cpp RPC from negotiating a direct RDMA path around WQPU."""
     os.environ["GGML_RDMA_DEV"] = "__wqpu_tcp_tunnel_only__"
 
 
 def doctor():
     install_public_config_compat()
     import wqpu
+    import wqpu_accel
     from wqpu_chain import load_network_config
     import wqpu_runtime_pin
 
     network = load_network_config()
+    accel = wqpu_accel.info(wqpu.total_ram_mb())
     checks = {
         "version": RELEASE_VERSION,
         "python": sys.version.split()[0],
         "openssl": bool(shutil.which("openssl")),
         "llama_cpp_tag": wqpu_runtime_pin.desired_tag(),
+        "accelerator": accel["accelerator"],
+        "runtime_variant": accel["runtime_variant"],
+        "vram_mb": accel["vram_mb"],
         "public_network_published": bool(network),
         "rpc_url": network.get("rpc_url") if network else None,
         "registry": network.get("registry") if network else None,
@@ -70,13 +68,14 @@ def main():
         sys.argv = [sys.argv[0]] + sys.argv[2:]
         return wqpu_claim.main()
 
-    # llama.cpp b10456 can auto-negotiate RDMA after its HELLO. WQPU must keep that
-    # stream inside its authenticated/metered relay rather than allowing an out-of-band
-    # transport to bypass the security boundary.
+    # b10456 can auto-negotiate RDMA after HELLO. WQPU deliberately keeps the RPC byte
+    # stream inside its authenticated/metered TCP/TLS relay, regardless of CPU/GPU backend.
     force_tunneled_rpc_transport()
 
     import wqpu
+    import wqpu_gpu_patch
     import wqpu_runtime_pin
+    wqpu_gpu_patch.install_wqpu(wqpu)
     wqpu.ensure_runtime = wqpu_runtime_pin.ensure_runtime
 
     # Keep accounting policy outside the large runtime module so malformed/partial
@@ -84,9 +83,10 @@ def main():
     import wqpu_accounting
     import wqpu_runtime as runtime
     runtime.save_usage_receipt = wqpu_accounting.save_usage_receipt
+    wqpu_gpu_patch.install_runtime(runtime, wqpu)
 
     # Public-network security is layered on only for ChainMesh. Legacy/private mode
-    # keeps the original Mesh behavior.
+    # keeps the original Mesh behavior while still benefiting from accelerator selection.
     import wqpu_network_guard
     wqpu_network_guard.install(runtime)
 
