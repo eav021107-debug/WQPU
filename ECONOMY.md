@@ -51,7 +51,7 @@ WQPU meter v2 parses the pinned llama.cpp RPC graph and estimates scalar work fr
 
 The worker also meters incoming work independently. Optional payment enforcement can refuse additional paid compute until previous measured work is covered.
 
-This meter is still experimental rather than a formally fraud-proof FLOP oracle. Real-value automatic settlement should remain disabled until the chosen public network has completed adversarial testing/audit and explicitly accepts this meter version.
+This meter is experimental rather than a formally fraud-proof FLOP oracle. Real-value automatic settlement should be enabled only after the selected public deployment has passed adversarial testing and audit.
 
 ## Gas relayer
 
@@ -59,7 +59,7 @@ The HTTP relayer can submit permit funding, session activation and provider clai
 
 Production relayers should use a dedicated signer/HSM, rate limits and redundant endpoints.
 
-## Current status
+## Status
 
 Implemented in WQPU 0.6.0:
 
@@ -69,7 +69,7 @@ Implemented in WQPU 0.6.0:
 - shared escrow;
 - permit funding;
 - bounded local session authorization;
-- automatic cumulative voucher signing;
+- cumulative voucher signing;
 - replay/limit/expiry protection;
 - relayed claims;
 - provider voucher inbox/outbox;
@@ -78,4 +78,4 @@ Implemented in WQPU 0.6.0:
 - Linux/Windows installers;
 - local Anvil deployment and end-to-end CI.
 
-What remains before real public-value use is external deployment and security work: publish the actual WQPU chain/testnet + relays + funded gas relayer, run Internet-scale/adversarial tests, and complete an independent audit.
+What remains before real public-value use is deployment/security work: publish the actual WQPU chain/testnet + relays + funded gas relayer, run Internet-scale/adversarial tests, and complete an independent audit.
