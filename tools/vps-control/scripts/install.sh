@@ -7,14 +7,15 @@ if [[ ${EUID:-$(id -u)} -ne 0 ]]; then
 fi
 
 APP_DIR=/opt/vps-control
-SERVICE_USER=${VPS_CONTROL_USER:-vpscontrol}
+SERVICE_USER=${VPS_CONTROL_USER:-${SUDO_USER:-vpscontrol}}
+TAKE_OWNERSHIP=${VPS_CONTROL_TAKE_OWNERSHIP:-0}
 SOURCE_DIR=$(cd "$(dirname "$0")/.." && pwd)
 PROJECT_ROOT=$(cd "$SOURCE_DIR/../.." && pwd)
 WORKSPACE=${VPS_CONTROL_ROOT:-$PROJECT_ROOT}
-ACTION_TOKEN=${VPS_CONTROL_ACTION_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')}
 PUBLIC_URL=${VPS_CONTROL_PUBLIC_URL:-https://CHANGE-ME.example.com}
 
 command -v python3 >/dev/null || { echo "python3 is required"; exit 1; }
+ACTION_TOKEN=${VPS_CONTROL_ACTION_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')}
 
 if ! id "$SERVICE_USER" >/dev/null 2>&1; then
   useradd --system --create-home --shell /bin/bash "$SERVICE_USER"
@@ -26,9 +27,9 @@ mkdir -p "$APP_DIR" "$WORKSPACE"
 cp -a "$SOURCE_DIR/." "$APP_DIR/"
 chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR"
 
-# The coding user must be able to edit the selected project. Keep ownership unchanged
-# when the workspace is an existing checkout; only claim a freshly-created empty path.
-if [[ -z "$(ls -A "$WORKSPACE" 2>/dev/null)" ]]; then
+# Existing projects keep their ownership. A checkout created specifically by the
+# bootstrap can opt in to ownership transfer so the coding service can edit it.
+if [[ "$TAKE_OWNERSHIP" == "1" || -z "$(ls -A "$WORKSPACE" 2>/dev/null)" ]]; then
   chown -R "$SERVICE_USER:$SERVICE_USER" "$WORKSPACE"
 fi
 
