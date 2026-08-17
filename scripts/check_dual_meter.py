@@ -23,7 +23,10 @@ REQUEST_ID = "ab" * 16
 
 
 class FakeChain(object):
-    network = {}
+    def __init__(self, relay_peer):
+        # Mirror the production path: AutoPayChainMesh learns public relays from
+        # the published blockchain/network config, not from an implicit cache.
+        self.network = {"relays": [dict(relay_peer)]}
 
 
 def frame(cmd, payload=b""):
@@ -105,11 +108,11 @@ async def main_async():
     wqpu.RPC_PORT = rpc_server.sockets[0].getsockname()[1]
 
     requester = wqpu_autopay.AutoPayChainMesh(
-        {"secret": secret, "peers": []}, FakeChain(), REQUESTER_WALLET
+        {"secret": secret, "peers": []}, FakeChain(relay_peer), REQUESTER_WALLET
     )
     requester.me = "requester-node"
     worker = wqpu_autopay.AutoPayChainMesh(
-        {"secret": secret, "peers": []}, FakeChain(), WORKER_WALLET
+        {"secret": secret, "peers": []}, FakeChain(relay_peer), WORKER_WALLET
     )
     worker.me = "worker-node"
 
