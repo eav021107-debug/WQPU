@@ -3,6 +3,7 @@ name: WQPU testnet stack
 on:
   push:
     paths:
+      - 'install-testnet.sh'
       - 'scripts/testnet_stack.py'
       - 'wqpu_rpc_gateway.py'
       - 'wqpu_relayer.py'
@@ -16,6 +17,7 @@ on:
       - '.github/workflows/testnet-stack.yml'
   pull_request:
     paths:
+      - 'install-testnet.sh'
       - 'scripts/testnet_stack.py'
       - 'wqpu_rpc_gateway.py'
       - 'wqpu_relayer.py'
@@ -43,6 +45,38 @@ jobs:
         run: python -m py_compile wqpu_rpc_gateway.py wqpu_relayer.py wqpu_wallet.py scripts/testnet_stack.py
       - name: Test stack policy/config/backup
         run: python -m unittest tests.test_rpc_gateway tests.test_testnet_stack tests.test_wallet_faucet tests.test_relayer_faucet -v
+
+  operator-installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Validate operator installer shell syntax
+        run: sh -n install-testnet.sh
+      - name: Install current commit without deleting persistent state
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.pull_request.head.sha || github.sha }}"
+          TEST_HOME="$RUNNER_TEMP/wqpu-operator-home"
+          OPERATOR_ROOT="$TEST_HOME/.local/share/wqpu-operator"
+          mkdir -p "$OPERATOR_ROOT/.wqpu-testnet"
+          echo preserve-me > "$OPERATOR_ROOT/.wqpu-testnet/sentinel"
+          HOME="$TEST_HOME" \
+          WQPU_OPERATOR_ROOT="$OPERATOR_ROOT" \
+          WQPU_OPERATOR_REF="$REF" \
+          WQPU_OPERATOR_SKIP_FOUNDRY=1 \
+          WQPU_OPERATOR_NO_START=1 \
+          sh install-testnet.sh
+          test "$(cat "$OPERATOR_ROOT/.wqpu-testnet/sentinel")" = "preserve-me"
+          "$TEST_HOME/.local/bin/wqpu-testnet" --help | grep -F 'WQPU one-command persistent EVM testnet operator stack'
+          grep -F "WQPU_TESTNET_CLIENT_REF='$REF'" "$TEST_HOME/.local/bin/wqpu-testnet"
+          (cd "$OPERATOR_ROOT" && forge build >/dev/null)
 
   integration:
     runs-on: ubuntu-latest
