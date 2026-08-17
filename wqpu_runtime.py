@@ -116,6 +116,14 @@ def peer_from_registry(node):
     }
 
 
+def registration_matches(node, endpoint, fingerprint):
+    if not node or not node.get("active"):
+        return False
+    registered_fp = str(node.get("fingerprint") or "").lower().replace("0x", "")
+    expected_fp = str(fingerprint or "").lower().replace("0x", "")
+    return str(node.get("endpoint") or "") == endpoint and registered_fp == expected_fp
+
+
 class ChainMesh(wqpu.Mesh):
     def __init__(self, cfg, chain, wallet):
         super(ChainMesh, self).__init__(cfg)
@@ -168,7 +176,9 @@ class ChainMesh(wqpu.Mesh):
 
     async def refresh_chain(self):
         try:
-            nodes = await wqpu.to_thread(self.chain.discover, self.wallet or None, 512, 300)
+            # Registration is persistent. Liveness/load comes from direct P2P, so a wallet
+            # does not need to approve an on-chain heartbeat transaction every few minutes.
+            nodes = await wqpu.to_thread(self.chain.discover, self.wallet or None, 512, 0)
             self.merge_chain_nodes(nodes)
             self.chain_price = await wqpu.to_thread(self.chain.global_price)
         except Exception:
@@ -217,12 +227,12 @@ class ChainMesh(wqpu.Mesh):
         return peers[:limit]
 
 
-async def wait_for_registration(chain, wallet, timeout=120):
+async def wait_for_registration(chain, wallet, endpoint, fingerprint, timeout=120):
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             node = await wqpu.to_thread(chain.find_wallet, wallet, 512)
-            if node and node.get("active"):
+            if registration_matches(node, endpoint, fingerprint):
                 return node
         except Exception:
             pass
@@ -240,23 +250,41 @@ def configured_chain(args, state):
 
 async def ensure_wallet(chain, state, force=False):
     wallet = str(state.get("wallet") or "").lower()
-    if wallet and not force:
-        return wallet
+    endpoint = os.environ.get("WQPU_PUBLIC_ENDPOINT", "").strip() or state.get("public_endpoint") or local_endpoint()
+    parse_endpoint(endpoint)
+    fingerprint = "0x" + wqpu.cert_fingerprint()
 
-    endpoint = local_endpoint()
+    if wallet and not force:
+        try:
+            node = await wqpu.to_thread(chain.find_wallet, wallet, 512)
+            if registration_matches(node, endpoint, fingerprint):
+                return wallet
+            print("WQPU: saved wallet registration no longer matches this node; reconnecting wallet...")
+        except Exception:
+            raise RuntimeError("could not verify saved wallet registration on the WQPU chain")
+
     chain_id = await wqpu.to_thread(chain.chain_id)
     print("WQPU: opening browser wallet connector...")
     result = await wqpu.to_thread(
         connect_wallet,
         chain.registry,
         endpoint,
-        "0x" + wqpu.cert_fingerprint(),
+        fingerprint,
         capacity_units(),
         system_load_bps(),
         chain_id,
         180,
+        chain.rpc_url,
+        os.environ.get("WQPU_CHAIN_NAME"),
+        os.environ.get("WQPU_NATIVE_SYMBOL"),
     )
     wallet = str(result["wallet"]).lower()
+
+    print("WQPU: wallet connected: {}".format(wallet))
+    registered = await wait_for_registration(chain, wallet, endpoint, fingerprint)
+    if not registered:
+        raise RuntimeError("wallet transaction was submitted, but this node registration was not confirmed")
+
     state.update({
         "wallet": wallet,
         "rpc_url": chain.rpc_url,
@@ -266,13 +294,7 @@ async def ensure_wallet(chain, state, force=False):
         "registration_tx": result.get("tx_hash"),
     })
     save_state(state)
-
-    print("WQPU: wallet connected: {}".format(wallet))
-    registered = await wait_for_registration(chain, wallet)
-    if registered:
-        print("WQPU: node registration confirmed on-chain.")
-    else:
-        print("WQPU: transaction submitted; registration is still waiting for confirmation.")
+    print("WQPU: node registration confirmed on-chain.")
     return wallet
 
 
