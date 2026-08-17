@@ -116,6 +116,28 @@ jobs:
           echo "balance before=$BEFORE_BALANCE after=$AFTER_BALANCE"
           test "$BEFORE_BALANCE" = "$AFTER_BALANCE"
           python -c 'import json; s=json.load(open(".wqpu-testnet/state.json")); assert s["resumed"] is True; assert s["persistent"] is True'
+      - name: Start HTTPS operator stack
+        shell: bash
+        run: |
+          python scripts/testnet_stack.py stop
+          python scripts/testnet_stack.py reset --yes
+          openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
+            -subj '/CN=127.0.0.1' \
+            -addext 'subjectAltName = IP:127.0.0.1' \
+            -keyout /tmp/wqpu-testnet-key.pem -out /tmp/wqpu-testnet-cert.pem >/dev/null 2>&1
+          unset RUNNER_TRACKING_ID
+          python scripts/testnet_stack.py start \
+            --public-host 127.0.0.1 \
+            --internal-rpc-port 28546 \
+            --rpc-port 18545 \
+            --relayer-port 18787 \
+            --relay-port 17443 \
+            --tls-cert /tmp/wqpu-testnet-cert.pem \
+            --tls-key /tmp/wqpu-testnet-key.pem
+          curl -kfsS https://127.0.0.1:18545/health
+          curl -kfsS https://127.0.0.1:18787/health
+          curl -kfsS https://127.0.0.1:18787/network-config.json | python -c 'import json,sys; p=json.load(sys.stdin)["public"]; assert p["rpc_url"].startswith("https://"); assert p["relayer_url"].startswith("https://"); assert p["faucet_url"].startswith("https://")'
+          python -c 'import json; s=json.load(open(".wqpu-testnet/state.json")); assert s["tls_enabled"] is True; assert s["public_scheme"] == "https"'
       - name: Stop testnet stack
         if: always()
         run: |
