@@ -9,6 +9,7 @@
     "token": null,
     "registry": null,
     "market": null,
-    "relayer_url": null
+    "relayer_url": null,
+    "relays": []
   }
 }
