@@ -1,9 +1,5 @@
 #!/usr/bin/env python3
-"""WQPU runtime extension: reserved-session activation, voucher delivery and claiming.
-
-Payment traffic rides the existing WQPU control protocol (`type=open`) with
-`service=payment`; no second P2P network or wallet private key is introduced.
-"""
+"""WQPU runtime extension: gasless funding, session activation and provider payments."""
 
 from __future__ import print_function
 
@@ -12,10 +8,11 @@ import os
 
 import wqpu
 import wqpu_runtime as runtime
-from wqpu_claim import relay, relay_activation, wait_receipt
-from wqpu_session import active_session, load_session, save_session
+from wqpu_claim import relay, relay_activation, relay_funding, wait_receipt
+from wqpu_session import active_session, escrow_balance, load_session, reserved_escrow, save_session
 from wqpu_vouchers import accept as accept_voucher
 from wqpu_vouchers import mark_claimed
+from wqpu_wallet import clear_funding_permit, load_funding_permit
 
 
 PAYMENT_SERVICE = "payment"
@@ -26,6 +23,54 @@ class AutoPayChainMesh(runtime.ChainMesh):
     def __init__(self, cfg, chain, wallet):
         super(AutoPayChainMesh, self).__init__(cfg, chain, wallet)
         self._ensure_payment_session_active()
+
+    def _free_escrow(self, market, requester):
+        balance = int(escrow_balance(self.chain, market, requester))
+        reserved = int(reserved_escrow(self.chain, market, requester))
+        if reserved > balance:
+            raise RuntimeError("on-chain reserved escrow exceeds balance")
+        return balance - reserved
+
+    def _fund_if_needed(self, session):
+        market = str(session.get("market") or "").lower()
+        requester = str(session.get("requester") or "").lower()
+        maximum = int(session.get("max_amount") or 0)
+        free = self._free_escrow(market, requester)
+        needed = max(0, maximum - free)
+        if needed == 0:
+            clear_funding_permit()
+            return True
+
+        funding = load_funding_permit()
+        if not funding:
+            print("[WQPU payment session needs {} more token-wei in escrow]".format(needed))
+            return False
+        if str(funding.get("requester") or "").lower() != requester:
+            print("[WQPU stored funding permit belongs to another wallet]")
+            return False
+        if str(funding.get("market") or "").lower() != market:
+            print("[WQPU stored funding permit belongs to another market]")
+            return False
+        if int(funding.get("amount") or 0) < needed:
+            print("[WQPU stored funding permit is smaller than current escrow shortfall]")
+            return False
+
+        try:
+            tx_hash = relay_funding(self.chain, funding)
+            wait_receipt(self.chain, tx_hash, 120)
+            session["funding_tx"] = tx_hash
+            save_session(session)
+            clear_funding_permit()
+            free = self._free_escrow(market, requester)
+            if free < maximum:
+                raise RuntimeError("funding confirmed but free escrow is still below session limit")
+            print("[WQPU escrow funded through wallet permit]")
+            return True
+        except Exception as exc:
+            # Permit remains stored. A reverted permit+deposit transaction consumes neither
+            # permit nonce nor funds, so it can be retried after tokens/relayer become available.
+            print("[WQPU escrow funding pending: {}]".format(exc))
+            return False
 
     def _ensure_payment_session_active(self):
         session = load_session()
@@ -58,6 +103,9 @@ class AutoPayChainMesh(runtime.ChainMesh):
         if not str(session.get("authorization_signature") or "").startswith("0x"):
             print("[WQPU payment session has no wallet authorization signature]")
             return
+        if not self._fund_if_needed(session):
+            return
+
         try:
             tx_hash = relay_activation(self.chain, session)
             wait_receipt(self.chain, tx_hash, 120)
@@ -69,8 +117,6 @@ class AutoPayChainMesh(runtime.ChainMesh):
             self.payment_session = session
             print("[WQPU payment session activated and funds reserved]")
         except Exception as exc:
-            # Compute can still run; automatic requester payments remain disabled until a
-            # relayer is configured and the signed session is successfully activated.
             print("[WQPU payment session pending activation: {}]".format(exc))
 
     async def _route_payment(self, target, voucher, ttl=MAX_PAYMENT_HOPS, trace=None):
