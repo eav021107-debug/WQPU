@@ -11,8 +11,7 @@ interface IWQPURegistryPrice {
 }
 
 /// @title WQPU Compute Market
-/// @notice Escrowed payment channels for permissionless compute providers.
-/// @dev Every channel snapshots the one global WQPU compute price when it opens.
+/// @notice Escrow + bounded payment sessions for permissionless compute providers.
 contract WQPUComputeMarket {
     uint256 public constant CLAIM_GRACE = 1 days;
     uint256 public constant PRICE_UNITS = 1_000_000;
@@ -26,6 +25,12 @@ contract WQPUComputeMarket {
     bytes32 private constant SESSION_TYPEHASH = keccak256(
         "SessionAuthorization(address requester,address sessionKey,bytes32 sessionId,uint128 maxAmount,uint64 validUntil)"
     );
+    bytes32 private constant SPEND_AUTH_TYPEHASH = keccak256(
+        "SpendAuthorization(address requester,address sessionKey,bytes32 sessionId,uint128 maxAmount,uint128 pricePerMillionUnits,uint64 validUntil)"
+    );
+    bytes32 private constant PROVIDER_VOUCHER_TYPEHASH = keccak256(
+        "ProviderVoucher(address requester,address provider,bytes32 sessionId,uint256 cumulativeAmount,uint256 cumulativeUnits)"
+    );
     bytes32 private constant NAME_HASH = keccak256("WQPU Compute Market");
     bytes32 private constant VERSION_HASH = keccak256("1");
 
@@ -37,8 +42,11 @@ contract WQPUComputeMarket {
     bytes32 public immutable DOMAIN_SEPARATOR;
 
     mapping(address => uint256) public nonces;
+    mapping(address => uint128) public escrowBalance;
     mapping(address => mapping(bytes32 => uint128)) public sessionSpent;
     mapping(address => mapping(bytes32 => bool)) public revokedSessions;
+    mapping(address => mapping(bytes32 => mapping(address => uint128))) public sessionProviderPaid;
+    mapping(address => mapping(bytes32 => mapping(address => uint128))) public sessionProviderUnits;
 
     struct Channel {
         address requester;
@@ -53,6 +61,18 @@ contract WQPUComputeMarket {
 
     mapping(bytes32 => Channel) public channels;
 
+    event EscrowDeposited(address indexed requester, uint256 amount, uint256 newBalance);
+    event EscrowWithdrawn(address indexed requester, uint256 amount, uint256 newBalance);
+    event EscrowSessionClaimed(
+        bytes32 indexed sessionId,
+        address indexed requester,
+        address indexed provider,
+        address sessionKey,
+        uint256 paidNow,
+        uint256 providerCumulativePaid,
+        uint256 providerCumulativeUnits,
+        uint256 sessionSpent
+    );
     event ChannelOpened(
         bytes32 indexed channelId,
         address indexed requester,
@@ -95,6 +115,105 @@ contract WQPUComputeMarket {
         );
     }
 
+    /// @notice One shared requester balance can pay any provider selected later.
+    function deposit(uint256 amount) external {
+        require(amount != 0, "zero amount");
+        uint256 next = uint256(escrowBalance[msg.sender]) + amount;
+        require(next <= type(uint128).max, "escrow too large");
+        require(token.transferFrom(msg.sender, address(this), amount), "deposit failed");
+        escrowBalance[msg.sender] = uint128(next);
+        emit EscrowDeposited(msg.sender, amount, next);
+    }
+
+    function withdraw(uint256 amount) external {
+        require(amount != 0, "zero amount");
+        uint256 balance = escrowBalance[msg.sender];
+        require(amount <= balance, "escrow balance");
+        uint256 next = balance - amount;
+        escrowBalance[msg.sender] = uint128(next);
+        require(token.transfer(msg.sender, amount), "withdraw failed");
+        emit EscrowWithdrawn(msg.sender, amount, next);
+    }
+
+    /// @notice Anyone may relay a provider voucher signed by a bounded local session key.
+    /// @dev A single SpendAuthorization can pay many different providers from requester escrow.
+    ///      The exact global price is included in wallet authorization; if network price changes,
+    ///      a new authorization is required rather than silently charging a different price.
+    function claimEscrowWithSession(
+        address requester,
+        address provider,
+        bytes32 sessionId,
+        uint256 cumulativeAmount,
+        uint256 cumulativeUnits,
+        bytes calldata voucherSignature,
+        address sessionKey,
+        uint128 maxAmount,
+        uint128 pricePerMillionUnits,
+        uint64 validUntil,
+        bytes calldata authorizationSignature
+    ) external {
+        require(requester != address(0), "zero requester");
+        require(provider != address(0) && provider != requester, "bad provider");
+        require(sessionKey != address(0), "zero session key");
+        require(maxAmount != 0, "zero session limit");
+        require(pricePerMillionUnits != 0, "zero session price");
+        require(block.timestamp <= validUntil, "session expired");
+        require(!revokedSessions[requester][sessionId], "session revoked");
+        require(registry.globalPricePerMillionUnits() == pricePerMillionUnits, "network price changed");
+
+        bytes32 authDigest = spendAuthorizationDigest(
+            requester,
+            sessionKey,
+            sessionId,
+            maxAmount,
+            pricePerMillionUnits,
+            validUntil
+        );
+        require(_recover(authDigest, authorizationSignature) == requester, "bad spend auth");
+
+        bytes32 voucher = providerVoucherDigest(
+            requester,
+            provider,
+            sessionId,
+            cumulativeAmount,
+            cumulativeUnits
+        );
+        require(_sessionSignatureMatches(voucher, voucherSignature, sessionKey), "bad provider voucher");
+
+        require(cumulativeUnits <= type(uint128).max, "units too large");
+        require(cumulativeAmount <= type(uint128).max, "amount too large");
+        uint256 expectedAmount = (cumulativeUnits * uint256(pricePerMillionUnits)) / PRICE_UNITS;
+        require(cumulativeAmount == expectedAmount, "wrong network price");
+
+        uint256 previousPaid = sessionProviderPaid[requester][sessionId][provider];
+        uint256 previousUnits = sessionProviderUnits[requester][sessionId][provider];
+        require(cumulativeAmount > previousPaid, "nothing new");
+        require(cumulativeUnits >= previousUnits, "units decreased");
+        uint256 delta = cumulativeAmount - previousPaid;
+
+        uint256 spent = uint256(sessionSpent[requester][sessionId]) + delta;
+        require(spent <= maxAmount, "session limit");
+        require(delta <= escrowBalance[requester], "escrow balance");
+
+        sessionProviderPaid[requester][sessionId][provider] = uint128(cumulativeAmount);
+        sessionProviderUnits[requester][sessionId][provider] = uint128(cumulativeUnits);
+        sessionSpent[requester][sessionId] = uint128(spent);
+        escrowBalance[requester] -= uint128(delta);
+
+        require(token.transfer(provider, delta), "provider payment failed");
+        emit EscrowSessionClaimed(
+            sessionId,
+            requester,
+            provider,
+            sessionKey,
+            delta,
+            cumulativeAmount,
+            cumulativeUnits,
+            spent
+        );
+    }
+
+    /// @notice Legacy/provider-specific channel path kept for compatibility during migration.
     function openChannel(address provider, uint256 amount, uint64 expiresAt)
         external
         returns (bytes32 channelId)
@@ -111,7 +230,6 @@ contract WQPUComputeMarket {
             abi.encode(block.chainid, address(this), msg.sender, provider, nonce)
         );
         require(channels[channelId].requester == address(0), "exists");
-
         require(token.transferFrom(msg.sender, address(this), amount), "deposit failed");
 
         channels[channelId] = Channel({
@@ -152,8 +270,6 @@ contract WQPUComputeMarket {
         return (cumulativeUnits * uint256(channel.pricePerMillionUnits)) / PRICE_UNITS;
     }
 
-    /// @notice Claim a voucher signed directly by the requester wallet.
-    /// @dev Anyone may relay the transaction; payout always goes to channel.provider.
     function claim(
         bytes32 channelId,
         uint256 cumulativeAmount,
@@ -167,10 +283,6 @@ contract WQPUComputeMarket {
         _settle(channelId, cumulativeAmount, cumulativeUnits);
     }
 
-    /// @notice Claim a voucher signed by a bounded local session key.
-    /// @dev The requester wallet signs SessionAuthorization once. The local session key can
-    ///      then sign vouchers until validUntil or maxAmount is reached. No wallet private key
-    ///      is stored by WQPU and no wallet popup is required for each voucher.
     function claimWithSession(
         bytes32 channelId,
         uint256 cumulativeAmount,
@@ -258,6 +370,48 @@ contract WQPUComputeMarket {
                 sessionId,
                 maxAmount,
                 validUntil
+            )
+        );
+        return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+    }
+
+    function spendAuthorizationDigest(
+        address requester,
+        address sessionKey,
+        bytes32 sessionId,
+        uint128 maxAmount,
+        uint128 pricePerMillionUnits,
+        uint64 validUntil
+    ) public view returns (bytes32) {
+        bytes32 structHash = keccak256(
+            abi.encode(
+                SPEND_AUTH_TYPEHASH,
+                requester,
+                sessionKey,
+                sessionId,
+                maxAmount,
+                pricePerMillionUnits,
+                validUntil
+            )
+        );
+        return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+    }
+
+    function providerVoucherDigest(
+        address requester,
+        address provider,
+        bytes32 sessionId,
+        uint256 cumulativeAmount,
+        uint256 cumulativeUnits
+    ) public view returns (bytes32) {
+        bytes32 structHash = keccak256(
+            abi.encode(
+                PROVIDER_VOUCHER_TYPEHASH,
+                requester,
+                provider,
+                sessionId,
+                cumulativeAmount,
+                cumulativeUnits
             )
         );
         return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
