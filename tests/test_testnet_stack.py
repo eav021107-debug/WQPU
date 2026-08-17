@@ -1,4 +1,6 @@
 import importlib.util
+import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -75,6 +77,67 @@ class TestnetStackTests(unittest.TestCase):
                 "0x" + "11" * 20, "0x" + "22" * 20, "0x" + "33" * 20,
                 scheme="ftp",
             )
+
+    def _fake_persistent_stack(self, root):
+        root = Path(root)
+        relay = root / "relay-home"
+        relay.mkdir(parents=True)
+        operator = "0x" + "44" * 20
+        (root / "operator.json").write_text(json.dumps({
+            "address": operator,
+            "private_key": "0x" + "11" * 32,
+        }))
+        (root / "deployment.json").write_text(json.dumps({
+            "chain_id": "0x7a69",
+            "operator": operator,
+            "token": "0x" + "11" * 20,
+            "registry": "0x" + "22" * 20,
+            "market": "0x" + "33" * 20,
+        }))
+        (root / "anvil-state.json").write_bytes(b'{"persisted":true}')
+        (relay / "cert.pem").write_bytes(b"TEST-CERT")
+        (relay / "key.pem").write_bytes(b"TEST-KEY")
+        (relay / "node-id").write_bytes(b"relay-node\n")
+        return operator
+
+    def test_backup_restore_round_trip_preserves_secret_identity_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            source = base / "source"
+            restored = base / "restored"
+            source.mkdir()
+            self._fake_persistent_stack(source)
+            archive = base / "network-backup.tar.gz"
+
+            path, manifest = stack.create_backup_archive(archive, source)
+            self.assertEqual(path, archive.resolve())
+            self.assertEqual(manifest["registry"], "0x" + "22" * 20)
+            self.assertTrue(archive.is_file())
+            if os.name != "nt":
+                self.assertEqual(archive.stat().st_mode & 0o777, 0o600)
+
+            restored_manifest = stack.restore_backup_archive(archive, restored)
+            self.assertEqual(restored_manifest["registry"], manifest["registry"])
+            for rel in (
+                "operator.json", "deployment.json", "anvil-state.json",
+                "relay-home/cert.pem", "relay-home/key.pem", "relay-home/node-id",
+            ):
+                self.assertEqual((restored / rel).read_bytes(), (source / rel).read_bytes())
+
+    def test_backup_archive_cannot_be_written_inside_live_state_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp) / "source"
+            source.mkdir()
+            self._fake_persistent_stack(source)
+            with self.assertRaises(RuntimeError):
+                stack.create_backup_archive(source / "backup.tar.gz", source)
+
+    def test_backup_member_path_validation_blocks_traversal(self):
+        self.assertFalse(stack._safe_backup_member_name("../operator.json"))
+        self.assertFalse(stack._safe_backup_member_name("relay-home/../../operator.json"))
+        self.assertFalse(stack._safe_backup_member_name("/etc/passwd"))
+        self.assertTrue(stack._safe_backup_member_name("operator.json"))
+        self.assertTrue(stack._safe_backup_member_name("relay-home/cert.pem"))
 
 
 if __name__ == "__main__":
