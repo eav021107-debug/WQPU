@@ -24,14 +24,23 @@ curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.s
 irm https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1 | iex
 ```
 
-The installer downloads:
-
-- `wqpu.py` — equal-peer llama.cpp transport;
-- `wqpu_chain.py` — dependency-free EVM registry reader;
-- `wqpu_wallet.py` — local browser wallet connector;
-- `wqpu_runtime.py` — public blockchain runtime.
+The installer downloads `wqpu.py`, `wqpu_chain.py`, `wqpu_wallet.py` and `wqpu_runtime.py`.
 
 Until the WQPU public chain is deployed and its RPC/contract addresses are published as defaults, the installer keeps the existing private join-code mesh working automatically.
+
+## Local blockchain devnet
+
+For an end-to-end public-chain test, install Foundry and run:
+
+```bash
+python scripts/devnet.py 0xYOUR_EXISTING_WALLET
+source .wqpu-devnet.env
+wqpu
+```
+
+The script starts a local Anvil chain, deploys `WQPUToken`, `WQPURegistry` and `WQPUComputeMarket`, and optionally gives the supplied existing wallet test ETH/WQPU. The browser connector can automatically add/switch to `WQPU Devnet`.
+
+The local devnet binds to `127.0.0.1` by default. For an isolated two-PC LAN test it can be started with `--listen-host 0.0.0.0`, but the included Anvil development key is public, so that RPC must never be exposed to the Internet or used with real funds.
 
 ## Public-chain test mode
 
@@ -45,15 +54,9 @@ wqpu
 
 On first public-mode start WQPU opens a localhost browser page. MetaMask, Rabby or another injected EVM wallet submits the node-registration transaction. WQPU never receives the seed phrase or private key.
 
-A registered node publishes:
+A registered node publishes its wallet address, reachable `HOST:PORT`, TLS fingerprint and offered capacity. Registration stays on-chain; live availability and load are checked over P2P, so the wallet is not asked to approve heartbeat transactions every few minutes.
 
-- wallet address;
-- reachable `HOST:PORT`;
-- TLS fingerprint;
-- offered capacity;
-- coarse load/heartbeat.
-
-The runtime then reads the registry, verifies TLS fingerprints for direct peers, exchanges fresh P2P utilization data and prefers less-busy workers. `WQPU_MAX_WORKERS` controls the maximum number of remote workers used for one request; the default is 8.
+The runtime reads the registry, verifies a peer against its registered TLS fingerprint and wallet, exchanges fresh utilization data and prefers less-busy workers. `WQPU_MAX_WORKERS` controls the maximum number of remote workers used for one request; the default is 8.
 
 ## Public endpoint
 
@@ -111,4 +114,4 @@ Current public-chain prototype verifies registry endpoints against their registe
 
 Before a public launch WQPU still needs production compute metering, EIP-712 voucher generation/claiming, NAT strategy, deployment to the chosen EVM chain, adversarial testing and contract audit.
 
-See `ECONOMY.md` for the current economic design.
+See `ECONOMY.md` and `PUBLIC_CHAIN_TODO.md` for the current design and remaining launch blockers.
