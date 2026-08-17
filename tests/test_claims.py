@@ -15,7 +15,7 @@ SESSION_ID = "0x" + "55" * 32
 
 def package(amount=100, units=1000):
     return {
-        "version": 1,
+        "version": 2,
         "kind": "wqpu-provider-voucher",
         "market": MARKET,
         "requester": REQUESTER,
@@ -28,6 +28,18 @@ def package(amount=100, units=1000):
         "cumulative_amount": amount,
         "cumulative_units": units,
         "voucher_signature": "0x" + "aa" * 64,
+    }
+
+
+def activation():
+    return {
+        "market": MARKET,
+        "requester": REQUESTER,
+        "session_key": SESSION_KEY,
+        "session_id": SESSION_ID,
+        "max_amount": 1_000_000,
+        "price_per_million_units": 100_000,
+        "valid_until": 9999999999,
         "authorization_signature": "0x" + "bb" * 65,
     }
 
@@ -42,16 +54,22 @@ class FakeClient(object):
 
 
 class ClaimTests(unittest.TestCase):
-    def test_struct_claim_calldata_has_correct_dynamic_offsets(self):
+    def test_claim_calldata_has_correct_voucher_offset(self):
         data = wqpu_claim.claim_calldata(FakeClient(), package())
         self.assertTrue(data.startswith("0x12345678"))
         args = data[10:]
-        words = [args[i:i + 64] for i in range(0, 11 * 64, 64)]
-        self.assertEqual(int(words[9], 16), 11 * 32)
-        # 64-byte voucher = one length word + two data words = 96 bytes.
-        self.assertEqual(int(words[10], 16), 11 * 32 + 96)
+        words = [args[i:i + 64] for i in range(0, 6 * 64, 64)]
+        self.assertEqual(int(words[5], 16), 6 * 32)
 
-    def test_simulation_uses_market_contract(self):
+    def test_activation_calldata_has_correct_signature_offset(self):
+        data = wqpu_claim.activation_calldata(FakeClient(), activation())
+        self.assertTrue(data.startswith("0x12345678"))
+        args = data[10:]
+        words = [args[i:i + 64] for i in range(0, 7 * 64, 64)]
+        self.assertEqual(int(words[6], 16), 7 * 32)
+
+    def test_simulations_use_market_contract(self):
+        self.assertTrue(wqpu_claim.simulate_activation(FakeClient(), activation()))
         self.assertTrue(wqpu_claim.simulate_claim(FakeClient(), package()))
 
     def test_provider_inbox_keeps_only_newer_cumulative_voucher(self):
