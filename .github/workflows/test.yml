@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile Python
-        run: python -m py_compile wqpu.py wqpu_chain.py wqpu_wallet.py wqpu_runtime.py
+        run: python -m py_compile wqpu.py wqpu_chain.py wqpu_wallet.py wqpu_runtime.py scripts/devnet.py
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Runtime version
@@ -29,10 +29,17 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Compile contracts
+      - name: Compile contracts with solc
         run: >-
           npx --yes solc@0.8.35 --bin
           contracts/WQPUToken.sol
           contracts/WQPURegistry.sol
           contracts/WQPUComputeMarket.sol
           -o /tmp/wqpu-solc
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Foundry build
+        run: forge build
+      - name: Deploy local WQPU devnet
+        run: python scripts/devnet.py
