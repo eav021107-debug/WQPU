@@ -10,6 +10,7 @@ REF=${1:-next-foundation}
 REPO=${WQPU_REPO:-eav021107-debug/WQPU}
 WORKSPACE=${VPS_CONTROL_ROOT:-/srv/wqpu}
 TMP=$(mktemp -d)
+CREATED_WORKSPACE=0
 trap 'rm -rf "$TMP"' EXIT
 
 if ! command -v git >/dev/null 2>&1; then
@@ -32,12 +33,15 @@ if [[ ! -d "$WORKSPACE/.git" ]]; then
   fi
   rm -rf "$WORKSPACE"
   git clone --depth 1 --branch "$REF" "https://github.com/${REPO}.git" "$WORKSPACE"
+  CREATED_WORKSPACE=1
 fi
 
-# Fetch the plugin source separately so this installer can also attach to another
-# existing project selected with VPS_CONTROL_ROOT.
+# Fetch plugin code separately so the same installer can attach to another existing
+# repository selected through VPS_CONTROL_ROOT.
 git clone --depth 1 --branch "$REF" "https://github.com/${REPO}.git" "$TMP/source"
-VPS_CONTROL_ROOT="$WORKSPACE" bash "$TMP/source/tools/vps-control/scripts/install.sh"
+VPS_CONTROL_ROOT="$WORKSPACE" \
+VPS_CONTROL_TAKE_OWNERSHIP="$CREATED_WORKSPACE" \
+bash "$TMP/source/tools/vps-control/scripts/install.sh"
 
 echo
 echo "Living project attached: $WORKSPACE"
