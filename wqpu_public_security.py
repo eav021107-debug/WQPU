@@ -34,6 +34,15 @@ def _wallet(mesh):
     return str(getattr(mesh, "wallet", "") or "").strip().lower()
 
 
+def _identity_paths(mesh):
+    """Return optional per-mesh identity paths; normal clients use wqpu.CERT/KEY."""
+    cert = getattr(mesh, "identity_cert_path", None)
+    key = getattr(mesh, "identity_key_path", None)
+    if cert and key:
+        return cert, key
+    return None, None
+
+
 def _hello_identity(mesh, role):
     uid = _network_uid(mesh)
     wallet = _wallet(mesh)
@@ -41,10 +50,13 @@ def _hello_identity(mesh, role):
         return {}
     if not wallet:
         raise RuntimeError("public WQPU transport requires a connected wallet")
+    cert, key = _identity_paths(mesh)
     return {
         "network_uid": uid,
         "wallet": wallet,
-        "identity_proof": build_identity_proof(uid, mesh.me, wallet, role),
+        "identity_proof": build_identity_proof(
+            uid, mesh.me, wallet, role, cert_path=cert, key_path=key
+        ),
     }
 
 
@@ -93,7 +105,14 @@ def install(cls):
             return info
         info["network"] = PUBLIC_PROTOCOL
         info["network_uid"] = uid
-        info["status_attestation"] = build_status_attestation(info)
+        cert, key = _identity_paths(self)
+        if cert and key:
+            from wqpu_node_identity import certificate_der, certificate_fingerprint_from_der
+            info["fingerprint"] = certificate_fingerprint_from_der(certificate_der(cert))
+            self.fp = info["fingerprint"]
+        info["status_attestation"] = build_status_attestation(
+            info, cert_path=cert, key_path=key
+        )
         return info
 
     def merge_nodes(self, route_key, nodes):
