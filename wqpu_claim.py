@@ -1,20 +1,16 @@
 #!/usr/bin/env python3
-"""Gasless activation and provider-claim helpers for WQPU.
-
-The wallet signs a bounded SpendAuthorization once. A relayer activates that session,
-which reserves its maximum spend on-chain. Workers later receive compact cumulative
-vouchers signed only by the local session key and can relay claims without holding a
-wallet private key.
-"""
+"""Gasless funding, session activation and provider claims for WQPU."""
 
 from __future__ import print_function
 
+import argparse
 import json
 import os
 import time
 import urllib.request
 
 
+FUND_SIGNATURE = "depositWithPermit(address,uint256,uint256,bytes)"
 ACTIVATE_SIGNATURE = (
     "activateSession((address,address,bytes32,uint128,uint128,uint64),bytes)"
 )
@@ -85,6 +81,27 @@ def _selector(client, signature):
     return raw[:8]
 
 
+def normalize_funding(funding):
+    f = dict(funding or {})
+    f["market"] = _address(f.get("market"), "market")
+    f["requester"] = _address(f.get("requester"), "requester")
+    f["amount"] = int(f.get("amount") or 0)
+    f["deadline"] = int(f.get("deadline") or 0)
+    if f["amount"] <= 0 or f["amount"] >= 2 ** 128:
+        raise ClaimError("invalid funding amount")
+    if f["deadline"] <= 0:
+        raise ClaimError("invalid permit deadline")
+    signature = "0x" + _strip0x(f.get("permit_signature")).lower()
+    if len(signature) != 132:
+        raise ClaimError("permit signature must be 65 bytes")
+    try:
+        int(signature[2:], 16)
+    except ValueError:
+        raise ClaimError("invalid permit signature")
+    f["permit_signature"] = signature
+    return f
+
+
 def normalize_package(package):
     p = dict(package or {})
     if p.get("kind") != "wqpu-provider-voucher":
@@ -108,7 +125,7 @@ def normalize_package(package):
     if p["cumulative_amount"] <= 0 or p["cumulative_units"] <= 0:
         raise ClaimError("empty provider voucher")
     voucher_sig = "0x" + _strip0x(p.get("voucher_signature")).lower()
-    if len(voucher_sig) != 2 + 64 * 2:
+    if len(voucher_sig) != 130:
         raise ClaimError("provider voucher signature must be compact r||s")
     try:
         int(voucher_sig[2:], 16)
@@ -134,7 +151,7 @@ def normalize_activation(session):
     if s["valid_until"] <= 0 or s["valid_until"] >= 2 ** 64:
         raise ClaimError("invalid session expiry")
     auth_sig = "0x" + _strip0x(s.get("authorization_signature")).lower()
-    if len(auth_sig) != 2 + 65 * 2:
+    if len(auth_sig) != 132:
         raise ClaimError("wallet authorization signature must be 65 bytes")
     try:
         int(auth_sig[2:], 16)
@@ -144,10 +161,21 @@ def normalize_activation(session):
     return s
 
 
+def funding_calldata(client, funding):
+    f = normalize_funding(funding)
+    tail = _dynamic_bytes(f["permit_signature"], "permit signature")
+    head = "".join([
+        _address_word(f["requester"], "requester"),
+        _word(f["amount"]),
+        _word(f["deadline"]),
+        _word(4 * 32),
+    ])
+    return "0x" + _selector(client, FUND_SIGNATURE) + head + tail
+
+
 def activation_calldata(client, session):
     s = normalize_activation(session)
-    auth_tail = _dynamic_bytes(s["authorization_signature"], "authorization signature")
-    # Static authorization tuple = six words; dynamic signature offset = seventh word.
+    tail = _dynamic_bytes(s["authorization_signature"], "authorization signature")
     head = "".join([
         _address_word(s["requester"], "requester"),
         _address_word(s["session_key"], "session key"),
@@ -157,13 +185,12 @@ def activation_calldata(client, session):
         _word(s["valid_until"]),
         _word(7 * 32),
     ])
-    return "0x" + _selector(client, ACTIVATE_SIGNATURE) + head + auth_tail
+    return "0x" + _selector(client, ACTIVATE_SIGNATURE) + head + tail
 
 
 def claim_calldata(client, package):
     p = normalize_package(package)
-    voucher_tail = _dynamic_bytes(p["voucher_signature"], "voucher signature")
-    # requester + sessionId + static ProviderVoucher tuple (3 words) + bytes offset.
+    tail = _dynamic_bytes(p["voucher_signature"], "voucher signature")
     head = "".join([
         _address_word(p["requester"], "requester"),
         _bytes32_word(p["session_id"], "session id"),
@@ -172,7 +199,7 @@ def claim_calldata(client, package):
         _word(p["cumulative_units"]),
         _word(6 * 32),
     ])
-    return "0x" + _selector(client, CLAIM_SIGNATURE) + head + voucher_tail
+    return "0x" + _selector(client, CLAIM_SIGNATURE) + head + tail
 
 
 def _simulate(client, market, data):
@@ -180,6 +207,11 @@ def _simulate(client, market, data):
     if not isinstance(result, str) or not result.startswith("0x"):
         raise ClaimError("bad EVM simulation result")
     return True
+
+
+def simulate_funding(client, funding):
+    f = normalize_funding(funding)
+    return _simulate(client, f["market"], funding_calldata(client, f))
 
 
 def simulate_activation(client, session):
@@ -201,8 +233,20 @@ def _unlocked_sender(client, sender=None):
     return _address(sender, "relayer")
 
 
+def fund_via_rpc(client, funding, sender=None):
+    f = normalize_funding(funding)
+    simulate_funding(client, f)
+    tx_hash = client.rpc("eth_sendTransaction", [{
+        "from": _unlocked_sender(client, sender),
+        "to": f["market"],
+        "data": funding_calldata(client, f),
+    }])
+    if not isinstance(tx_hash, str) or not tx_hash.startswith("0x"):
+        raise ClaimError("bad funding transaction hash")
+    return tx_hash
+
+
 def activate_via_rpc(client, session, sender=None):
-    """Dev/test helper for an RPC that deliberately exposes an unlocked relayer."""
     s = normalize_activation(session)
     simulate_activation(client, s)
     tx_hash = client.rpc("eth_sendTransaction", [{
@@ -216,7 +260,6 @@ def activate_via_rpc(client, session, sender=None):
 
 
 def relay_via_rpc(client, package, sender=None):
-    """Dev/test helper for an RPC that deliberately exposes an unlocked relayer."""
     p = normalize_package(package)
     simulate_claim(client, p)
     tx_hash = client.rpc("eth_sendTransaction", [{
@@ -251,8 +294,7 @@ def _relayer_url(client):
 def _relay_http(url, kind, field, value, timeout=20):
     payload = json.dumps({"kind": kind, field: value}).encode("utf-8")
     request = urllib.request.Request(
-        str(url),
-        data=payload,
+        str(url), data=payload,
         headers={"Content-Type": "application/json", "User-Agent": "WQPU-relay/0.6"},
     )
     try:
@@ -266,6 +308,17 @@ def _relay_http(url, kind, field, value, timeout=20):
     return tx_hash
 
 
+def relay_funding(client, funding):
+    f = normalize_funding(funding)
+    simulate_funding(client, f)
+    url = _relayer_url(client)
+    if url:
+        return _relay_http(url, "wqpu-relay-funding", "funding", f)
+    if os.environ.get("WQPU_ALLOW_UNLOCKED_RPC_RELAYER", "0") == "1":
+        return fund_via_rpc(client, f)
+    raise ClaimError("funding permit is valid but no relayer is configured")
+
+
 def relay_activation(client, session):
     s = normalize_activation(session)
     simulate_activation(client, s)
@@ -274,9 +327,7 @@ def relay_activation(client, session):
         return _relay_http(url, "wqpu-relay-activation", "session", s)
     if os.environ.get("WQPU_ALLOW_UNLOCKED_RPC_RELAYER", "0") == "1":
         return activate_via_rpc(client, s)
-    raise ClaimError(
-        "session authorization is valid but no relayer is configured; set WQPU_RELAYER_URL"
-    )
+    raise ClaimError("session authorization is valid but no relayer is configured")
 
 
 def relay(client, package):
@@ -287,6 +338,45 @@ def relay(client, package):
         return _relay_http(url, "wqpu-relay-claim", "voucher", p)
     if os.environ.get("WQPU_ALLOW_UNLOCKED_RPC_RELAYER", "0") == "1":
         return relay_via_rpc(client, p)
-    raise ClaimError(
-        "claim is valid but no relayer is configured; set WQPU_RELAYER_URL"
-    )
+    raise ClaimError("claim is valid but no relayer is configured")
+
+
+def main():
+    from wqpu_chain import RegistryClient
+    from wqpu_vouchers import mark_claimed, pending
+
+    parser = argparse.ArgumentParser(prog="wqpu claim")
+    parser.add_argument("--submit", action="store_true", help="relay all pending provider vouchers")
+    args = parser.parse_args()
+    rows = pending()
+    if not rows:
+        print("No pending WQPU provider vouchers.")
+        return 0
+
+    if not args.submit:
+        print("Pending provider vouchers: {}".format(len(rows)))
+        for row in rows:
+            print("- requester {} | amount {} | units {}".format(
+                str(row.get("requester") or "?")[:12],
+                row.get("cumulative_amount", 0),
+                row.get("cumulative_units", 0),
+            ))
+        print("Run `wqpu claim --submit` to relay them.")
+        return 0
+
+    client = RegistryClient()
+    failures = 0
+    for row in rows:
+        try:
+            tx_hash = relay(client, row)
+            wait_receipt(client, tx_hash, 120)
+            mark_claimed(row, tx_hash)
+            print("claimed {} -> {}".format(row.get("cumulative_amount"), tx_hash))
+        except Exception as exc:
+            failures += 1
+            print("claim failed: {}".format(exc))
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
