@@ -20,12 +20,14 @@ jobs:
           python -m py_compile
           wqpu.py wqpu_chain.py wqpu_wallet.py wqpu_session.py
           wqpu_meter.py wqpu_payments.py wqpu_claim.py wqpu_vouchers.py
-          wqpu_runtime.py wqpu_autopay.py scripts/devnet.py scripts/check_devnet.py
-          scripts/check_session_payment.py
+          wqpu_runtime.py wqpu_autopay.py wqpu_entry.py
+          scripts/devnet.py scripts/check_devnet.py scripts/check_session_payment.py
       - name: Unit tests
         run: python -m unittest discover -s tests -v
-      - name: Runtime version
-        run: python wqpu_autopay.py --version
+      - name: Unified runtime version
+        run: python wqpu_entry.py --version
+      - name: Provider claim command
+        run: python wqpu_entry.py claim
       - name: Validate published network JSON
         run: python -c "import json; json.load(open('network-config.json'))"
 
@@ -45,6 +47,7 @@ jobs:
           WQPU_RAW_BASE="https://raw.githubusercontent.com/eav021107-debug/WQPU/$REF" \
           sh install.sh
           "$TEST_HOME/.local/bin/wqpu" --version | grep -F 'WQPU 0.6.0-dev'
+          "$TEST_HOME/.local/bin/wqpu" claim | grep -F 'No pending WQPU provider vouchers.'
 
   installer-windows:
     runs-on: windows-latest
@@ -70,9 +73,9 @@ jobs:
           .\install.ps1
           $launcher = Join-Path $env:LOCALAPPDATA 'WQPU\bin\wqpu.cmd'
           $version = (& $launcher --version | Out-String).Trim()
-          if ($version -ne 'WQPU 0.6.0-dev') {
-            throw "Unexpected installed version: $version"
-          }
+          if ($version -ne 'WQPU 0.6.0-dev') { throw "Unexpected installed version: $version" }
+          $claim = (& $launcher claim | Out-String).Trim()
+          if ($claim -ne 'No pending WQPU provider vouchers.') { throw "Unexpected claim output: $claim" }
 
   solidity:
     runs-on: ubuntu-latest
@@ -99,5 +102,5 @@ jobs:
         run: python scripts/devnet.py
       - name: Registry client round-trip
         run: python scripts/check_devnet.py
-      - name: OpenSSL session payment round-trip
+      - name: Fully relayed permit/session payment round-trip
         run: python scripts/check_session_payment.py
