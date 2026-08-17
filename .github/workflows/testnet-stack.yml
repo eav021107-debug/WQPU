@@ -41,7 +41,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - name: Compile stack modules
         run: python -m py_compile wqpu_rpc_gateway.py wqpu_relayer.py wqpu_wallet.py scripts/testnet_stack.py
-      - name: Test stack policy/config
+      - name: Test stack policy/config/backup
         run: python -m unittest tests.test_rpc_gateway tests.test_testnet_stack tests.test_wallet_faucet tests.test_relayer_faucet -v
 
   integration:
@@ -91,13 +91,15 @@ jobs:
           BALANCE=$(cast balance "$WALLET" --rpc-url http://127.0.0.1:18545)
           TOKEN=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["token"])')
           TOKEN_BALANCE=$(cast call "$TOKEN" 'balanceOf(address)(uint256)' "$WALLET" --rpc-url http://127.0.0.1:18545)
-          echo "native balance=$BALANCE token balance=$TOKEN_BALANCE"
+          REGISTRY=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["registry"])')
+          RELAY_FP=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["relays"][0]["fingerprint"])')
+          echo "native balance=$BALANCE token balance=$TOKEN_BALANCE registry=$REGISTRY relay_fp=$RELAY_FP"
           test "$BALANCE" != "0"
           test "$TOKEN_BALANCE" != "0"
-          REGISTRY=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["registry"])')
           printf '%s\n' "$REGISTRY" > /tmp/wqpu-registry-before
           printf '%s\n' "$BALANCE" > /tmp/wqpu-balance-before
           printf '%s\n' "$TOKEN_BALANCE" > /tmp/wqpu-token-balance-before
+          printf '%s\n' "$RELAY_FP" > /tmp/wqpu-relay-fp-before
       - name: Stop and resume the same chain without faucet inflation
         shell: bash
         run: |
@@ -115,7 +117,6 @@ jobs:
           python scripts/testnet_stack.py status
           BEFORE_REGISTRY=$(cat /tmp/wqpu-registry-before)
           AFTER_REGISTRY=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["registry"])')
-          echo "registry before=$BEFORE_REGISTRY after=$AFTER_REGISTRY"
           test "$BEFORE_REGISTRY" = "$AFTER_REGISTRY"
 
           WALLET=0x1111111111111111111111111111111111111111
@@ -127,11 +128,45 @@ jobs:
           AFTER_BALANCE=$(cast balance "$WALLET" --rpc-url http://127.0.0.1:18545)
           TOKEN=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["token"])')
           AFTER_TOKEN_BALANCE=$(cast call "$TOKEN" 'balanceOf(address)(uint256)' "$WALLET" --rpc-url http://127.0.0.1:18545)
-          echo "native before=$BEFORE_BALANCE after=$AFTER_BALANCE"
-          echo "token before=$BEFORE_TOKEN_BALANCE after=$AFTER_TOKEN_BALANCE"
           test "$BEFORE_BALANCE" = "$AFTER_BALANCE"
           test "$BEFORE_TOKEN_BALANCE" = "$AFTER_TOKEN_BALANCE"
           python -c 'import json; s=json.load(open(".wqpu-testnet/state.json")); assert s["resumed"] is True; assert s["persistent"] is True'
+      - name: Backup reset restore and resume identical network
+        shell: bash
+        run: |
+          python scripts/testnet_stack.py stop
+          python scripts/testnet_stack.py backup /tmp/wqpu-testnet-backup.tar.gz
+          test -s /tmp/wqpu-testnet-backup.tar.gz
+          test "$(stat -c '%a' /tmp/wqpu-testnet-backup.tar.gz)" = "600"
+          python scripts/testnet_stack.py reset --yes
+          test ! -e .wqpu-testnet/operator.json
+          python scripts/testnet_stack.py restore /tmp/wqpu-testnet-backup.tar.gz --yes
+          test -s .wqpu-testnet/operator.json
+          test -s .wqpu-testnet/anvil-state.json
+          test -s .wqpu-testnet/relay-home/key.pem
+          unset RUNNER_TRACKING_ID
+          python scripts/testnet_stack.py start \
+            --public-host 127.0.0.1 \
+            --internal-rpc-port 28546 \
+            --rpc-port 18545 \
+            --relayer-port 18787 \
+            --relay-port 17443
+
+          BEFORE_REGISTRY=$(cat /tmp/wqpu-registry-before)
+          AFTER_REGISTRY=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["registry"])')
+          BEFORE_RELAY_FP=$(cat /tmp/wqpu-relay-fp-before)
+          AFTER_RELAY_FP=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["relays"][0]["fingerprint"])')
+          WALLET=0x1111111111111111111111111111111111111111
+          BEFORE_BALANCE=$(cat /tmp/wqpu-balance-before)
+          BEFORE_TOKEN_BALANCE=$(cat /tmp/wqpu-token-balance-before)
+          AFTER_BALANCE=$(cast balance "$WALLET" --rpc-url http://127.0.0.1:18545)
+          TOKEN=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["token"])')
+          AFTER_TOKEN_BALANCE=$(cast call "$TOKEN" 'balanceOf(address)(uint256)' "$WALLET" --rpc-url http://127.0.0.1:18545)
+          echo "registry=$BEFORE_REGISTRY/$AFTER_REGISTRY relay=$BEFORE_RELAY_FP/$AFTER_RELAY_FP"
+          test "$BEFORE_REGISTRY" = "$AFTER_REGISTRY"
+          test "$BEFORE_RELAY_FP" = "$AFTER_RELAY_FP"
+          test "$BEFORE_BALANCE" = "$AFTER_BALANCE"
+          test "$BEFORE_TOKEN_BALANCE" = "$AFTER_TOKEN_BALANCE"
       - name: Start HTTPS operator stack
         shell: bash
         run: |
