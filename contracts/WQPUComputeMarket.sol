@@ -4,6 +4,15 @@ pragma solidity ^0.8.35;
 interface IWQPUToken {
     function transfer(address to, uint256 value) external returns (bool);
     function transferFrom(address from, address to, uint256 value) external returns (bool);
+    function permit(
+        address owner,
+        address spender,
+        uint256 value,
+        uint256 deadline,
+        uint8 v,
+        bytes32 r,
+        bytes32 s
+    ) external;
 }
 
 interface IWQPURegistryPrice {
@@ -146,12 +155,22 @@ contract WQPUComputeMarket {
 
     /// @notice One shared requester balance can pay any provider selected later.
     function deposit(uint256 amount) external {
-        require(amount != 0, "zero amount");
-        uint256 next = uint256(escrowBalance[msg.sender]) + amount;
-        require(next <= type(uint128).max, "escrow too large");
-        require(token.transferFrom(msg.sender, address(this), amount), "deposit failed");
-        escrowBalance[msg.sender] = uint128(next);
-        emit EscrowDeposited(msg.sender, amount, next);
+        _depositFrom(msg.sender, amount);
+    }
+
+    /// @notice Fund requester escrow using one EIP-2612 wallet signature.
+    /// @dev Anyone may relay this transaction. The signed permit can approve only this market
+    ///      for exactly `amount`, and transferFrom consumes that allowance immediately.
+    function depositWithPermit(
+        address requester,
+        uint256 amount,
+        uint256 deadline,
+        bytes calldata permitSignature
+    ) external {
+        require(requester != address(0), "zero requester");
+        (uint8 v, bytes32 r, bytes32 s) = _splitSignature(permitSignature);
+        token.permit(requester, address(this), amount, deadline, v, r, s);
+        _depositFrom(requester, amount);
     }
 
     /// @notice Only escrow not reserved for active sessions can be withdrawn.
@@ -399,6 +418,15 @@ contract WQPUComputeMarket {
         return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
     }
 
+    function _depositFrom(address requester, uint256 amount) internal {
+        require(amount != 0, "zero amount");
+        uint256 next = uint256(escrowBalance[requester]) + amount;
+        require(next <= type(uint128).max, "escrow too large");
+        require(token.transferFrom(requester, address(this), amount), "deposit failed");
+        escrowBalance[requester] = uint128(next);
+        emit EscrowDeposited(requester, amount, next);
+    }
+
     function _validateProviderVoucher(
         address requester,
         bytes32 sessionId,
@@ -494,6 +522,21 @@ contract WQPUComputeMarket {
         );
     }
 
+    function _splitSignature(bytes calldata signature)
+        internal
+        pure
+        returns (uint8 v, bytes32 r, bytes32 s)
+    {
+        require(signature.length == 65, "bad signature length");
+        assembly {
+            r := calldataload(signature.offset)
+            s := calldataload(add(signature.offset, 32))
+            v := byte(0, calldataload(add(signature.offset, 64)))
+        }
+        if (v < 27) v += 27;
+        require(v == 27 || v == 28, "bad signature v");
+    }
+
     function _sessionSignatureMatches(
         bytes32 digest,
         bytes calldata signature,
@@ -513,17 +556,8 @@ contract WQPUComputeMarket {
     }
 
     function _recover(bytes32 digest, bytes calldata signature) internal pure returns (address) {
-        require(signature.length == 65, "bad signature length");
-        bytes32 r;
-        bytes32 s;
-        uint8 v;
-        assembly {
-            r := calldataload(signature.offset)
-            s := calldataload(add(signature.offset, 32))
-            v := byte(0, calldataload(add(signature.offset, 64)))
-        }
+        (uint8 v, bytes32 r, bytes32 s) = _splitSignature(signature);
         require(uint256(s) <= HALF_ORDER, "bad signature s");
-        require(v == 27 || v == 28, "bad signature v");
         address signer = ecrecover(digest, v, r, s);
         require(signer != address(0), "bad signer");
         return signer;
