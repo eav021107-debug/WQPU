@@ -16,6 +16,8 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile Python
-        run: python -m py_compile wqpu.py wqpu_chain.py wqpu_wallet.py
+        run: python -m py_compile wqpu.py wqpu_chain.py wqpu_wallet.py wqpu_runtime.py
       - name: Unit tests
         run: python -m unittest discover -s tests -v
+      - name: Runtime version
+        run: python wqpu_runtime.py --version
