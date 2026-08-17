@@ -1,16 +1,16 @@
-# WQPU 0.6.0-dev
+# WQPU 0.6.0
 
-WQPU is an experimental equal-peer distributed LLM network built around `llama.cpp` RPC.
+WQPU is an experimental equal-peer distributed LLM network built around a pinned `llama.cpp` RPC protocol and an EVM accounting layer.
 
-The target public-network flow is:
+Target public-network UX:
 
 ```text
-install WQPU -> connect existing wallet -> discover workers from blockchain -> wqpu>
+install WQPU -> connect existing wallet -> node joins automatically -> wqpu>
 ```
 
-Every computer runs the same peer software. There is no permanent inference coordinator. The computer that receives a user prompt temporarily coordinates only that request and can combine several reachable workers.
+Every computer runs the same peer software. A computer that receives a prompt coordinates only that request and may combine several less-busy workers. There is no permanent inference coordinator.
 
-## One-command install
+## Install
 
 ### macOS / Linux
 
@@ -24,73 +24,33 @@ curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.s
 irm https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1 | iex
 ```
 
-The installer downloads `wqpu.py`, `wqpu_chain.py`, `wqpu_wallet.py` and `wqpu_runtime.py`.
-
-Until the WQPU public chain is deployed and its RPC/contract addresses are published as defaults, the installer keeps the existing private join-code mesh working automatically.
-
-## Local blockchain devnet
-
-For an end-to-end public-chain test, install Foundry and run:
+Useful checks:
 
 ```bash
-python scripts/devnet.py 0xYOUR_EXISTING_WALLET
-source .wqpu-devnet.env
-wqpu
+wqpu --version
+wqpu doctor
+wqpu claim
 ```
 
-The script starts a local Anvil chain, deploys `WQPUToken`, `WQPURegistry` and `WQPUComputeMarket`, and optionally gives the supplied existing wallet test ETH/WQPU. The browser connector can automatically add/switch to `WQPU Devnet`.
+The installers are exercised in CI on Linux and Windows.
 
-The local devnet binds to `127.0.0.1` by default. For an isolated two-PC LAN test it can be started with `--listen-host 0.0.0.0`, but the included Anvil development key is public, so that RPC must never be exposed to the Internet or used with real funds.
+## What happens on first public-network start
 
-## Public-chain test mode
+When `network-config.json` contains a published WQPU network, WQPU:
 
-Set a JSON-RPC endpoint and deployed `WQPURegistry` address:
+1. opens a localhost browser wallet connector;
+2. connects an existing EVM wallet — WQPU never receives the seed phrase/private key;
+3. registers the node wallet, endpoint, capacity and TLS fingerprint on-chain;
+4. discovers other nodes from `WQPURegistry`;
+5. connects directly or through TLS-pinned bootstrap relays when NAT/CGNAT blocks inbound traffic;
+6. ranks live workers by load/capacity;
+7. starts a local `llama-server` and distributes work through the selected `ggml-rpc-server` workers.
 
-```bash
-export WQPU_RPC_URL='http://127.0.0.1:8545'
-export WQPU_REGISTRY='0x...'
-wqpu
-```
+The blockchain stores discovery/accounting state only. Prompts, model data and llama.cpp RPC traffic stay off-chain.
 
-On first public-mode start WQPU opens a localhost browser page. MetaMask, Rabby or another injected EVM wallet submits the node-registration transaction. WQPU never receives the seed phrase or private key.
+## Model runtime
 
-A registered node publishes its wallet address, reachable `HOST:PORT`, TLS fingerprint and offered capacity. Registration stays on-chain; live availability and load are checked over P2P, so the wallet is not asked to approve heartbeat transactions every few minutes.
-
-The runtime reads the registry, verifies a peer against its registered TLS fingerprint and wallet, exchanges fresh utilization data and prefers less-busy workers. `WQPU_MAX_WORKERS` controls the maximum number of remote workers used for one request; the default is 8.
-
-## Public endpoint
-
-By default WQPU tries to infer a local endpoint. Override it when the machine has a public hostname/IP or port forwarding:
-
-```bash
-export WQPU_PUBLIC_ENDPOINT='example.net:7443'
-```
-
-Universal NAT traversal is not solved yet. A node behind restrictive NAT may need port forwarding or a future WQPU relay/hole-punching layer before other Internet peers can use it directly.
-
-## CLI
-
-Public mode:
-
-```text
-wqpu> hello
-wqpu> /status
-wqpu> /peers
-wqpu> /chain
-wqpu> /wallet
-wqpu> /exit
-```
-
-Legacy private mode remains available:
-
-```bash
-wqpu --legacy
-wqpu --join 'WQPU1...'
-```
-
-## Model execution
-
-Each node contributes a localhost-only `ggml-rpc-server`. For a prompt, the requester starts its own local `llama-server` and passes the selected remote RPC endpoints to llama.cpp. Distribution itself does not requantize the model; model quality is determined by the selected GGUF model/quantization.
+WQPU pins `llama.cpp` to release `b10456` so every node speaks the same RPC protocol. Downloaded release archives are SHA-256 checked when GitHub publishes an asset digest.
 
 Default model:
 
@@ -100,18 +60,111 @@ ggml-org/gemma-3-1b-it-GGUF:Q4_K_M
 
 Override it with `WQPU_MODEL`.
 
-## Blockchain contracts
+## Wallet and payments
 
-- `contracts/WQPUToken.sol` — fixed-supply WQPU token.
-- `contracts/WQPURegistry.sol` — wallet/node directory, TLS fingerprint, capacity/load and one global compute price.
-- `contracts/WQPUComputeMarket.sol` — escrowed payment channels. Each channel snapshots the global network price when it opens and rejects vouchers priced differently.
+The public runtime implements:
 
-The blockchain stores discovery/accounting data only. Prompts, model data and llama.cpp RPC traffic remain off-chain.
+- fixed-supply `WQPUToken`;
+- one global compute price for all users;
+- shared requester escrow;
+- EIP-2612 permit funding;
+- a local secp256k1 session key authorized once by the wallet with a maximum spend, price and expiry;
+- on-chain reservation of the session limit before vouchers can be used;
+- cumulative per-provider EIP-712 vouchers;
+- replay protection and session/provider cumulative accounting;
+- HTTP gas relayer for permit funding, session activation and provider claims;
+- provider payouts that can only go to the provider wallet encoded in the voucher;
+- durable voucher inbox/outbox and retry/ACK routing.
 
-## Security status
+The provider can submit accumulated payouts with:
 
-Current public-chain prototype verifies registry endpoints against their registered TLS fingerprints and never accepts wallet private keys. It is still experimental and not ready for real-value funds.
+```bash
+wqpu claim --submit
+```
 
-Before a public launch WQPU still needs production compute metering, EIP-712 voucher generation/claiming, NAT strategy, deployment to the chosen EVM chain, adversarial testing and contract audit.
+## Compute metering
 
-See `ECONOMY.md` and `PUBLIC_CHAIN_TODO.md` for the current design and remaining launch blockers.
+Meter v2 parses the pinned llama.cpp serialized RPC graph. It estimates scalar work from tensor shapes; matrix multiplication and flash attention receive shape-aware estimates instead of treating every graph node equally. Malformed, partial or protocol-mismatched streams fail closed and cannot create a voucher.
+
+This is still experimental accounting, not a formally fraud-proof FLOP oracle. For that reason real-value automatic voucher issuance/payment enforcement should only be enabled on networks whose operator accepts this meter version and has completed security testing.
+
+## NAT / relay
+
+A node behind a home router or CGNAT can keep an outbound TLS connection to a configured WQPU bootstrap relay. A requester can reach that worker through the relay without opening an inbound router port.
+
+The relay is transport only. Worker wallet identity and TLS fingerprint are still checked against the blockchain registry. CI includes a three-node integration test:
+
+```text
+requester -> relay -> outbound-only worker
+```
+
+with a real bidirectional RPC byte stream.
+
+## Local EVM devnet
+
+Install Foundry, then run:
+
+```bash
+python scripts/devnet.py 0xYOUR_EXISTING_WALLET
+source .wqpu-devnet.env
+wqpu
+```
+
+This starts Anvil and deploys:
+
+```text
+WQPUToken -> WQPURegistry -> WQPUComputeMarket
+```
+
+The test suite also exercises the full gasless flow:
+
+```text
+permit -> escrow funding -> session reservation -> provider voucher -> HTTP relayer -> provider balance
+```
+
+Never expose the included Anvil development keys/RPC to the public Internet or use them with real funds.
+
+## Legacy private mesh
+
+Until a public WQPU network is published in `network-config.json`, the normal installer keeps the private mesh working:
+
+```bash
+wqpu --legacy
+wqpu --join 'WQPU1...'
+```
+
+This fallback does not change the public-chain architecture; it simply lets the software run before public infrastructure exists.
+
+## Contracts
+
+- `contracts/WQPUToken.sol` — fixed-supply ERC-20 + EIP-2612 permit.
+- `contracts/WQPURegistry.sol` — node wallet/endpoint/TLS/capacity directory + one global price.
+- `contracts/WQPUComputeMarket.sol` — shared escrow, bounded sessions, vouchers, claims and refunds.
+
+## Validation
+
+GitHub Actions covers:
+
+- Python 3.8 and 3.11;
+- unit/adversarial parser and payment tests;
+- Linux installer;
+- Windows installer;
+- Solidity compilation and Foundry tests;
+- local Token -> Registry -> Market deployment;
+- Python -> EVM registry round-trip;
+- OpenSSL wallet/session signatures;
+- HTTP-relayed permit/session/provider-payment round-trip;
+- replay rejection/reserved-session accounting;
+- requester -> relay -> NAT worker integration.
+
+## What is code-complete vs external deployment
+
+WQPU 0.6.0 contains the complete public-network prototype code path. A truly zero-configuration Internet-wide launch additionally requires **external infrastructure** that cannot live inside this repository alone:
+
+- deploy the chosen WQPU EVM chain/testnet;
+- publish its RPC + contract addresses in `network-config.json`;
+- operate at least one public TLS-pinned transport relay;
+- operate at least one funded gas relayer;
+- security/adversarial review and an independent contract/network audit before real-value use.
+
+See `PUBLIC_CHAIN_TODO.md` for the exact deployment checklist and `ECONOMY.md` for the payment model.
