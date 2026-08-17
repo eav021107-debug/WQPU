@@ -39,7 +39,17 @@ def session():
         "max_amount": 10_000_000,
         "price_per_million_units": 1_000_000,
         "valid_until": 5000,
-        "authorization_signature": "0x" + "aa" * 65,
+    }
+
+
+def active(reserved=10_000_000):
+    return {
+        "session_key": SESSION_KEY,
+        "max_amount": 10_000_000,
+        "price_per_million_units": 1_000_000,
+        "reserved_remaining": reserved,
+        "valid_until": 5000,
+        "active": True,
     }
 
 
@@ -56,7 +66,7 @@ class PaymentTests(unittest.TestCase):
     def test_cumulative_vouchers_only_add_new_work(self):
         chain = FakeChain()
         with mock.patch.object(wqpu_payments, "session_address", return_value=SESSION_KEY), \
-             mock.patch.object(wqpu_payments, "escrow_balance", return_value=10_000_000), \
+             mock.patch.object(wqpu_payments, "active_session", return_value=active()), \
              mock.patch.object(wqpu_payments, "session_spent", return_value=0), \
              mock.patch.object(wqpu_payments, "sign_provider_voucher", return_value="0x" + "bb" * 64):
             payments = wqpu_payments.PaymentSession(chain, session())
@@ -69,10 +79,10 @@ class PaymentTests(unittest.TestCase):
         self.assertEqual(second["cumulative_amount"], 1_500_000)
         self.assertEqual(payments.local_spent(), 1_500_000)
 
-    def test_outstanding_vouchers_cannot_overcommit_escrow(self):
+    def test_outstanding_vouchers_cannot_overcommit_reserved_session(self):
         chain = FakeChain()
         with mock.patch.object(wqpu_payments, "session_address", return_value=SESSION_KEY), \
-             mock.patch.object(wqpu_payments, "escrow_balance", return_value=1_000_000), \
+             mock.patch.object(wqpu_payments, "active_session", return_value=active(1_000_000)), \
              mock.patch.object(wqpu_payments, "session_spent", return_value=0), \
              mock.patch.object(wqpu_payments, "sign_provider_voucher", return_value="0x" + "bb" * 64):
             payments = wqpu_payments.PaymentSession(chain, session())
@@ -80,9 +90,20 @@ class PaymentTests(unittest.TestCase):
             with self.assertRaises(wqpu_payments.PaymentError):
                 payments.issue("0x" + "66" * 20, 500_000)
 
-    def test_network_price_change_invalidates_session(self):
+    def test_global_price_change_does_not_reprice_activated_session(self):
         chain = FakeChain(price=2_000_000)
-        with mock.patch.object(wqpu_payments, "session_address", return_value=SESSION_KEY):
+        with mock.patch.object(wqpu_payments, "session_address", return_value=SESSION_KEY), \
+             mock.patch.object(wqpu_payments, "active_session", return_value=active()):
+            payments = wqpu_payments.PaymentSession(chain, session())
+            self.assertTrue(payments.validate()["active"])
+            self.assertEqual(payments.quote(1_000_000), 1_000_000)
+
+    def test_inactive_session_is_rejected(self):
+        chain = FakeChain()
+        inactive = active()
+        inactive["active"] = False
+        with mock.patch.object(wqpu_payments, "session_address", return_value=SESSION_KEY), \
+             mock.patch.object(wqpu_payments, "active_session", return_value=inactive):
             payments = wqpu_payments.PaymentSession(chain, session())
             with self.assertRaises(wqpu_payments.PaymentError):
                 payments.validate()
@@ -90,7 +111,7 @@ class PaymentTests(unittest.TestCase):
     def test_local_state_behind_chain_is_rejected(self):
         chain = FakeChain()
         with mock.patch.object(wqpu_payments, "session_address", return_value=SESSION_KEY), \
-             mock.patch.object(wqpu_payments, "escrow_balance", return_value=10_000_000), \
+             mock.patch.object(wqpu_payments, "active_session", return_value=active()), \
              mock.patch.object(wqpu_payments, "session_spent", return_value=500_000), \
              mock.patch.object(wqpu_payments, "sign_provider_voucher", return_value="0x" + "bb" * 64):
             payments = wqpu_payments.PaymentSession(chain, session())
