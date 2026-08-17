@@ -59,6 +59,21 @@ contract WQPUComputeMarket {
         bool refunded;
     }
 
+    struct SpendAuthorizationData {
+        address requester;
+        address sessionKey;
+        bytes32 sessionId;
+        uint128 maxAmount;
+        uint128 pricePerMillionUnits;
+        uint64 validUntil;
+    }
+
+    struct ProviderVoucherData {
+        address provider;
+        uint256 cumulativeAmount;
+        uint256 cumulativeUnits;
+    }
+
     mapping(bytes32 => Channel) public channels;
 
     event EscrowDeposited(address indexed requester, uint256 amount, uint256 newBalance);
@@ -136,84 +151,19 @@ contract WQPUComputeMarket {
     }
 
     /// @notice Anyone may relay a provider voucher signed by a bounded local session key.
-    /// @dev A single SpendAuthorization can pay many different providers from requester escrow.
-    ///      The exact global price is included in wallet authorization; if network price changes,
-    ///      a new authorization is required rather than silently charging a different price.
+    /// @dev A single authorization can pay many providers from one requester escrow.
     function claimEscrowWithSession(
-        address requester,
-        address provider,
-        bytes32 sessionId,
-        uint256 cumulativeAmount,
-        uint256 cumulativeUnits,
+        SpendAuthorizationData calldata auth,
+        ProviderVoucherData calldata voucher,
         bytes calldata voucherSignature,
-        address sessionKey,
-        uint128 maxAmount,
-        uint128 pricePerMillionUnits,
-        uint64 validUntil,
         bytes calldata authorizationSignature
     ) external {
-        require(requester != address(0), "zero requester");
-        require(provider != address(0) && provider != requester, "bad provider");
-        require(sessionKey != address(0), "zero session key");
-        require(maxAmount != 0, "zero session limit");
-        require(pricePerMillionUnits != 0, "zero session price");
-        require(block.timestamp <= validUntil, "session expired");
-        require(!revokedSessions[requester][sessionId], "session revoked");
-        require(registry.globalPricePerMillionUnits() == pricePerMillionUnits, "network price changed");
-
-        bytes32 authDigest = spendAuthorizationDigest(
-            requester,
-            sessionKey,
-            sessionId,
-            maxAmount,
-            pricePerMillionUnits,
-            validUntil
-        );
-        require(_recover(authDigest, authorizationSignature) == requester, "bad spend auth");
-
-        bytes32 voucher = providerVoucherDigest(
-            requester,
-            provider,
-            sessionId,
-            cumulativeAmount,
-            cumulativeUnits
-        );
-        require(_sessionSignatureMatches(voucher, voucherSignature, sessionKey), "bad provider voucher");
-
-        require(cumulativeUnits <= type(uint128).max, "units too large");
-        require(cumulativeAmount <= type(uint128).max, "amount too large");
-        uint256 expectedAmount = (cumulativeUnits * uint256(pricePerMillionUnits)) / PRICE_UNITS;
-        require(cumulativeAmount == expectedAmount, "wrong network price");
-
-        uint256 previousPaid = sessionProviderPaid[requester][sessionId][provider];
-        uint256 previousUnits = sessionProviderUnits[requester][sessionId][provider];
-        require(cumulativeAmount > previousPaid, "nothing new");
-        require(cumulativeUnits >= previousUnits, "units decreased");
-        uint256 delta = cumulativeAmount - previousPaid;
-
-        uint256 spent = uint256(sessionSpent[requester][sessionId]) + delta;
-        require(spent <= maxAmount, "session limit");
-        require(delta <= escrowBalance[requester], "escrow balance");
-
-        sessionProviderPaid[requester][sessionId][provider] = uint128(cumulativeAmount);
-        sessionProviderUnits[requester][sessionId][provider] = uint128(cumulativeUnits);
-        sessionSpent[requester][sessionId] = uint128(spent);
-        escrowBalance[requester] -= uint128(delta);
-
-        require(token.transfer(provider, delta), "provider payment failed");
-        emit EscrowSessionClaimed(
-            sessionId,
-            requester,
-            provider,
-            sessionKey,
-            delta,
-            cumulativeAmount,
-            cumulativeUnits,
-            spent
-        );
+        _validateSpendAuthorization(auth, authorizationSignature);
+        _validateProviderVoucher(auth, voucher, voucherSignature);
+        _settleEscrowSession(auth, voucher);
     }
 
-    /// @notice Legacy/provider-specific channel path kept for compatibility during migration.
+    /// @notice Legacy/provider-specific channel path kept during migration.
     function openChannel(address provider, uint256 amount, uint64 expiresAt)
         external
         returns (bytes32 channelId)
@@ -415,6 +365,96 @@ contract WQPUComputeMarket {
             )
         );
         return keccak256(abi.encodePacked("\x19\x01", DOMAIN_SEPARATOR, structHash));
+    }
+
+    function _validateSpendAuthorization(
+        SpendAuthorizationData calldata auth,
+        bytes calldata authorizationSignature
+    ) internal view {
+        require(auth.requester != address(0), "zero requester");
+        require(auth.sessionKey != address(0), "zero session key");
+        require(auth.maxAmount != 0, "zero session limit");
+        require(auth.pricePerMillionUnits != 0, "zero session price");
+        require(block.timestamp <= auth.validUntil, "session expired");
+        require(!revokedSessions[auth.requester][auth.sessionId], "session revoked");
+        require(
+            registry.globalPricePerMillionUnits() == auth.pricePerMillionUnits,
+            "network price changed"
+        );
+
+        bytes32 digest = spendAuthorizationDigest(
+            auth.requester,
+            auth.sessionKey,
+            auth.sessionId,
+            auth.maxAmount,
+            auth.pricePerMillionUnits,
+            auth.validUntil
+        );
+        require(_recover(digest, authorizationSignature) == auth.requester, "bad spend auth");
+    }
+
+    function _validateProviderVoucher(
+        SpendAuthorizationData calldata auth,
+        ProviderVoucherData calldata voucher,
+        bytes calldata voucherSignature
+    ) internal view {
+        require(
+            voucher.provider != address(0) && voucher.provider != auth.requester,
+            "bad provider"
+        );
+        require(voucher.cumulativeUnits <= type(uint128).max, "units too large");
+        require(voucher.cumulativeAmount <= type(uint128).max, "amount too large");
+        uint256 expectedAmount =
+            (voucher.cumulativeUnits * uint256(auth.pricePerMillionUnits)) / PRICE_UNITS;
+        require(voucher.cumulativeAmount == expectedAmount, "wrong network price");
+
+        bytes32 digest = providerVoucherDigest(
+            auth.requester,
+            voucher.provider,
+            auth.sessionId,
+            voucher.cumulativeAmount,
+            voucher.cumulativeUnits
+        );
+        require(
+            _sessionSignatureMatches(digest, voucherSignature, auth.sessionKey),
+            "bad provider voucher"
+        );
+    }
+
+    function _settleEscrowSession(
+        SpendAuthorizationData calldata auth,
+        ProviderVoucherData calldata voucher
+    ) internal {
+        uint256 previousPaid =
+            sessionProviderPaid[auth.requester][auth.sessionId][voucher.provider];
+        uint256 previousUnits =
+            sessionProviderUnits[auth.requester][auth.sessionId][voucher.provider];
+        require(voucher.cumulativeAmount > previousPaid, "nothing new");
+        require(voucher.cumulativeUnits >= previousUnits, "units decreased");
+
+        uint256 delta = voucher.cumulativeAmount - previousPaid;
+        uint256 spent = uint256(sessionSpent[auth.requester][auth.sessionId]) + delta;
+        require(spent <= auth.maxAmount, "session limit");
+        require(delta <= escrowBalance[auth.requester], "escrow balance");
+
+        sessionProviderPaid[auth.requester][auth.sessionId][voucher.provider] =
+            uint128(voucher.cumulativeAmount);
+        sessionProviderUnits[auth.requester][auth.sessionId][voucher.provider] =
+            uint128(voucher.cumulativeUnits);
+        sessionSpent[auth.requester][auth.sessionId] = uint128(spent);
+        escrowBalance[auth.requester] -= uint128(delta);
+
+        require(token.transfer(voucher.provider, delta), "provider payment failed");
+        emit EscrowSessionClaimed(
+            auth.sessionId,
+            auth.requester,
+            voucher.provider,
+            auth.sessionKey,
+            delta,
+            voucher.cumulativeAmount,
+            voucher.cumulativeUnits,
+            spent
+        );
     }
 
     function _settle(
