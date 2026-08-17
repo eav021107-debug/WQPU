@@ -21,11 +21,14 @@ import time
 
 import wqpu
 from wqpu_chain import RegistryClient, parse_endpoint
-from wqpu_session import load_session, save_session, session_address
+from wqpu_meter import MeterError, UsageBook
+from wqpu_payments import PaymentError, PaymentSession
+from wqpu_session import escrow_balance, load_session, save_session, session_address
 from wqpu_wallet import connect_wallet
 
 VERSION = "0.6.0-dev"
 STATE_FILE = wqpu.HOME / "chain.json"
+USAGE_DIR = wqpu.HOME / "usage"
 PUBLIC_PROTOCOL = "wqpu-public-v1"
 DEFAULT_SESSION_MAX_AMOUNT = 10 * 10 ** 18
 DEFAULT_SESSION_LIFETIME = 24 * 60 * 60
@@ -204,6 +207,58 @@ def persist_session(wallet, chain_id, request, signature):
     })
 
 
+def save_usage_receipt(mesh, snapshot):
+    receipt = {
+        "version": 1,
+        "kind": "wqpu-rpc-usage-receipt",
+        "created_at": int(time.time()),
+        "model": wqpu.model_name(),
+        "meter": "llama.cpp-rpc-graph-node-executions-v1",
+        "prototype_accounting": True,
+        "workers": [],
+    }
+    auto_vouchers = os.environ.get("WQPU_AUTO_VOUCHERS", "0") == "1"
+    payments = None
+    if auto_vouchers:
+        try:
+            payments = PaymentSession(mesh.chain)
+            payments.validate()
+        except Exception as exc:
+            receipt["payment_error"] = str(exc)
+
+    for node_id, stats in snapshot.items():
+        units = int(stats.get("node_executions") or 0)
+        if units <= 0:
+            continue
+        info = mesh.peer_info.get(node_id) or {}
+        wallet = str(info.get("wallet") or "").lower()
+        worker = {
+            "node_id": node_id,
+            "wallet": wallet or None,
+            "hostname": info.get("hostname"),
+            "prototype_compute_units": units,
+            "rpc": stats,
+        }
+        if payments and wallet:
+            try:
+                worker["voucher"] = payments.issue(wallet, units)
+            except Exception as exc:
+                worker["voucher_error"] = str(exc)
+        receipt["workers"].append(worker)
+
+    if not receipt["workers"]:
+        return receipt, None
+
+    USAGE_DIR.mkdir(parents=True, exist_ok=True)
+    path = USAGE_DIR / "request-{}-{}.json".format(int(time.time()), secrets.token_hex(4))
+    path.write_text(json.dumps(receipt, indent=2) + "\n")
+    try:
+        path.chmod(0o600)
+    except Exception:
+        pass
+    return receipt, path
+
+
 class ChainMesh(wqpu.Mesh):
     def __init__(self, cfg, chain, wallet):
         super(ChainMesh, self).__init__(cfg)
@@ -214,6 +269,7 @@ class ChainMesh(wqpu.Mesh):
         self.chain_peers = {}
         self.verified_node_ids = set()
         self.payment_session = load_session()
+        self.usage_book = None
 
     def my_info(self):
         info = super(ChainMesh, self).my_info()
@@ -302,6 +358,42 @@ class ChainMesh(wqpu.Mesh):
         peers.sort(key=rank)
         limit = max(1, int(os.environ.get("WQPU_MAX_WORKERS", "8")))
         return peers[:limit]
+
+    def begin_usage(self):
+        self.usage_book = UsageBook()
+
+    def end_usage(self):
+        book = self.usage_book
+        self.usage_book = None
+        return book.snapshot() if book else {}
+
+    async def _copy_metered(self, reader, writer, meter):
+        try:
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                if meter:
+                    try:
+                        meter.feed(data)
+                    except MeterError:
+                        meter = None
+                writer.write(data)
+                await writer.drain()
+        except Exception:
+            pass
+        await wqpu.close_writer(writer)
+
+    async def proxy_handler(self, target, cr, cw):
+        try:
+            rr, rw = await self.open_rpc(target)
+            meter = self.usage_book.meter(target) if self.usage_book else None
+            await asyncio.gather(
+                self._copy_metered(cr, rw, meter),
+                wqpu.copy_stream(rr, cw),
+            )
+        except Exception:
+            await wqpu.close_writer(cw)
 
 
 async def wait_for_registration(chain, wallet, endpoint, fingerprint, timeout=120):
@@ -426,10 +518,30 @@ async def ensure_wallet(chain, state, force=False):
     return wallet
 
 
+async def run_metered_request(mesh, server_bin, text):
+    mesh.begin_usage()
+    try:
+        await wqpu.ask(mesh, server_bin, text)
+    finally:
+        snapshot = mesh.end_usage()
+        receipt, path = await wqpu.to_thread(save_usage_receipt, mesh, snapshot)
+        for worker in receipt.get("workers") or []:
+            print("[worker {} | prototype units {}]".format(
+                str(worker.get("wallet") or worker.get("node_id") or "?")[:12],
+                worker.get("prototype_compute_units", 0),
+            ))
+            if worker.get("voucher"):
+                print("[automatic cumulative voucher issued]")
+            elif worker.get("voucher_error"):
+                print("[voucher not issued: {}]".format(worker["voucher_error"]))
+        if path:
+            print("[usage receipt: {}]".format(path))
+
+
 async def interactive(mesh, server_bin):
     wqpu.ensure_console_stdin()
     print("\nWQPU public peer is online. Type a question.")
-    print("Commands: /status  /peers  /chain  /wallet  /session  /exit\n")
+    print("Commands: /status  /peers  /chain  /wallet  /session  /payment  /exit\n")
     while not mesh.stop.is_set():
         try:
             line = (await wqpu.to_thread(input, "wqpu> ")).strip()
@@ -458,6 +570,20 @@ async def interactive(mesh, server_bin):
                 print("Price / 1M units: {}".format(session.get("price_per_million_units")))
                 print("Valid until: {}".format(session.get("valid_until")))
             continue
+        if line == "/payment":
+            try:
+                payments = PaymentSession(mesh.chain)
+                payments.validate()
+                balance = escrow_balance(mesh.chain, payments.market, payments.requester)
+                print("Escrow: {} token-wei | local vouchers: {} / {}".format(
+                    balance, payments.local_spent(), payments.max_amount
+                ))
+                print("Automatic vouchers: {}".format(
+                    "on" if os.environ.get("WQPU_AUTO_VOUCHERS", "0") == "1" else "off"
+                ))
+            except Exception as exc:
+                print("Payment unavailable: {}".format(exc))
+            continue
         if line == "/chain":
             price = mesh.chain_price
             print("RPC: {}".format(mesh.chain.rpc_url))
@@ -480,7 +606,7 @@ async def interactive(mesh, server_bin):
                 ))
             continue
         try:
-            await wqpu.ask(mesh, server_bin, line)
+            await run_metered_request(mesh, server_bin, line)
         except Exception as exc:
             print("WQPU error: {}".format(exc))
 
