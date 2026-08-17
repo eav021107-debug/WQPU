@@ -9,6 +9,7 @@ from __future__ import print_function
 import argparse
 import json
 import os
+import ssl
 import threading
 import time
 import urllib.request
@@ -47,6 +48,24 @@ def method_allowed(method):
     if method.startswith(BLOCKED_PREFIXES):
         return False
     return False
+
+
+def validate_tls_pair(cert, key):
+    cert = str(cert or "").strip()
+    key = str(key or "").strip()
+    if bool(cert) != bool(key):
+        raise RuntimeError("both TLS certificate and key are required")
+    return cert, key
+
+
+def enable_tls(server, cert, key):
+    cert, key = validate_tls_pair(cert, key)
+    if not cert:
+        return False
+    context = ssl.SSLContext(getattr(ssl, "PROTOCOL_TLS_SERVER", ssl.PROTOCOL_TLS))
+    context.load_cert_chain(certfile=cert, keyfile=key)
+    server.socket = context.wrap_socket(server.socket, server_side=True)
+    return True
 
 
 class RateLimiter(object):
@@ -122,7 +141,7 @@ class GatewayHTTPServer(ThreadingHTTPServer):
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
-    server_version = "WQPURPCGateway/0.1"
+    server_version = "WQPURPCGateway/0.2"
 
     def log_message(self, fmt, *args):
         if os.environ.get("WQPU_GATEWAY_QUIET", "0") != "1":
@@ -172,12 +191,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
             self._json(400, jsonrpc_error(None, -32700, str(exc)))
 
 
-def serve(host=None, port=None, upstream=None):
+def serve(host=None, port=None, upstream=None, tls_cert=None, tls_key=None):
     host = host or os.environ.get("WQPU_GATEWAY_HOST", "0.0.0.0")
     port = int(port or os.environ.get("WQPU_GATEWAY_PORT", "8545"))
     rate = int(os.environ.get("WQPU_GATEWAY_RATE_LIMIT", str(DEFAULT_RATE)))
+    tls_cert = tls_cert or os.environ.get("WQPU_GATEWAY_TLS_CERT", "")
+    tls_key = tls_key or os.environ.get("WQPU_GATEWAY_TLS_KEY", "")
     server = GatewayHTTPServer((host, port), Gateway(upstream), rate)
-    print("WQPU RPC gateway listening on http://{}:{}".format(host, server.server_port))
+    secure = enable_tls(server, tls_cert, tls_key)
+    scheme = "https" if secure else "http"
+    print("WQPU RPC gateway listening on {}://{}:{}".format(scheme, host, server.server_port))
     try:
         server.serve_forever()
     finally:
@@ -189,8 +212,10 @@ def main():
     parser.add_argument("--host", default=None)
     parser.add_argument("--port", type=int, default=None)
     parser.add_argument("--upstream", default=None)
+    parser.add_argument("--tls-cert", default=None)
+    parser.add_argument("--tls-key", default=None)
     args = parser.parse_args()
-    serve(args.host, args.port, args.upstream)
+    serve(args.host, args.port, args.upstream, args.tls_cert, args.tls_key)
     return 0
 
 
