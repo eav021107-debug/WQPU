@@ -150,11 +150,15 @@ def make_session_request(chain, market):
     if lifetime < 60:
         raise RuntimeError("WQPU_SESSION_LIFETIME must be at least 60 seconds")
     now = latest_block_timestamp(chain)
+    price = int(chain.global_price())
+    if price <= 0 or price >= 2 ** 128:
+        raise RuntimeError("invalid WQPU global price")
     return {
         "market": market,
         "sessionKey": session_address(chain),
         "sessionId": "0x" + secrets.token_hex(32),
         "maxAmount": max_amount,
+        "pricePerMillionUnits": price,
         "validUntil": now + lifetime,
     }
 
@@ -168,6 +172,7 @@ def session_is_usable(chain, wallet, market):
     try:
         now = latest_block_timestamp(chain)
         local_key = session_address(chain)
+        current_price = int(chain.global_price())
         return (
             str(saved.get("requester") or "").lower() == wallet.lower()
             and str(saved.get("market") or "").lower() == market.lower()
@@ -176,6 +181,7 @@ def session_is_usable(chain, wallet, market):
             and str(saved.get("authorization_signature") or "").startswith("0x")
             and int(saved.get("valid_until") or 0) > now + 60
             and int(saved.get("max_amount") or 0) > 0
+            and int(saved.get("price_per_million_units") or 0) == current_price
         )
     except Exception:
         return False
@@ -191,6 +197,7 @@ def persist_session(wallet, chain_id, request, signature):
         "session_key": request["sessionKey"].lower(),
         "session_id": request["sessionId"].lower(),
         "max_amount": int(request["maxAmount"]),
+        "price_per_million_units": int(request["pricePerMillionUnits"]),
         "valid_until": int(request["validUntil"]),
         "authorization_signature": signature,
         "authorized_at": int(time.time()),
@@ -448,6 +455,7 @@ async def interactive(mesh, server_bin):
             else:
                 print("Session key: {}".format(session.get("session_key")))
                 print("Limit: {} token-wei".format(session.get("max_amount")))
+                print("Price / 1M units: {}".format(session.get("price_per_million_units")))
                 print("Valid until: {}".format(session.get("valid_until")))
             continue
         if line == "/chain":
