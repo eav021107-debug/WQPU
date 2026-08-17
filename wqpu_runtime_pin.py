@@ -12,6 +12,7 @@ import json
 import os
 import shutil
 import tarfile
+import time
 import zipfile
 from pathlib import Path
 
@@ -19,6 +20,7 @@ import wqpu
 
 
 DEFAULT_LLAMA_TAG = "b10456"
+NETWORK_ATTEMPTS = 4
 
 
 def network_runtime_config():
@@ -61,6 +63,58 @@ def _verify_asset(path, asset):
         raise RuntimeError("llama.cpp asset SHA-256 mismatch")
 
 
+def _retryable(exc):
+    code = getattr(exc, "code", None)
+    if code is not None:
+        try:
+            code = int(code)
+        except Exception:
+            code = None
+    # Exact 4xx responses (missing tag, forbidden asset, etc.) will not improve by retrying.
+    return code is None or code >= 500
+
+
+def _backoff(attempt):
+    # Keep installs responsive while smoothing over transient GitHub/CDN 5xx/timeouts.
+    time.sleep(min(8, 1 << int(attempt)))
+
+
+def _release_json(tag, attempts=NETWORK_ATTEMPTS):
+    url = "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{}".format(tag)
+    last = None
+    for attempt in range(int(attempts)):
+        try:
+            return wqpu.api_json(url)
+        except Exception as exc:
+            last = exc
+            if not _retryable(exc) or attempt + 1 >= int(attempts):
+                break
+            _backoff(attempt)
+    raise RuntimeError("could not fetch pinned llama.cpp {} release metadata: {}".format(tag, last))
+
+
+def _download_asset(url, path, attempts=NETWORK_ATTEMPTS):
+    last = None
+    for attempt in range(int(attempts)):
+        try:
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            wqpu.download(url, path)
+            return
+        except Exception as exc:
+            last = exc
+            try:
+                path.unlink()
+            except OSError:
+                pass
+            if not _retryable(exc) or attempt + 1 >= int(attempts):
+                break
+            _backoff(attempt)
+    raise RuntimeError("could not download pinned llama.cpp runtime: {}".format(last))
+
+
 def ensure_runtime():
     wqpu.ensure_home()
     tag = desired_tag()
@@ -76,9 +130,7 @@ def ensure_runtime():
             pass
 
     print("WQPU: downloading pinned llama.cpp {}...".format(tag))
-    release = wqpu.api_json(
-        "https://api.github.com/repos/ggml-org/llama.cpp/releases/tags/{}".format(tag)
-    )
+    release = _release_json(tag)
     actual_tag = str(release.get("tag_name") or "")
     if actual_tag != tag:
         raise RuntimeError("llama.cpp release tag mismatch")
@@ -97,7 +149,7 @@ def ensure_runtime():
     target.mkdir(parents=True)
     archive = wqpu.RUNTIME / str(asset["name"])
     try:
-        wqpu.download(asset["browser_download_url"], archive)
+        _download_asset(asset["browser_download_url"], archive)
         _verify_asset(archive, asset)
         if archive.suffix == ".zip":
             with zipfile.ZipFile(str(archive)) as bundle:
