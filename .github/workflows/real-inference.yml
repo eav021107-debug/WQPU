@@ -1,0 +1,75 @@
+name: WQPU real inference
+
+on:
+  push:
+    paths:
+      - 'scripts/check_real_inference.py'
+      - '.github/workflows/real-inference.yml'
+      - 'wqpu_runtime_pin.py'
+      - 'wqpu_autopay.py'
+      - 'wqpu_meter.py'
+      - 'wqpu_accounting.py'
+      - 'wqpu_attestation.py'
+      - 'wqpu_public_security.py'
+      - 'wqpu_transport_relay.py'
+  pull_request:
+    paths:
+      - 'scripts/check_real_inference.py'
+      - '.github/workflows/real-inference.yml'
+      - 'wqpu_runtime_pin.py'
+      - 'wqpu_autopay.py'
+      - 'wqpu_meter.py'
+      - 'wqpu_accounting.py'
+      - 'wqpu_attestation.py'
+      - 'wqpu_public_security.py'
+      - 'wqpu_transport_relay.py'
+  workflow_dispatch:
+
+jobs:
+  real-inference-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/llama.cpp
+            ~/.wqpu/runtime
+          key: wqpu-real-inference-b10456-gemma3-1b-${{ runner.os }}
+      - name: Compile real inference path
+        run: >-
+          python -m py_compile
+          wqpu.py wqpu_chain.py wqpu_runtime.py wqpu_runtime_pin.py
+          wqpu_autopay.py wqpu_meter.py wqpu_accounting.py wqpu_attestation.py
+          wqpu_network_guard.py wqpu_node_identity.py wqpu_node_status.py
+          wqpu_public_config.py wqpu_public_security.py wqpu_transport_relay.py
+          scripts/testnet_stack.py scripts/testnet_doctor.py
+          scripts/check_two_client_relay.py scripts/check_real_inference.py
+      - name: Start isolated operator stack
+        shell: bash
+        run: |
+          unset RUNNER_TRACKING_ID
+          python scripts/testnet_stack.py reset --yes
+          python scripts/testnet_stack.py start \
+            --public-host 127.0.0.1 \
+            --internal-rpc-port 31546 \
+            --rpc-port 21545 \
+            --relayer-port 21787 \
+            --relay-port 21443
+      - name: Real pinned llama.cpp chat through authenticated WQPU relay
+        env:
+          WQPU_LLAMA_TAG: b10456
+          WQPU_REAL_MODEL: ggml-org/gemma-3-1b-it-GGUF:Q4_K_M
+        run: python scripts/check_real_inference.py
+      - name: Operator remains healthy after real inference
+        run: python scripts/testnet_doctor.py
+      - name: Stop operator stack
+        if: always()
+        run: python scripts/testnet_stack.py stop || true
