@@ -50,7 +50,7 @@ The blockchain stores discovery/accounting state only. Prompts, model data and l
 
 ## Model runtime
 
-WQPU pins `llama.cpp` to release `b10456` so every node speaks the same RPC protocol. Downloaded release archives are SHA-256 checked when GitHub publishes an asset digest.
+WQPU pins `llama.cpp` to release `b10456` so every node speaks the same RPC protocol. WQPU also pins the exact supported CPU/GPU release assets and SHA-256 values so switching accelerator backends cannot silently switch RPC versions.
 
 Default model:
 
@@ -59,6 +59,28 @@ ggml-org/gemma-3-1b-it-GGUF:Q4_K_M
 ```
 
 Override it with `WQPU_MODEL`.
+
+### CPU / GPU workers
+
+The default is `WQPU_ACCEL=auto`; normally there is nothing to configure. WQPU selects a pinned backend build for the machine and no longer forces `ggml-rpc-server --device CPU`:
+
+- macOS uses the Metal-capable pinned build;
+- Windows x64 with a compatible NVIDIA driver uses the CUDA 12.4 build and its pinned CUDA runtime bundle;
+- Windows can fall back to Vulkan, then CPU;
+- Linux x64/arm64 uses the pinned Vulkan build when a real Vulkan GPU path is available, otherwise CPU;
+- CUDA workers advertise detected VRAM as provider capacity; accelerator metadata is also included in the live node status.
+
+Manual overrides are available for troubleshooting or deterministic deployments:
+
+```bash
+WQPU_ACCEL=cpu wqpu
+WQPU_ACCEL=vulkan wqpu
+WQPU_ACCEL=metal wqpu
+WQPU_ACCEL=cuda12 wqpu
+WQPU_RPC_DEVICE=CUDA1 wqpu
+```
+
+`wqpu doctor` shows the selected accelerator, runtime variant and detected VRAM. WQPU still forces llama.cpp RPC traffic to remain TCP inside the authenticated/metered WQPU TLS tunnel; a GPU backend does not bypass node identity, NAT relay or dual-meter accounting.
 
 ## Wallet and payments
 
@@ -87,6 +109,8 @@ The network operator can enable automatic voucher issuance from `network-config.
 ## Compute metering
 
 Meter v2 parses the pinned llama.cpp serialized RPC graph. It estimates scalar work from tensor shapes; matrix multiplication and flash attention receive shape-aware estimates instead of treating every graph node equally. Malformed, partial or protocol-mismatched streams fail closed and cannot create a voucher.
+
+Real llama.cpp uses multiple physical RPC sockets for one logical request. WQPU meters each socket independently, verifies each worker-signed report against the provider wallet's on-chain TLS fingerprint, and aggregates only verified reports before creating a voucher.
 
 This is still experimental accounting, not a formally fraud-proof FLOP oracle. Real-value automatic payment should only be enabled after adversarial testing and audit of the selected public deployment.
 
@@ -147,6 +171,7 @@ GitHub Actions covers:
 
 - Python 3.8 and 3.11;
 - unit/adversarial parser and payment tests;
+- CPU/GPU backend selection and pinned runtime manifest tests;
 - Linux installer;
 - Windows installer;
 - Solidity compilation and Foundry tests;
@@ -155,7 +180,11 @@ GitHub Actions covers:
 - OpenSSL wallet/session signatures;
 - HTTP-relayed permit/session/provider-payment round-trip;
 - replay rejection/reserved-session accounting;
-- requester -> relay -> NAT worker integration.
+- requester -> relay -> NAT worker integration;
+- real pinned Gemma inference through one measured/paid worker;
+- one real Gemma request split across two independently metered and paid WQPU workers.
+
+A physical CUDA/Metal/Vulkan runner is still required to benchmark actual GPU execution; hosted CI validates accelerator selection and preserves the real CPU multiworker regression path.
 
 ## Deployment boundary
 
