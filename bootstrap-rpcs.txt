@@ -1,5 +1,12 @@
-# WQPU bootstrap RPC seeds.
-# One RPC URL per line. These locate the WQPU blockchain only.
-# Compute peers are discovered exclusively from the on-chain registry.
+# WQPU trusted bootstrap RPCs.
 #
-# Keep empty for local automatic LAN bootstrap during devnet testing.
+# These addresses locate the WQPU blockchain only. They are NOT compute peers.
+# Compute/storage peers are discovered exclusively from the authenticated
+# on-chain registry after the blockchain connection has been verified.
+#
+# Production entries must use HTTPS or WSS. The one-command client rejects
+# LAN broadcast discovery, arbitrary network-supplied RPCs and insecure HTTP/WS
+# unless an explicit development flag is enabled.
+#
+# One trusted production RPC URL per line will be added when the first public
+# WQPU bootstrap endpoint is deployed.
