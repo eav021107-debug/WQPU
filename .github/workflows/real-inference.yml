@@ -6,6 +6,7 @@ on:
       - 'scripts/check_real_rpc_wire.py'
       - 'scripts/check_real_inference.py'
       - '.github/workflows/real-inference.yml'
+      - 'wqpu_entry.py'
       - 'wqpu_runtime_pin.py'
       - 'wqpu_autopay.py'
       - 'wqpu_meter.py'
@@ -18,6 +19,7 @@ on:
       - 'scripts/check_real_rpc_wire.py'
       - 'scripts/check_real_inference.py'
       - '.github/workflows/real-inference.yml'
+      - 'wqpu_entry.py'
       - 'wqpu_runtime_pin.py'
       - 'wqpu_autopay.py'
       - 'wqpu_meter.py'
@@ -48,7 +50,7 @@ jobs:
       - name: Compile real inference path
         run: >-
           python -m py_compile
-          wqpu.py wqpu_chain.py wqpu_runtime.py wqpu_runtime_pin.py
+          wqpu.py wqpu_entry.py wqpu_chain.py wqpu_runtime.py wqpu_runtime_pin.py
           wqpu_autopay.py wqpu_meter.py wqpu_accounting.py wqpu_attestation.py
           wqpu_network_guard.py wqpu_node_identity.py wqpu_node_status.py
           wqpu_public_config.py wqpu_public_security.py wqpu_transport_relay.py
@@ -69,11 +71,13 @@ jobs:
       - name: Real b10456 HELLO/device-memory wire through authenticated relay
         env:
           WQPU_LLAMA_TAG: b10456
+          GGML_RDMA_DEV: __wqpu_tcp_tunnel_only__
         run: python scripts/check_real_rpc_wire.py
       - name: Real pinned llama.cpp chat through authenticated WQPU relay
         env:
           WQPU_LLAMA_TAG: b10456
           WQPU_REAL_MODEL: ggml-org/gemma-3-1b-it-GGUF:Q4_K_M
+          GGML_RDMA_DEV: __wqpu_tcp_tunnel_only__
         run: python scripts/check_real_inference.py
       - name: Operator remains healthy after real inference
         run: python scripts/testnet_doctor.py
