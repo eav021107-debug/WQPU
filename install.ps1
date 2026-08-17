@@ -4,7 +4,7 @@ $root = Join-Path $env:LOCALAPPDATA 'WQPU'
 $bin = Join-Path $root 'bin'
 $join = $env:WQPU_JOIN
 $expectedWqpu = 'WQPU 0.6.0-dev'
-$cacheBuster = 'chain-0.6.0-dev-r3'
+$cacheBuster = 'session-0.6.0-dev-r1'
 $chainState = Join-Path $HOME '.wqpu\chain.json'
 
 New-Item -ItemType Directory -Force -Path $root,$bin | Out-Null
@@ -69,7 +69,7 @@ if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
 }
 
 Write-Host 'WQPU: downloading runtime...'
-$pythonFiles = @('wqpu.py','wqpu_chain.py','wqpu_wallet.py','wqpu_runtime.py')
+$pythonFiles = @('wqpu.py','wqpu_chain.py','wqpu_wallet.py','wqpu_session.py','wqpu_runtime.py')
 $files = $pythonFiles + @('network-config.json')
 foreach ($file in $files) {
   Invoke-WebRequest -UseBasicParsing "$raw/$file`?installer=$cacheBuster" -OutFile (Join-Path $root $file)
