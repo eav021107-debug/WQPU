@@ -254,7 +254,6 @@ start_provider_background() {
   local rpc="$1" slot="$2" port log
   port="$(provider_port "$slot")"
   log="$BASE/node-$slot.log"
-  publish_slot "$rpc" "$slot" "wqpu://$local_ip:$port"
   (cd "$SOURCE_DIR/client" && GOWORK=off go run ./cmd/wqpu-dev-node "$rpc" "$slot" "wqpu://0.0.0.0:$port" "$WQPU_RUNTIME_BASE") >"$log" 2>&1 &
   NODE_PID=$!
   wait_node_ready "$NODE_PID" "$log"
