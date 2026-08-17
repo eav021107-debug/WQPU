@@ -10,12 +10,17 @@ on:
       - 'wqpu_meter.py'
       - 'wqpu_accounting.py'
       - 'wqpu_attestation.py'
+      - 'wqpu_session.py'
+      - 'wqpu_payments.py'
+      - 'wqpu_claim.py'
+      - 'wqpu_vouchers.py'
       - 'wqpu_network_guard.py'
       - 'wqpu_node_identity.py'
       - 'wqpu_node_status.py'
       - 'wqpu_public_config.py'
       - 'wqpu_public_security.py'
       - 'wqpu_transport_relay.py'
+      - 'wqpu_relayer.py'
       - 'scripts/testnet_stack.py'
       - 'scripts/testnet_doctor.py'
       - 'scripts/check_two_client_relay.py'
@@ -29,12 +34,17 @@ on:
       - 'wqpu_meter.py'
       - 'wqpu_accounting.py'
       - 'wqpu_attestation.py'
+      - 'wqpu_session.py'
+      - 'wqpu_payments.py'
+      - 'wqpu_claim.py'
+      - 'wqpu_vouchers.py'
       - 'wqpu_network_guard.py'
       - 'wqpu_node_identity.py'
       - 'wqpu_node_status.py'
       - 'wqpu_public_config.py'
       - 'wqpu_public_security.py'
       - 'wqpu_transport_relay.py'
+      - 'wqpu_relayer.py'
       - 'scripts/testnet_stack.py'
       - 'scripts/testnet_doctor.py'
       - 'scripts/check_two_client_relay.py'
@@ -51,14 +61,16 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: stable
-      - name: Compile two-client dual-meter path
+      - name: Compile measured-payment two-client path
         run: >-
           python -m py_compile
           wqpu.py wqpu_chain.py wqpu_runtime.py wqpu_autopay.py
           wqpu_meter.py wqpu_accounting.py wqpu_attestation.py
+          wqpu_session.py wqpu_payments.py wqpu_claim.py wqpu_vouchers.py
           wqpu_network_guard.py wqpu_node_identity.py wqpu_node_status.py
           wqpu_public_config.py wqpu_public_security.py wqpu_transport_relay.py
-          scripts/testnet_stack.py scripts/testnet_doctor.py scripts/check_two_client_relay.py
+          wqpu_relayer.py scripts/testnet_stack.py scripts/testnet_doctor.py
+          scripts/check_two_client_relay.py
       - name: Start isolated operator stack
         shell: bash
         run: |
@@ -70,7 +82,7 @@ jobs:
             --rpc-port 20545 \
             --relayer-port 20787 \
             --relay-port 20443
-      - name: Distinct wallets, TLS identities and signed dual meter through relay
+      - name: Distinct clients measured compute payment through relay
         run: python scripts/check_two_client_relay.py
       - name: Operator remains healthy
         run: python scripts/testnet_doctor.py
