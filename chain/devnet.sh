@@ -1,0 +1,218 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+# shellcheck disable=SC1091
+. "$HERE/runtime.lock"
+
+SRC_DIR="${WQPU_CHAIN_SRC:-$HOME/.cache/wqpu-chain/cosmos-evm-$COSMOS_EVM_TAG}"
+BIN_DIR="${WQPU_CHAIN_BIN_DIR:-$HOME/.local/share/wqpu-chain/bin}"
+CHAIN_HOME="${WQPU_CHAIN_HOME:-$HOME/.wqpu-chain-dev}"
+DEV_TEST_ADDRESS="${WQPU_DEVNET_TEST_ADDRESS:-}"
+PUBLIC_JSON_RPC="${WQPU_DEVNET_PUBLIC_RPC:-0}"
+P2P_SEEDS_FILE="${WQPU_P2P_SEEDS_FILE:-$HERE/../bootstrap-p2p.txt}"
+P2P_SEED_MODE="${WQPU_P2P_SEED_MODE:-0}"
+P2P_EXTERNAL_ADDRESS="${WQPU_P2P_EXTERNAL_ADDRESS:-}"
+BIN="$BIN_DIR/wqpud"
+KEYRING="test" # local devnet only; never use this backend for a public validator
+RESET=0
+BUILD_ONLY=0
+
+usage() {
+  cat <<'EOF'
+Usage: chain/devnet.sh [--reset] [--build-only]
+
+--reset       delete only the local WQPU devnet state and create a fresh genesis
+--build-only  fetch/verify/patch/build the pinned WQPU chain runtime, then exit
+
+P2P bootstrap/PEX controls:
+  WQPU_P2P_SEEDS_FILE=/path/to/seeds.txt
+  WQPU_P2P_SEED_MODE=0|1
+  WQPU_P2P_EXTERNAL_ADDRESS=tcp://HOST:26656
+
+CometBFT PEX is always enabled. Seeds are only first-contact peers; learned peers
+are persisted by CometBFT in config/addrbook.json and used on later starts.
+
+Set WQPU_DEVNET_PUBLIC_RPC=1 only for an isolated LAN test. It binds the devnet
+JSON-RPC/WS ports to all interfaces so other physical WQPU machines can join.
+EOF
+}
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --reset) RESET=1 ;;
+    --build-only) BUILD_ONLY=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
+  esac
+  shift
+done
+
+if [ "$PUBLIC_JSON_RPC" != "0" ] && [ "$PUBLIC_JSON_RPC" != "1" ]; then
+  echo "WQPU_DEVNET_PUBLIC_RPC must be 0 or 1." >&2
+  exit 2
+fi
+if [ "$P2P_SEED_MODE" != "0" ] && [ "$P2P_SEED_MODE" != "1" ]; then
+  echo "WQPU_P2P_SEED_MODE must be 0 or 1." >&2
+  exit 2
+fi
+
+need() {
+  command -v "$1" >/dev/null 2>&1 || {
+    echo "WQPU devnet requires '$1'." >&2
+    exit 1
+  }
+}
+
+need git
+need go
+need python3
+[ -f "$HERE/p2p_config.py" ] || { echo "WQPU P2P config helper is missing." >&2; exit 1; }
+[ -f "$P2P_SEEDS_FILE" ] || { echo "WQPU P2P seed manifest is missing: $P2P_SEEDS_FILE" >&2; exit 1; }
+
+mkdir -p "$(dirname "$SRC_DIR")" "$BIN_DIR"
+
+if [ ! -d "$SRC_DIR/.git" ]; then
+  echo "WQPU chain: fetching pinned consensus/runtime source $COSMOS_EVM_TAG..."
+  rm -rf "$SRC_DIR"
+  git clone --filter=blob:none --no-checkout https://github.com/cosmos/evm.git "$SRC_DIR"
+fi
+
+git -C "$SRC_DIR" fetch --depth=1 origin "$COSMOS_EVM_COMMIT"
+git -C "$SRC_DIR" checkout --detach --force "$COSMOS_EVM_COMMIT" >/dev/null
+ACTUAL_COMMIT="$(git -C "$SRC_DIR" rev-parse HEAD)"
+if [ "$ACTUAL_COMMIT" != "$COSMOS_EVM_COMMIT" ]; then
+  echo "WQPU chain runtime verification failed." >&2
+  exit 1
+fi
+
+echo "WQPU chain: applying native 0x0900 wallet/provider/job/receipt/escrow/bond/price overlay..."
+python3 "$HERE/runtime_patch_settlement.py" \
+  --source "$SRC_DIR" \
+  --overlay "$HERE/x/wqpu/precompile"
+
+if ! grep -q 'WithWQPUSettlementNetwork' "$SRC_DIR/evmd/app.go"; then
+  echo "WQPU chain overlay registration verification failed." >&2
+  exit 1
+fi
+
+echo "WQPU chain: building pinned WQPU runtime..."
+(
+  cd "$SRC_DIR/evmd"
+  GOWORK=off go build -trimpath -o "$BIN" ./cmd/evmd
+)
+chmod 755 "$BIN"
+
+if [ "$BUILD_ONLY" -eq 1 ]; then
+  echo "WQPU chain runtime built: $BIN"
+  exit 0
+fi
+
+if [ "$RESET" -eq 1 ]; then
+  rm -rf "$CHAIN_HOME"
+fi
+
+if [ ! -f "$CHAIN_HOME/config/genesis.json" ]; then
+  echo "WQPU chain: creating fresh local genesis..."
+  mkdir -p "$CHAIN_HOME"
+
+  "$BIN" init wqpu-dev-validator --chain-id "$CHAIN_ID" --home "$CHAIN_HOME" >/dev/null
+  "$BIN" config set client chain-id "$CHAIN_ID" --home "$CHAIN_HOME" >/dev/null
+  "$BIN" config set client keyring-backend "$KEYRING" --home "$CHAIN_HOME" >/dev/null
+
+  # This is an operational validator key for the isolated local devnet, not a
+  # user wallet. User wallets are never generated or imported by WQPU.
+  VALIDATOR_KEY_JSON="$CHAIN_HOME/dev-validator-key.json"
+  umask 077
+  "$BIN" keys add validator \
+    --algo eth_secp256k1 \
+    --keyring-backend "$KEYRING" \
+    --home "$CHAIN_HOME" \
+    --output json > "$VALIDATOR_KEY_JSON"
+
+  python3 "$HERE/devnet_config.py" genesis "$CHAIN_HOME/config/genesis.json" \
+    --base "$BASE_DENOM" \
+    --display "$DISPLAY_DENOM" \
+    --exponent "$DISPLAY_EXPONENT"
+
+  # 1,000,000 WQPU for the dev validator; 10,000 WQPU bonded at genesis.
+  "$BIN" genesis add-genesis-account validator \
+    "1000000000000000000000000${BASE_DENOM}" \
+    --keyring-backend "$KEYRING" \
+    --home "$CHAIN_HOME" >/dev/null
+
+  # Optional deterministic test-only EVM address for CI/live RPC smoke tests.
+  # add-genesis-account resolves literal hex as a keyring name in this SDK,
+  # therefore the same 20 bytes are rendered with the pinned `cosmos` bech32 prefix.
+  if [ -n "$DEV_TEST_ADDRESS" ]; then
+    DEV_TEST_BECH32="$(python3 "$HERE/devnet_config.py" bech32 "$DEV_TEST_ADDRESS" --prefix cosmos)"
+    "$BIN" genesis add-genesis-account "$DEV_TEST_BECH32" \
+      "1000000000000000000000${BASE_DENOM}" \
+      --home "$CHAIN_HOME" >/dev/null
+  fi
+
+  "$BIN" genesis gentx validator \
+    "10000000000000000000000${BASE_DENOM}" \
+    --gas-prices "1${BASE_DENOM}" \
+    --keyring-backend "$KEYRING" \
+    --chain-id "$CHAIN_ID" \
+    --home "$CHAIN_HOME" >/dev/null
+
+  "$BIN" genesis collect-gentxs --home "$CHAIN_HOME" >/dev/null
+  "$BIN" genesis validate-genesis --home "$CHAIN_HOME" >/dev/null
+fi
+
+# Runtime config is repaired on every start, not just first genesis creation.
+# This makes an existing devnet home self-heal after older WQPU versions.
+python3 "$HERE/devnet_config.py" app-toml "$CHAIN_HOME/config/app.toml" \
+  --evm-chain-id "$EVM_CHAIN_ID"
+python3 "$HERE/devnet_config.py" config-toml "$CHAIN_HOME/config/config.toml"
+
+P2P_ARGS=(
+  "$CHAIN_HOME/config/config.toml"
+  --seeds-file "$P2P_SEEDS_FILE"
+  --seed-mode "$P2P_SEED_MODE"
+)
+if [ -n "$P2P_EXTERNAL_ADDRESS" ]; then
+  P2P_ARGS+=(--external-address "$P2P_EXTERNAL_ADDRESS")
+fi
+python3 "$HERE/p2p_config.py" "${P2P_ARGS[@]}"
+
+JSON_RPC_ADDRESS="127.0.0.1:8545"
+if [ "$PUBLIC_JSON_RPC" = "1" ]; then
+  # devnet_config.py deliberately defaults to loopback. Multi-machine devnet
+  # mode explicitly widens only JSON-RPC/WS after that safe baseline is applied.
+  python3 - "$CHAIN_HOME/config/app.toml" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old_rpc = 'address = "127.0.0.1:8545"'
+old_ws = 'ws-address = "127.0.0.1:8546"'
+if text.count(old_rpc) != 1 or text.count(old_ws) != 1:
+    raise SystemExit("WQPU public devnet RPC patch could not find the expected safe bindings")
+text = text.replace(old_rpc, 'address = "0.0.0.0:8545"')
+text = text.replace(old_ws, 'ws-address = "0.0.0.0:8546"')
+path.write_text(text, encoding="utf-8")
+PY
+  JSON_RPC_ADDRESS="0.0.0.0:8545"
+  echo "WARNING: WQPU devnet JSON-RPC is exposed to the LAN. Do not expose ports 8545/8546 to the public Internet."
+fi
+
+echo "WQPU sovereign devnet"
+echo "  chain-id:      $CHAIN_ID"
+echo "  EVM chain-id:  $EVM_CHAIN_ID"
+echo "  native coin:   $DISPLAY_DENOM ($BASE_DENOM)"
+echo "  precompile:    0x0000000000000000000000000000000000000900"
+echo "  JSON-RPC:      http://$JSON_RPC_ADDRESS"
+echo "  P2P/PEX:       enabled (addrbook persisted)"
+echo "  P2P seed mode: $P2P_SEED_MODE"
+echo "  data:          $CHAIN_HOME"
+echo
+
+echo "Starting wqpud..."
+exec "$BIN" start \
+  --home "$CHAIN_HOME" \
+  --chain-id "$CHAIN_ID" \
+  --minimum-gas-prices="0${BASE_DENOM}" \
+  --evm.min-tip=0

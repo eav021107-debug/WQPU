@@ -4,6 +4,16 @@ WQPU is an experimental **equal-peer distributed LLM network** built around `lla
 
 There is no permanent coordinator and no dedicated relay program. Every computer runs the same `wqpu.py` and has the same rights and functions.
 
+## Next foundation: one-command full-stack smoke
+
+On Linux or macOS, the current `next-foundation` can download its pinned toolchain, start the sovereign WQPU devnet, publish three equal compute nodes, split one tiny LLM across two remote nodes, run inference, verify remote model allocation, and cleanly stop the local test network:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/next-foundation/next.sh | bash
+```
+
+This is a full local integration smoke for the new foundation, not yet the final persistent public-node CLI. It requires `curl`, `tar`, `git`, and `python3`; Go 1.25.9 is installed privately by the script and verified before use.
+
 ```text
 Mac <----> Windows <----> Linux/VPS <----> other WQPU peers
   \____________ equal-peer WQPU mesh ______________/

@@ -1,0 +1,63 @@
+name: wqpu-live-compute-integration
+
+on:
+  push:
+    branches: [next-foundation]
+    paths:
+      - 'next.sh'
+      - 'chain/devnet.sh'
+      - 'chain/devnet_config.py'
+      - 'chain/runtime.lock'
+      - 'chain/runtime_patch*.py'
+      - 'chain/cmd/wqpu-compute-bootstrap/**'
+      - 'chain/x/wqpu/precompile/**'
+      - 'client/internal/chainclient/**'
+      - 'client/internal/chainregistry/**'
+      - 'client/internal/computenode/**'
+      - 'client/internal/llamaruntime/**'
+      - 'client/internal/carrier/**'
+      - 'client/internal/peertransport/**'
+      - 'client/internal/rpctunnel/**'
+      - 'client/internal/rpcmesh/**'
+      - 'client/internal/sessionkey/**'
+      - 'client/internal/transport/**'
+      - 'client/cmd/wqpu-live-chain-compute-smoke/**'
+      - '.github/workflows/wqpu-live-compute-integration.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  full-live-chain-compute:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 55
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+
+      - name: Resolve pinned chain dependencies
+        working-directory: chain
+        run: go mod tidy
+
+      - name: Resolve pinned client dependencies
+        working-directory: client
+        run: go mod tidy
+
+      - name: Run the public one-command full-stack smoke
+        shell: bash
+        env:
+          WQPU_SOURCE_DIR: ${{ github.workspace }}
+          WQPU_USE_SYSTEM_GO: '1'
+          WQPU_NEXT_HOME: ${{ runner.temp }}/wqpu-next
+        run: bash ./next.sh

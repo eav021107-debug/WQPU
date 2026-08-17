@@ -1,0 +1,118 @@
+name: wqpu-multimachine-integration
+
+on:
+  push:
+    branches: [next-foundation]
+    paths:
+      - 'up.sh'
+      - 'join.sh'
+      - 'bootstrap-rpcs.txt'
+      - 'bootstrap-p2p.txt'
+      - 'chain-checkpoint.txt'
+      - 'network.sh'
+      - 'chain/devnet.sh'
+      - 'chain/public-bootstrap.sh'
+      - 'chain/public-bootstrap-entry.sh'
+      - 'chain/public-join.sh'
+      - 'chain/devnet_config.py'
+      - 'chain/p2p_config.py'
+      - 'chain/node_id.py'
+      - 'chain/test_p2p_config.py'
+      - 'chain/test_node_id.py'
+      - 'chain/runtime.lock'
+      - 'chain/runtime_patch*.py'
+      - 'chain/cmd/wqpu-compute-bootstrap/**'
+      - 'chain/cmd/wqpu-slot-helper/**'
+      - 'chain/x/wqpu/precompile/**'
+      - 'client/internal/chainclient/**'
+      - 'client/internal/chainregistry/**'
+      - 'client/internal/computenode/**'
+      - 'client/internal/devidentity/**'
+      - 'client/internal/llamaruntime/**'
+      - 'client/internal/carrier/**'
+      - 'client/internal/peertransport/**'
+      - 'client/internal/rpctunnel/**'
+      - 'client/internal/rpcmesh/**'
+      - 'client/internal/sessionkey/**'
+      - 'client/internal/transport/**'
+      - 'client/cmd/wqpu-dev-node/**'
+      - 'client/cmd/wqpu-dev-infer/**'
+      - 'client/cmd/wqpu-rpc-verify/**'
+      - '.github/workflows/wqpu-multimachine-integration.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cross-machine-proof:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+
+      - name: Validate decentralized bootstrap launcher
+        shell: bash
+        run: |
+          bash -n ./up.sh
+          bash -n ./join.sh
+          bash -n ./chain/devnet.sh
+          bash -n ./chain/public-bootstrap.sh
+          bash -n ./chain/public-bootstrap-entry.sh
+          bash -n ./chain/public-join.sh
+          ! grep -Eq 'WQPU_CHAIN_DISCOVER|255\.255\.255\.255|start_lan_beacon|find_lan_rpc' ./up.sh
+          grep -Fq 'BOOTSTRAP_CACHE' ./up.sh
+          grep -Fq 'bootstrap-p2p.txt' ./up.sh
+          grep -Fq 'chain-checkpoint.txt' ./up.sh
+          grep -Fq 'load_chain_checkpoint' ./up.sh
+          grep -Fq 'WQPU_DEV_LOCAL_FALLBACK' ./up.sh
+          grep -Fq 'wqpu-rpc-verify' ./up.sh
+          grep -Fq 'Only TCP/26656 should be public' ./chain/public-bootstrap.sh
+          grep -Fq '127.0.0.1:26657/status' ./chain/public-bootstrap.sh
+          grep -Fq 'go run -mod=mod ./cmd/wqpu-compute-bootstrap address' ./chain/public-bootstrap.sh
+          grep -Fq 'WQPU_PUBLIC_RESET_PARTIAL' ./chain/public-bootstrap-entry.sh
+          ! grep -Eq 'firewall-cmd .*--add-port=(8545|8546|26657)' ./chain/public-bootstrap.sh
+          grep -Fq 'genesis checksum mismatch' ./chain/public-join.sh
+          grep -Fq 'launchctl bootstrap' ./chain/public-join.sh
+          grep -Fq 'WQPU PUBLIC NODE READY' ./chain/public-join.sh
+
+      - name: Test CometBFT PEX configuration
+        shell: bash
+        run: |
+          cd chain
+          python3 -m unittest test_p2p_config.py test_node_id.py
+
+      - name: Test strict bootstrap verifier
+        shell: bash
+        run: |
+          cd client
+          GOWORK=off go test -mod=mod ./cmd/wqpu-rpc-verify
+          GOWORK=off go build -mod=mod ./cmd/wqpu-rpc-verify
+
+      - name: Run shared-chain blockchain-registry distributed inference proof
+        shell: bash
+        env:
+          WQPU_SOURCE_DIR: ${{ github.workspace }}
+          WQPU_USE_SYSTEM_GO: '1'
+          WQPU_NETWORK_HOME: ${{ runner.temp }}/wqpu-network
+        run: bash ./network.sh ci
+
+      - name: Verify PEX and persistent CometBFT addrbook config
+        shell: bash
+        run: |
+          config="${{ runner.temp }}/wqpu-network/devnet-home/config/config.toml"
+          grep -Fq 'pex = true' "$config"
+          grep -Fq 'seed_mode = false' "$config"
+          grep -Fq 'addr_book_strict = true' "$config"
+          grep -Fq 'addr_book_file = "config/addrbook.json"' "$config"

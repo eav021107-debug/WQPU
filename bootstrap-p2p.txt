@@ -1,0 +1,16 @@
+# WQPU CometBFT P2P bootstrap seeds.
+#
+# Format, one seed per line:
+#   <40-hex-comet-node-id>@<dns-or-ip>:26656
+#
+# These are ONLY first-contact addresses for the WQPU blockchain P2P layer.
+# They are not authorities, coordinators, compute peers, or sources of truth.
+# After a node reaches the network, CometBFT PEX exchanges additional peer
+# addresses and persists them in config/addrbook.json. The blockchain itself
+# remains the canonical source of WQPU compute/storage/provider registry data.
+#
+# Production should ship several independent seeds operated by different
+# parties/regions. No single seed (including the project creator's VPS) may be
+# required for the network to continue operating.
+#
+# Real entries will be added after public WQPU chain nodes have stable node IDs.

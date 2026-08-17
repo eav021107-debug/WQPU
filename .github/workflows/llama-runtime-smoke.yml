@@ -1,0 +1,133 @@
+name: llama-runtime-smoke
+
+on:
+  push:
+    branches: [next-foundation]
+    paths:
+      - 'client/internal/llamaruntime/**'
+      - 'client/internal/carrier/**'
+      - 'client/internal/chainregistry/**'
+      - 'client/internal/peertransport/**'
+      - 'client/internal/rpctunnel/**'
+      - 'client/internal/rpcmesh/**'
+      - 'client/internal/computenode/**'
+      - 'client/internal/sessionkey/**'
+      - 'client/internal/transport/**'
+      - 'client/cmd/wqpu-runtime-install/**'
+      - 'client/cmd/wqpu-llama-rpc-smoke/**'
+      - 'client/cmd/wqpu-llama-model-smoke/**'
+      - 'client/cmd/wqpu-llama-multipeer-smoke/**'
+      - '.github/workflows/llama-runtime-smoke.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  official-linux-x64:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+          cache-dependency-path: client/go.mod
+
+      - name: Resolve pinned WQPU client module checksums
+        working-directory: client
+        run: go mod tidy
+
+      - name: Install exact official llama.cpp through production WQPU installer
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${RUNNER_TEMP}/wqpu-runtime"
+          echo "WQPU_RUNTIME_BASE=$BASE" >> "$GITHUB_ENV"
+          (cd client && go run ./cmd/wqpu-runtime-install "$BASE") > runtime.paths
+          cat runtime.paths
+
+          TAG="$(sed -n 's/^tag=//p' runtime.paths)"
+          ROOT="$(sed -n 's/^root=//p' runtime.paths)"
+          RPC="$(sed -n 's/^rpc=//p' runtime.paths)"
+          SERVER="$(sed -n 's/^server=//p' runtime.paths)"
+          CLI="$(sed -n 's/^cli=//p' runtime.paths)"
+
+          test "$TAG" = 'b10453'
+          test -n "$ROOT" && test -d "$ROOT"
+          test -n "$RPC" && test -x "$RPC"
+          test -n "$SERVER" && test -x "$SERVER"
+          test -n "$CLI" && test -x "$CLI"
+          case "$ROOT" in "$BASE"/*) ;; *) echo 'runtime escaped WQPU base directory' >&2; exit 1;; esac
+
+          (cd client && go run ./cmd/wqpu-runtime-install "$BASE") > runtime.second.paths
+          cmp runtime.paths runtime.second.paths
+
+      - name: Verify installed RPC/server/CLI flags
+        shell: bash
+        run: |
+          set -euo pipefail
+          RPC="$(sed -n 's/^rpc=//p' runtime.paths)"
+          SERVER="$(sed -n 's/^server=//p' runtime.paths)"
+          CLI="$(sed -n 's/^cli=//p' runtime.paths)"
+
+          "$RPC" --help > rpc.help 2>&1
+          grep -F -- '--host HOST' rpc.help
+          grep -F -- '--port PORT' rpc.help
+          grep -F -- '--device <dev1,dev2,...>' rpc.help
+          grep -F -- '--cache' rpc.help
+
+          "$SERVER" --help > server.help 2>&1
+          grep -F -- '--rpc' server.help
+          grep -F -- '--fit' server.help
+          grep -F -- '--host' server.help
+          grep -F -- '--port' server.help
+          grep -F -- '--hf-file' server.help
+          grep -F -- '--device' server.help
+          grep -F -- '--n-gpu-layers' server.help
+          grep -F -- '--tensor-split' server.help
+          grep -F -- '--split-mode' server.help
+
+          "$CLI" --help > cli.help 2>&1
+          grep -F -- '--rpc' cli.help
+          grep -F -- '--list-devices' cli.help
+
+      - name: Send real llama.cpp RPC protocol through managed WQPU SecureStream
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd client && go run ./cmd/wqpu-llama-rpc-smoke --runtime-base "$WQPU_RUNTIME_BASE") 2>&1 | tee managed-rpc.log
+          grep -F 'real llama.cpp RPC crossed WQPU SecureStream' managed-rpc.log
+          if grep -Fq "WARNING: Host ('127.0.0.1') is != '127.0.0.1'" managed-rpc.log; then
+            echo 'managed llama.cpp RPC backend unexpectedly left loopback' >&2
+            exit 1
+          fi
+
+      - name: Load and infer a tiny model on remote WQPU RPC0
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd client && go run ./cmd/wqpu-llama-model-smoke --runtime-base "$WQPU_RUNTIME_BASE") 2>&1 | tee model-smoke.log
+          grep -F 'tiny model inference crossed remote WQPU RPC0 with remote allocation' model-smoke.log
+          grep -F '[alloc_buffer]' "$WQPU_RUNTIME_BASE/model-smoke-rpc.log"
+
+      - name: Split one tiny model across two equal production WQPU compute nodes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Three equal computenode.Node instances are started. One happens to
+          # originate this request; the other two become RPC0/RPC1. The caller
+          # only supplies peer IDs to StartHFFileInference. Runtime installation,
+          # managed local RPC backends, bounded provider rpcmesh, requester
+          # forwarders, device mapping and llama-server lifecycle are all owned
+          # by production data-plane packages. Both remote backend logs must show
+          # actual model allocation.
+          (cd client && go run ./cmd/wqpu-llama-multipeer-smoke --runtime-base "$WQPU_RUNTIME_BASE") 2>&1 | tee multipeer-smoke.log
+          grep -F 'three equal WQPU compute nodes split one model across RPC0 and RPC1' multipeer-smoke.log
+          grep -F '[alloc_buffer]' "$WQPU_RUNTIME_BASE/multipeer-rpc-0.log"
+          grep -F '[alloc_buffer]' "$WQPU_RUNTIME_BASE/multipeer-rpc-1.log"
+          echo 'Equal-node WQPU distributed model allocation and inference smoke passed.'

@@ -1,0 +1,60 @@
+name: wqpu-network-runtime-smoke
+
+on:
+  push:
+    branches: [next-foundation]
+    paths:
+      - 'chain/runtime.lock'
+      - 'chain/devnet.sh'
+      - 'chain/runtime_patch.py'
+      - 'chain/runtime_patch_network.py'
+      - 'chain/x/wqpu/precompile/network_contract.go'
+      - 'chain/x/wqpu/precompile/storage.go'
+      - 'chain/x/wqpu/precompile/hash_index.go'
+      - 'chain/x/wqpu/precompile/provider.go'
+      - 'chain/x/wqpu/precompile/peer_registry.go'
+      - 'chain/x/wqpu/precompile/session_state.go'
+      - 'chain/x/wqpu/precompile/session_action.go'
+      - '.github/workflows/wqpu-network-runtime-smoke.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  target-wqpud:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+      - name: Prepare exact pinned Cosmos EVM source
+        env:
+          WQPU_CHAIN_SRC: ${{ runner.temp }}/cosmos-evm
+          WQPU_CHAIN_BIN_DIR: ${{ runner.temp }}/wqpu-bin
+        run: bash chain/devnet.sh --build-only
+      - name: Apply target WQPU network overlay
+        env:
+          WQPU_CHAIN_SRC: ${{ runner.temp }}/cosmos-evm
+        run: >-
+          python chain/runtime_patch_network.py
+          --source "$WQPU_CHAIN_SRC"
+          --overlay chain/x/wqpu/precompile
+      - name: Rebuild target wqpud
+        working-directory: ${{ runner.temp }}/cosmos-evm
+        env:
+          WQPU_CHAIN_BIN_DIR: ${{ runner.temp }}/wqpu-bin
+        shell: bash
+        run: |
+          set -euo pipefail
+          pkg="$(go list -f '{{if eq .Name "main"}}{{.ImportPath}}{{end}}' ./... | grep 'evmd' | head -n 1)"
+          test -n "$pkg"
+          mkdir -p "$WQPU_CHAIN_BIN_DIR"
+          go build -trimpath -o "$WQPU_CHAIN_BIN_DIR/wqpud" "$pkg"
+      - name: Verify daemon and registration source
+        run: |
+          "${{ runner.temp }}/wqpu-bin/wqpud" version
+          test -f "${{ runner.temp }}/cosmos-evm/precompiles/wqpu/network_contract.go"
+          grep -F 'wqpuprecompile.WithWQPUNetwork(precompiletypes.DefaultStaticPrecompiles(' "${{ runner.temp }}/cosmos-evm/evmd/app.go"

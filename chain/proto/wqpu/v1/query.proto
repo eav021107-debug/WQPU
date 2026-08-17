@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+package wqpu.v1;
+
+option go_package = "github.com/eav021107-debug/WQPU/chain/x/wqpu/types";
+
+import "wqpu/v1/types.proto";
+
+service Query {
+  rpc Params(QueryParamsRequest) returns (QueryParamsResponse);
+  rpc GlobalPrice(QueryGlobalPriceRequest) returns (QueryGlobalPriceResponse);
+  rpc ActiveProviders(QueryActiveProvidersRequest) returns (QueryActiveProvidersResponse);
+  rpc Provider(QueryProviderRequest) returns (QueryProviderResponse);
+  rpc Session(QuerySessionRequest) returns (QuerySessionResponse);
+  rpc Job(QueryJobRequest) returns (QueryJobResponse);
+}
+
+message QueryParamsRequest {}
+message QueryParamsResponse { Params params = 1; }
+
+message QueryGlobalPriceRequest {}
+message QueryGlobalPriceResponse { GlobalPriceState price = 1; }
+
+message QueryActiveProvidersRequest {
+  bytes model_hash = 1;
+  uint32 protocol_version = 2;
+}
+message QueryActiveProvidersResponse {
+  repeated ProviderRecord providers = 1;
+}
+
+message QueryProviderRequest { string wallet = 1; }
+message QueryProviderResponse { ProviderRecord provider = 1; }
+
+message QuerySessionRequest {
+  string wallet = 1;
+  string session_address = 2;
+}
+message QuerySessionResponse { SessionDelegation delegation = 1; }
+
+message QueryJobRequest { bytes job_id = 1; }
+message QueryJobResponse { JobReservation reservation = 1; }

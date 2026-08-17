@@ -1,0 +1,147 @@
+name: wqpu-devnet-rpc-smoke
+
+on:
+  push:
+    branches: [next-foundation]
+    paths:
+      - 'chain/runtime.lock'
+      - 'chain/devnet.sh'
+      - 'chain/devnet_config.py'
+      - 'chain/runtime_patch.py'
+      - 'chain/runtime_patch_settlement.py'
+      - 'chain/cmd/wqpu-selector/**'
+      - 'chain/cmd/wqpu-rpc-write-smoke/**'
+      - 'chain/cmd/wqpu-economic-smoke/**'
+      - 'chain/x/wqpu/precompile/**'
+      - '.github/workflows/wqpu-devnet-rpc-smoke.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  live-rpc:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+      - name: Resolve pinned WQPU Go module checksums
+        working-directory: chain
+        run: go mod tidy
+      - name: Boot sovereign WQPU devnet and exercise native precompile
+        shell: bash
+        env:
+          WQPU_CHAIN_SRC: ${{ runner.temp }}/cosmos-evm
+          WQPU_CHAIN_BIN_DIR: ${{ runner.temp }}/wqpu-bin
+          WQPU_CHAIN_HOME: ${{ runner.temp }}/wqpu-home
+        run: |
+          set -euo pipefail
+
+          PRECOMPILE='0x0000000000000000000000000000000000000900'
+          selector() {
+            (cd chain && go run ./cmd/wqpu-selector "$1")
+          }
+          PROTOCOL_SELECTOR="$(selector 'protocolVersion()')"
+          PRICE_SELECTOR="$(selector 'globalPrice()')"
+          EPOCH_SELECTOR="$(selector 'priceEpoch()')"
+          BONDED_SELECTOR="$(selector 'bondedPriceCapacity()')"
+
+          # Both live helpers use the same explicitly public devnet-only wallet.
+          # Only its derived address is passed into genesis funding.
+          WRITE_ADDRESS="$(cd chain && go run ./cmd/wqpu-rpc-write-smoke address)"
+          ECONOMIC_ADDRESS="$(cd chain && go run ./cmd/wqpu-economic-smoke address)"
+          test "$WRITE_ADDRESS" = "$ECONOMIC_ADDRESS"
+          WQPU_DEVNET_TEST_ADDRESS="$WRITE_ADDRESS"
+          export WQPU_DEVNET_TEST_ADDRESS
+
+          LOG="${RUNNER_TEMP}/wqpu-devnet.log"
+          bash chain/devnet.sh --reset >"$LOG" 2>&1 &
+          PID=$!
+          cleanup() {
+            kill "$PID" 2>/dev/null || true
+            wait "$PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          # A listening JSON-RPC socket is not enough: eth_call needs an actual
+          # canonical header. Wait until the sovereign chain has produced block 1.
+          ready=0
+          for _ in $(seq 1 180); do
+            if ! kill -0 "$PID" 2>/dev/null; then
+              cat "$LOG"
+              echo 'WQPU devnet exited before the first block became ready' >&2
+              exit 1
+            fi
+            RESPONSE="$(curl -fsS \
+              -H 'content-type: application/json' \
+              --data '{"jsonrpc":"2.0","id":1,"method":"eth_blockNumber","params":[]}' \
+              http://127.0.0.1:8545 2>/dev/null || true)"
+            if python3 - "$RESPONSE" <<'PY'
+          import json
+          import sys
+          try:
+              response = json.loads(sys.argv[1])
+              value = int(response.get("result", "0x0"), 16)
+          except Exception:
+              raise SystemExit(1)
+          raise SystemExit(0 if value >= 1 else 1)
+          PY
+            then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then
+            cat "$LOG"
+            echo 'WQPU JSON-RPC did not expose a canonical block in time' >&2
+            exit 1
+          fi
+
+          rpc_call() {
+            local data="$1"
+            curl -fsS \
+              -H 'content-type: application/json' \
+              --data "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"eth_call\",\"params\":[{\"to\":\"$PRECOMPILE\",\"data\":\"0x$data\"},\"latest\"]}" \
+              http://127.0.0.1:8545
+          }
+
+          assert_uint() {
+            local response="$1"
+            local expected="$2"
+            python3 - "$response" "$expected" <<'PY'
+          import json
+          import sys
+          response = json.loads(sys.argv[1])
+          if "error" in response:
+              raise SystemExit("JSON-RPC error: {}".format(response["error"]))
+          value = int(response.get("result", "0x0"), 16)
+          expected = int(sys.argv[2])
+          if value != expected:
+              raise SystemExit("expected {}, got {} ({})".format(expected, value, response))
+          PY
+          }
+
+          # Read-only path before any application state has been written.
+          assert_uint "$(rpc_call "$PROTOCOL_SELECTOR")" 1
+          assert_uint "$(rpc_call "$PRICE_SELECTOR")" 1000
+          assert_uint "$(rpc_call "$EPOCH_SELECTOR")" 0
+          assert_uint "$(rpc_call "$BONDED_SELECTOR")" 0
+
+          # Basic signed write path: authorize -> publish -> native bond ->
+          # bonded global-price epoch -> native unbond/refund.
+          (cd chain && go run ./cmd/wqpu-rpc-write-smoke run http://127.0.0.1:8545)
+
+          # Full production economic path with two independent temporary sessions:
+          # fund -> reserve -> dual-signed receipt -> finalize payout -> refund.
+          (cd chain && go run ./cmd/wqpu-economic-smoke run http://127.0.0.1:8545)
+
+          grep -F 'precompile:    0x0000000000000000000000000000000000000900' "$LOG"
+          echo 'Live WQPU 0x0900 read/write and full economic-cycle smoke passed.'
