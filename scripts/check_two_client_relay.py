@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""E2E: two distinct WQPU wallets/TLS identities route RPC through one public relay."""
+"""E2E: distinct wallets/TLS identities route and dual-meter RPC through one relay."""
 from __future__ import print_function
 
 import asyncio
@@ -7,6 +7,7 @@ import json
 import os
 import secrets
 import shutil
+import struct
 import subprocess
 import sys
 import urllib.request
@@ -17,7 +18,11 @@ os.chdir(str(ROOT))
 sys.path.insert(0, str(ROOT))
 
 import wqpu  # noqa: E402
+import wqpu_accounting  # noqa: E402
+import wqpu_attestation  # noqa: E402
+import wqpu_autopay  # noqa: E402
 import wqpu_chain  # noqa: E402
+import wqpu_meter  # noqa: E402
 import wqpu_network_guard  # noqa: E402
 import wqpu_public_config  # noqa: E402
 import wqpu_public_security  # noqa: E402
@@ -87,6 +92,32 @@ def register(rpc_url, registry, wallet_key, wallet, fingerprint, port):
     ])
 
 
+def frame(command, payload=b""):
+    return bytes([command]) + len(payload).to_bytes(8, "little") + payload
+
+
+def rpc_tensor(tensor_id, ne=(1, 1, 1, 1), op=2):
+    raw = bytearray(wqpu_meter.RPC_TENSOR_SIZE)
+    struct.pack_into("<Q", raw, 0, tensor_id)
+    struct.pack_into("<I", raw, 8, 0)
+    struct.pack_into("<Q", raw, 12, 0)
+    struct.pack_into("<4I", raw, 20, *ne)
+    struct.pack_into("<4I", raw, 36, 1, 1, 1, 1)
+    struct.pack_into("<I", raw, 52, op)
+    return bytes(raw)
+
+
+def graph_payload():
+    tensor = rpc_tensor(7, ne=(2, 3, 4, 1), op=2)
+    return b"".join([
+        (0).to_bytes(4, "little"),
+        (1).to_bytes(4, "little"),
+        (7).to_bytes(8, "little"),
+        (1).to_bytes(4, "little"),
+        tensor,
+    ])
+
+
 async def echo_handler(reader, writer):
     try:
         while True:
@@ -150,19 +181,23 @@ async def check():
         raise RuntimeError("both test wallets were not registered")
 
     wqpu_network_guard.install(runtime)
-    wqpu_public_security.install(runtime.ChainMesh)
+    wqpu_public_security.install(wqpu_autopay.AutoPayChainMesh)
     relay_peer = dict(config["relays"][0])
     secret = runtime.public_secret(config["chain_id"], registry)
     mesh_cfg = {"secret": secret, "peers": [relay_peer]}
 
-    requester = runtime.ChainMesh(mesh_cfg, chain, requester_wallet)
-    worker = runtime.ChainMesh(mesh_cfg, chain, worker_wallet)
+    requester = wqpu_autopay.AutoPayChainMesh(mesh_cfg, chain, requester_wallet)
+    worker = wqpu_autopay.AutoPayChainMesh(mesh_cfg, chain, worker_wallet)
     requester.me = "two-client-requester"
     worker.me = "two-client-worker"
     requester.identity_cert_path = requester_cert
     requester.identity_key_path = requester_tls_key
     worker.identity_cert_path = worker_cert
     worker.identity_key_path = worker_tls_key
+    # Worker usage attestations resolve by provider_node_id. Normal one-node-per-process
+    # installs fall back to wqpu.CERT/KEY and never need this registration.
+    wqpu_attestation.register_identity(requester.me, requester_cert, requester_tls_key)
+    wqpu_attestation.register_identity(worker.me, worker_cert, worker_tls_key)
     for mesh in (requester, worker):
         mesh.chain_nodes[requester_wallet] = requester_record
         mesh.chain_nodes[worker_wallet] = worker_record
@@ -170,12 +205,15 @@ async def check():
     echo = await asyncio.start_server(echo_handler, "127.0.0.1", 0)
     old_rpc_port = wqpu.RPC_PORT
     wqpu.RPC_PORT = echo.sockets[0].getsockname()[1]
-    stream_writer = None
+    proxy = None
+    client_writer = None
+    request_id = secrets.token_hex(16)
     try:
         await worker.connect_control(relay_peer)
         await requester.connect_control(relay_peer)
         await wait_until(lambda: worker.me in requester.peer_info)
         await wait_until(lambda: any(nid == worker.me for nid, _ in requester.peers()))
+        await wait_until(lambda: requester.me in worker.peer_info)
 
         seen = requester.peer_info.get(worker.me) or {}
         if str(seen.get("wallet") or "").lower() != worker_wallet:
@@ -185,23 +223,59 @@ async def check():
         if requester_wallet == worker_wallet or requester_fp == worker_fp:
             raise RuntimeError("two-client test did not create distinct identities")
 
-        reader, stream_writer = await requester.open_rpc(worker.me)
-        payload = b"WQPU two-client authenticated relay RPC\x00\x01\x02"
-        stream_writer.write(payload)
-        await stream_writer.drain()
+        requester.current_request_id = request_id
+        requester.provider_usage_reports.pop(request_id, None)
+        requester.begin_usage()
+        proxy = await asyncio.start_server(
+            lambda r, w: requester.proxy_handler(worker.me, r, w),
+            "127.0.0.1", 0,
+        )
+        reader, client_writer = await asyncio.open_connection(
+            "127.0.0.1", proxy.sockets[0].getsockname()[1]
+        )
+        payload = frame(wqpu_meter.RPC_CMD_GRAPH_COMPUTE, graph_payload())
+        client_writer.write(payload)
+        await client_writer.drain()
         echoed = await asyncio.wait_for(reader.readexactly(len(payload)), 10)
         if echoed != payload:
-            raise RuntimeError("authenticated relay RPC echo mismatch")
+            raise RuntimeError("authenticated dual-meter RPC echo mismatch")
+        await wqpu.close_writer(client_writer)
+        client_writer = None
+        await wqpu.close_server(proxy)
+        proxy = None
 
-        print("WQPU two-client relay E2E OK")
-        print("requester={} worker={} distinct_tls=true".format(requester_wallet, worker_wallet))
+        await requester.wait_provider_reports([worker.me], request_id, 10)
+        snapshot = requester.end_usage()
+        requester_stats = snapshot.get(worker.me)
+        report = (requester.provider_usage_reports.get(request_id) or {}).get(worker.me)
+        if not requester_stats or not report:
+            raise RuntimeError("dual-meter worker report was not received")
+        worker_stats = report.get("rpc") or {}
+        if not wqpu_accounting.meters_match(requester_stats, worker_stats):
+            raise RuntimeError("distinct requester and worker meters disagreed")
+        if int(requester_stats.get("estimated_scalar_ops") or 0) != 24:
+            raise RuntimeError("unexpected synthetic compute estimate")
+        if wqpu_attestation.certificate_fingerprint(report.get("certificate")) != worker_fp:
+            raise RuntimeError("usage report was not signed by registered worker TLS identity")
+        if str(report.get("provider_wallet") or "").lower() != worker_wallet:
+            raise RuntimeError("usage report claimed wrong provider wallet")
+
+        print("WQPU two-client authenticated dual-meter E2E OK")
+        print("requester={} worker={} scalar_ops=24 distinct_tls=true".format(
+            requester_wallet, worker_wallet
+        ))
     finally:
-        if stream_writer:
-            await wqpu.close_writer(stream_writer)
+        requester.current_request_id = None
+        if client_writer:
+            await wqpu.close_writer(client_writer)
+        if proxy:
+            await wqpu.close_server(proxy)
         wqpu.RPC_PORT = old_rpc_port
         await close_mesh(requester)
         await close_mesh(worker)
         await wqpu.close_server(echo)
+        wqpu_attestation.unregister_identity(requester.me)
+        wqpu_attestation.unregister_identity(worker.me)
         for key, wallet in ((requester_key, requester_wallet), (worker_key, worker_wallet)):
             try:
                 run([
