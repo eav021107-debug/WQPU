@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Fast real-wire probe for pinned llama.cpp RPC through WQPU.
 
-Exercises the exact b10456 initialization sequence needed before model loading:
-HELLO -> DEVICE_COUNT -> GET_DEVICE_MEMORY. Runs once directly against the real
+Exercises the exact b10456 initialization/allocation sequence used before graph execution:
+HELLO -> DEVICE_COUNT -> GET_DEVICE_MEMORY -> GET_ALIGNMENT -> GET_MAX_SIZE ->
+ALLOC_BUFFER -> BUFFER_GET_BASE -> FREE_BUFFER. Runs once directly against the real
 `ggml-rpc-server`, then byte-for-byte through the authenticated WQPU relay tunnel.
 """
 from __future__ import print_function
@@ -34,6 +35,11 @@ from wqpu_chain import RegistryClient  # noqa: E402
 
 STACK = ROOT / ".wqpu-testnet"
 WIRE_HOME = STACK / "real-wire-e2e"
+RPC_CMD_ALLOC_BUFFER = 0
+RPC_CMD_GET_ALIGNMENT = 1
+RPC_CMD_GET_MAX_SIZE = 2
+RPC_CMD_BUFFER_GET_BASE = 3
+RPC_CMD_FREE_BUFFER = 4
 RPC_CMD_GET_DEVICE_MEMORY = 11
 RPC_CMD_HELLO = 14
 RPC_CMD_DEVICE_COUNT = 15
@@ -90,33 +96,94 @@ async def response(reader, expected_size, label):
     return await asyncio.wait_for(reader.readexactly(size), 10)
 
 
+async def rpc_call(reader, writer, command, payload, expected_size, label):
+    writer.write(request_frame(command, payload))
+    await writer.drain()
+    return await response(reader, expected_size, label)
+
+
 async def probe(reader, writer, label):
     # Zero caps deliberately force plain TCP even if a build has optional RDMA support.
-    writer.write(request_frame(RPC_CMD_HELLO, b"\x00" * CAPS_SIZE))
-    await writer.drain()
-    hello = await response(reader, HELLO_RSP_SIZE, label + " HELLO")
+    hello = await rpc_call(
+        reader, writer, RPC_CMD_HELLO, b"\x00" * CAPS_SIZE, HELLO_RSP_SIZE,
+        label + " HELLO",
+    )
     major, minor, patch = hello[0], hello[1], hello[2]
 
-    writer.write(request_frame(RPC_CMD_DEVICE_COUNT))
-    await writer.drain()
-    count = struct.unpack("<I", await response(reader, 4, label + " DEVICE_COUNT"))[0]
+    count = struct.unpack(
+        "<I", await rpc_call(
+            reader, writer, RPC_CMD_DEVICE_COUNT, b"", 4,
+            label + " DEVICE_COUNT",
+        )
+    )[0]
     if count <= 0:
         raise RuntimeError("{} exposes no RPC devices".format(label))
 
-    writer.write(request_frame(RPC_CMD_GET_DEVICE_MEMORY, struct.pack("<I", 0)))
-    await writer.drain()
     free_mem, total_mem = struct.unpack(
-        "<QQ", await response(reader, 16, label + " GET_DEVICE_MEMORY")
+        "<QQ", await rpc_call(
+            reader, writer, RPC_CMD_GET_DEVICE_MEMORY, struct.pack("<I", 0), 16,
+            label + " GET_DEVICE_MEMORY",
+        )
     )
     if total_mem <= 0 or free_mem > total_mem:
         raise RuntimeError("{} returned invalid device memory {}/{}".format(
             label, free_mem, total_mem
         ))
+
+    alignment = struct.unpack(
+        "<Q", await rpc_call(
+            reader, writer, RPC_CMD_GET_ALIGNMENT, struct.pack("<I", 0), 8,
+            label + " GET_ALIGNMENT",
+        )
+    )[0]
+    max_size = struct.unpack(
+        "<Q", await rpc_call(
+            reader, writer, RPC_CMD_GET_MAX_SIZE, struct.pack("<I", 0), 8,
+            label + " GET_MAX_SIZE",
+        )
+    )[0]
+    if alignment <= 0 or max_size <= 0:
+        raise RuntimeError("{} returned invalid alignment/max-size {}/{}".format(
+            label, alignment, max_size
+        ))
+
+    requested = max(4096, int(alignment))
+    if requested > max_size:
+        requested = int(max_size)
+    remote_ptr, remote_size = struct.unpack(
+        "<QQ", await rpc_call(
+            reader, writer, RPC_CMD_ALLOC_BUFFER, struct.pack("<IQ", 0, requested), 16,
+            label + " ALLOC_BUFFER",
+        )
+    )
+    if remote_ptr == 0 or remote_size < requested:
+        raise RuntimeError("{} returned invalid allocation ptr={} size={} requested={}".format(
+            label, remote_ptr, remote_size, requested
+        ))
+
+    base_ptr = struct.unpack(
+        "<Q", await rpc_call(
+            reader, writer, RPC_CMD_BUFFER_GET_BASE, struct.pack("<Q", remote_ptr), 8,
+            label + " BUFFER_GET_BASE",
+        )
+    )[0]
+    if base_ptr == 0:
+        raise RuntimeError("{} returned a null buffer base".format(label))
+
+    await rpc_call(
+        reader, writer, RPC_CMD_FREE_BUFFER, struct.pack("<Q", remote_ptr), 0,
+        label + " FREE_BUFFER",
+    )
+
     return {
         "rpc_version": "{}.{}.{}".format(major, minor, patch),
         "device_count": count,
         "free_mem": free_mem,
         "total_mem": total_mem,
+        "alignment": alignment,
+        "max_size": max_size,
+        "allocation_size": remote_size,
+        "allocation_base_nonzero": bool(base_ptr),
         "server_caps_nonzero": any(hello[4:]),
     }
 
@@ -217,10 +284,11 @@ async def check():
         await tunneled_writer.drain()
         tunneled = await probe(tunneled_reader, tunneled_writer, "wqpu")
 
-        if direct["device_count"] != tunneled["device_count"]:
-            raise RuntimeError("WQPU changed RPC device count")
-        if direct["total_mem"] != tunneled["total_mem"]:
-            raise RuntimeError("WQPU changed RPC device total memory")
+        for field in ("device_count", "total_mem", "alignment", "max_size"):
+            if int(direct[field]) != int(tunneled[field]):
+                raise RuntimeError("WQPU changed RPC {}: direct={} tunneled={}".format(
+                    field, direct[field], tunneled[field]
+                ))
 
         print("WQPU REAL RPC WIRE PROBE OK")
         print(json.dumps({"direct": direct, "wqpu": tunneled}, sort_keys=True))
