@@ -55,6 +55,33 @@ class RuntimePinTests(unittest.TestCase):
             finally:
                 wqpu_runtime_pin.wqpu.RUNTIME = old_runtime
 
+    def test_pinned_b10456_asset_never_needs_release_api(self):
+        with mock.patch.object(
+            wqpu_runtime_pin.wqpu, "api_json", side_effect=AssertionError("release API")
+        ):
+            asset = wqpu_runtime_pin._asset_for("b10456", "-bin-ubuntu-x64.tar.gz")
+        self.assertEqual(asset["name"], "llama-b10456-bin-ubuntu-x64.tar.gz")
+        self.assertEqual(
+            asset["digest"],
+            "sha256:d07b3f80f3a1ed1de46bfba5671b4af40a87417e1dbf35d0603ad2d623ddc577",
+        )
+        self.assertEqual(asset["source"], "wqpu-pinned-manifest")
+        self.assertIn("/releases/download/b10456/", asset["browser_download_url"])
+
+    def test_manifest_covers_every_client_platform_suffix(self):
+        suffixes = {
+            "-bin-ubuntu-x64.tar.gz",
+            "-bin-ubuntu-arm64.tar.gz",
+            "-bin-macos-arm64.tar.gz",
+            "-bin-macos-x64.tar.gz",
+            "-bin-win-cpu-x64.zip",
+            "-bin-win-cpu-arm64.zip",
+        }
+        self.assertEqual(set(wqpu_runtime_pin.PINNED_ASSETS["b10456"]), suffixes)
+        for suffix in suffixes:
+            self.assertEqual(len(wqpu_runtime_pin.PINNED_ASSETS["b10456"][suffix]), 64)
+            int(wqpu_runtime_pin.PINNED_ASSETS["b10456"][suffix], 16)
+
     def test_wrong_cached_tag_forces_exact_release_lookup(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -110,13 +137,6 @@ class RuntimePinTests(unittest.TestCase):
     def test_asset_download_retries_and_removes_partial_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "asset.zip"
-
-            def flaky(_url, target):
-                if not path.exists():
-                    path.write_bytes(b"partial")
-                    raise FakeHttpError(503)
-                target.write_bytes(b"complete")
-
             calls = {"n": 0}
 
             def retry_download(_url, target):
@@ -143,6 +163,8 @@ class RuntimePinTests(unittest.TestCase):
                 wqpu_runtime_pin._verify_asset(path, {"digest": "sha256:" + "00" * 32})
             with self.assertRaises(RuntimeError):
                 wqpu_runtime_pin._verify_asset(path, {"digest": "md5:deadbeef"})
+            with self.assertRaises(RuntimeError):
+                wqpu_runtime_pin._verify_asset(path, {})
 
 
 if __name__ == "__main__":
