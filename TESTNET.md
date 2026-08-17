@@ -32,6 +32,26 @@ requests test ETH/WQPU before it asks the wallet to register the node.
 Automatic real-value-style vouchers remain disabled in generated testnet config unless
 `--payments` is explicitly passed. Testnet faucet funds have no real value.
 
+## HTTPS for an Internet-facing testnet
+
+Plain HTTP is useful for localhost/LAN testing. For a real Internet-facing domain, pass a
+trusted PEM certificate and matching private key:
+
+```bash
+python scripts/testnet_stack.py start \
+  --public-host testnet.example.com \
+  --tls-cert /etc/letsencrypt/live/testnet.example.com/fullchain.pem \
+  --tls-key /etc/letsencrypt/live/testnet.example.com/privkey.pem
+```
+
+The RPC, relayer, faucet, config and generated join URLs then switch to `https://`.
+The same certificate setting is remembered for normal stop/start cycles. Use a publicly
+trusted certificate for browser wallets; a self-signed certificate is only suitable for
+controlled development/testing.
+
+The WQPU transport relay on port `7443` remains a separate pinned-TLS channel whose exact
+certificate fingerprint is published in `network-config.json`.
+
 ## Persistence
 
 Normal `stop` / `start` cycles preserve the same testnet. Anvil checkpoints its state to
