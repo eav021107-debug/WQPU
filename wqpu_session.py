@@ -2,9 +2,7 @@
 """Bounded local payment-session key for WQPU.
 
 The user's wallet key never enters WQPU. This module creates a separate secp256k1
-key locally with OpenSSL. The wallet authorizes only that session key, for a fixed
-amount, global price and expiry. Session vouchers can then be signed without wallet
-popups.
+key locally with OpenSSL and reads activated session state from the compute market.
 """
 
 from __future__ import print_function
@@ -58,12 +56,16 @@ def _address_word(value):
     return _strip0x(_address(value)).rjust(64, "0")
 
 
-def _selector(client, signature):
+def function_selector(client, signature):
     encoded = "0x" + signature.encode("utf-8").hex()
     hashed = client.rpc("web3_sha3", [encoded])
     if not isinstance(hashed, str) or len(_strip0x(hashed)) != 64:
         raise SessionError("RPC does not support web3_sha3")
     return _strip0x(hashed)[:8]
+
+
+def _selector(client, signature):
+    return function_selector(client, signature)
 
 
 def _call(client, contract, data):
@@ -74,6 +76,22 @@ def _call(client, contract, data):
     if not isinstance(result, str) or not result.startswith("0x"):
         raise SessionError("bad eth_call result")
     return _strip0x(result)
+
+
+def _result_uint(result, index=0):
+    start = index * 64
+    word = result[start:start + 64]
+    if len(word) != 64:
+        raise SessionError("short ABI result")
+    return int(word, 16)
+
+
+def _result_address(result, index=0):
+    start = index * 64
+    word = result[start:start + 64]
+    if len(word) != 64:
+        raise SessionError("short ABI address")
+    return "0x" + word[-40:]
 
 
 def load_session():
@@ -153,7 +171,7 @@ def new_session_authorization(client, requester, market, max_amount, lifetime_se
         block = client.rpc("eth_getBlockByNumber", ["latest", False])
         now = int(block["timestamp"], 16)
 
-    price = int(getattr(client, "global_price")())
+    price = int(client.global_price())
     return {
         "requester": requester,
         "session_key": session_address(client, path),
@@ -172,22 +190,6 @@ def voucher_digest(client, market, channel_id, cumulative_amount, cumulative_uni
     result = _call(client, market, data)
     if len(result) < 64:
         raise SessionError("short voucher digest")
-    return "0x" + result[:64]
-
-
-def session_authorization_digest(client, market, requester, session_key, session_id, max_amount, valid_until):
-    selector = _selector(client, "sessionAuthorizationDigest(address,address,bytes32,uint128,uint64)")
-    data = (
-        selector
-        + _address_word(requester)
-        + _address_word(session_key)
-        + _bytes32(session_id, "session id").hex()
-        + _word(max_amount)
-        + _word(valid_until)
-    )
-    result = _call(client, market, data)
-    if len(result) < 64:
-        raise SessionError("short session authorization digest")
     return "0x" + result[:64]
 
 
@@ -250,18 +252,36 @@ def provider_voucher_digest(
 def escrow_balance(client, market, requester):
     selector = _selector(client, "escrowBalance(address)")
     result = _call(client, market, selector + _address_word(requester))
-    if len(result) < 64:
-        raise SessionError("short escrow balance")
-    return int(result[:64], 16)
+    return _result_uint(result)
+
+
+def reserved_escrow(client, market, requester):
+    selector = _selector(client, "reservedEscrow(address)")
+    result = _call(client, market, selector + _address_word(requester))
+    return _result_uint(result)
 
 
 def session_spent(client, market, requester, session_id):
     selector = _selector(client, "sessionSpent(address,bytes32)")
     data = selector + _address_word(requester) + _bytes32(session_id, "session id").hex()
     result = _call(client, market, data)
-    if len(result) < 64:
-        raise SessionError("short session spent")
-    return int(result[:64], 16)
+    return _result_uint(result)
+
+
+def active_session(client, market, requester, session_id):
+    selector = _selector(client, "activeSessions(address,bytes32)")
+    data = selector + _address_word(requester) + _bytes32(session_id, "session id").hex()
+    result = _call(client, market, data)
+    if len(result) < 64 * 6:
+        raise SessionError("short active session")
+    return {
+        "session_key": _result_address(result, 0).lower(),
+        "max_amount": _result_uint(result, 1),
+        "price_per_million_units": _result_uint(result, 2),
+        "reserved_remaining": _result_uint(result, 3),
+        "valid_until": _result_uint(result, 4),
+        "active": bool(_result_uint(result, 5)),
+    }
 
 
 def _read_der_length(data, offset):
@@ -321,11 +341,6 @@ def sign_digest(digest, path=None):
         raise SessionError("session signing failed: {}".format(proc.stderr.decode("utf-8", "replace")))
     r, s = parse_der_signature(proc.stdout)
     return "0x{:064x}{:064x}".format(r, s)
-
-
-def sign_voucher(client, market, channel_id, cumulative_amount, cumulative_units, path=None):
-    digest = voucher_digest(client, market, channel_id, cumulative_amount, cumulative_units)
-    return sign_digest(digest, path)
 
 
 def sign_provider_voucher(
