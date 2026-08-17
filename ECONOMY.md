@@ -6,7 +6,9 @@
 install WQPU -> connect existing wallet -> node appears in WQPU registry -> wqpu>
 ```
 
-WQPU never asks for a seed phrase or private key. The browser wallet submits transactions and signs payment vouchers.
+WQPU never asks for the user's wallet seed phrase or private key. The browser wallet submits registration and funding transactions itself.
+
+For fully automatic per-request settlement, the remaining design is a narrowly scoped local session key authorized once by the wallet. That session key must be able to sign compute vouchers only; it must not be able to transfer arbitrary wallet funds. This session authorization is not implemented yet.
 
 ## What the blockchain does
 
@@ -18,10 +20,10 @@ The chain is a shared discovery/accounting layer only. Prompts, model tensors an
 - reachable P2P endpoint;
 - TLS certificate fingerprint;
 - offered capacity;
-- coarse load/heartbeat;
+- coarse load at registration/update time;
 - one global WQPU compute price.
 
-The runtime supplements the coarse on-chain load with fresher P2P load snapshots and prefers less-busy workers.
+Registration is persistent. The runtime determines real liveness and current load over direct P2P connections, so a user's wallet is not asked to approve periodic heartbeat transactions.
 
 ## One network price
 
@@ -43,12 +45,12 @@ The prototype currently has a `priceController`. On a production WQPU chain that
 2. requester opens a channel and deposits WQPU;
 3. the channel snapshots the current global price;
 4. provider performs metered work;
-5. requester signs cumulative EIP-712 vouchers;
+5. requester/session signer signs cumulative EIP-712 vouchers;
 6. contract accepts a voucher only when its amount exactly matches the channel price and cumulative compute units;
-7. provider claims the newest voucher;
+7. any relayer may submit the valid voucher, but the contract always pays the channel's provider wallet;
 8. unused deposit is refundable after expiry plus the claim grace period.
 
-Old vouchers cannot reduce already-paid amounts, and a voucher with a different price is rejected.
+Old vouchers cannot reduce already-paid amounts, replayed vouchers cannot pay twice, and a voucher with a different price is rejected.
 
 ## Compute units
 
@@ -60,19 +62,26 @@ This metering layer is the next economic-runtime milestone. Until it is implemen
 
 Implemented in the `agent/blockchain-runtime` prototype:
 
-- browser wallet connector without private-key custody;
-- on-chain node discovery at startup;
-- TLS fingerprint binding;
-- one global price;
+- browser wallet connector without wallet-key custody;
+- on-chain node discovery;
+- persistent wallet/endpoint/TLS identity;
+- TLS fingerprint verification;
+- one global compute price;
 - live P2P load ranking;
 - multiple reachable workers can participate in one llama.cpp request;
+- relayer-friendly provider claims;
+- publishable `network-config.json` for eventual zero-config public installs;
+- reproducible local Anvil devnet with automatic contract deployment;
+- Linux and Windows one-command installer smoke tests;
+- real Python registry-client round-trip against deployed Solidity contracts;
 - legacy private join-code mode remains available.
 
 Still required before a real public launch:
 
-- deploy token/registry/market to the chosen WQPU EVM chain or test network;
-- publish the chain RPC + contract addresses as the default network configuration;
+- choose/deploy the production WQPU EVM chain or test network;
+- publish chain RPC + contract addresses in `network-config.json`;
 - automatic NAT traversal / relay policy for nodes that cannot accept inbound Internet connections;
-- per-provider compute metering;
-- requester EIP-712 voucher generation and provider claiming;
+- verifiable per-provider compute metering;
+- one-time session authorization + automatic EIP-712 voucher signing;
+- relayer policy/infrastructure for gasless claims;
 - adversarial/security testing and contract audit.
