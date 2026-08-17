@@ -64,6 +64,8 @@ jobs:
         shell: bash
         run: |
           cd client
+          GOWORK=off go mod tidy
+          GOWORK=off go mod download all
           GOWORK=off go build ./cmd/wqpu-rpc-verify
 
       - name: Run shared-chain blockchain-registry distributed inference proof
