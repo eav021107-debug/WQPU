@@ -86,7 +86,12 @@ SRC="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 # Copy over code without deleting ROOT. This intentionally preserves ROOT/.wqpu-testnet
 # (chain state, operator key, deployment and relay identity) on upgrades/reinstalls.
 cp -R "$SRC"/. "$ROOT"/
-chmod 755 "$ROOT/scripts/testnet_stack.py" "$ROOT/wqpu_rpc_gateway.py" "$ROOT/wqpu_relayer.py" "$ROOT/wqpu_transport_relay.py"
+chmod 755 \
+  "$ROOT/scripts/testnet_stack.py" \
+  "$ROOT/wqpu_rpc_gateway.py" \
+  "$ROOT/wqpu_relayer.py" \
+  "$ROOT/wqpu_transport_relay.py" \
+  "$ROOT/wqpu_operator_service_cli.py"
 
 "$PYTHON" -m py_compile \
   "$ROOT/scripts/testnet_stack.py" \
@@ -94,13 +99,23 @@ chmod 755 "$ROOT/scripts/testnet_stack.py" "$ROOT/wqpu_rpc_gateway.py" "$ROOT/wq
   "$ROOT/wqpu_rpc_gateway.py" \
   "$ROOT/wqpu_relayer.py" \
   "$ROOT/wqpu_transport_relay.py" \
-  "$ROOT/wqpu_wallet.py"
+  "$ROOT/wqpu_wallet.py" \
+  "$ROOT/wqpu_operator_service.py" \
+  "$ROOT/wqpu_operator_service_cli.py"
 (cd "$ROOT" && forge build >/dev/null)
 
 cat > "$BIN/wqpu-testnet" <<EOF
 #!/usr/bin/env sh
 export PATH="$HOME/.foundry/bin:\$PATH"
 export WQPU_TESTNET_CLIENT_REF='${REF}'
+if [ "\${1:-}" = "autostart" ]; then
+  shift
+  ACTION="\${1:-status}"
+  exec "$PYTHON" "$ROOT/wqpu_operator_service_cli.py" "\$ACTION" \
+    --script "$ROOT/scripts/testnet_stack.py" \
+    --state "$ROOT/.wqpu-testnet/state.json" \
+    --config "$ROOT/.wqpu-testnet/network-config.json"
+fi
 exec "$PYTHON" "$ROOT/scripts/testnet_stack.py" "\$@"
 EOF
 chmod 755 "$BIN/wqpu-testnet"
@@ -123,4 +138,15 @@ if [ "${WQPU_OPERATOR_NO_START:-0}" = "1" ]; then
   exit 0
 fi
 
-exec "$BIN/wqpu-testnet" start "$@"
+if "$BIN/wqpu-testnet" status >/dev/null 2>&1; then
+  echo "WQPU operator: stack is already running; code was updated without interrupting it."
+  if [ "${WQPU_OPERATOR_NO_AUTOSTART:-0}" != "1" ]; then
+    "$BIN/wqpu-testnet" autostart refresh || echo "WQPU operator: autostart refresh was not available; the running stack is unaffected."
+  fi
+  exit 0
+fi
+
+"$BIN/wqpu-testnet" start "$@"
+if [ "${WQPU_OPERATOR_NO_AUTOSTART:-0}" != "1" ]; then
+  "$BIN/wqpu-testnet" autostart enable || echo "WQPU operator: stack is running, but automatic reboot startup could not be enabled on this OS/session."
+fi
