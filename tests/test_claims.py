@@ -13,6 +13,16 @@ MARKET = "0x" + "44" * 20
 SESSION_ID = "0x" + "55" * 32
 
 
+def funding():
+    return {
+        "market": MARKET,
+        "requester": REQUESTER,
+        "amount": 500_000,
+        "deadline": 9999999999,
+        "permit_signature": "0x" + "cc" * 65,
+    }
+
+
 def package(amount=100, units=1000):
     return {
         "version": 2,
@@ -54,6 +64,13 @@ class FakeClient(object):
 
 
 class ClaimTests(unittest.TestCase):
+    def test_funding_calldata_has_correct_signature_offset(self):
+        data = wqpu_claim.funding_calldata(FakeClient(), funding())
+        self.assertTrue(data.startswith("0x12345678"))
+        args = data[10:]
+        words = [args[i:i + 64] for i in range(0, 4 * 64, 64)]
+        self.assertEqual(int(words[3], 16), 4 * 32)
+
     def test_claim_calldata_has_correct_voucher_offset(self):
         data = wqpu_claim.claim_calldata(FakeClient(), package())
         self.assertTrue(data.startswith("0x12345678"))
@@ -69,6 +86,7 @@ class ClaimTests(unittest.TestCase):
         self.assertEqual(int(words[6], 16), 7 * 32)
 
     def test_simulations_use_market_contract(self):
+        self.assertTrue(wqpu_claim.simulate_funding(FakeClient(), funding()))
         self.assertTrue(wqpu_claim.simulate_activation(FakeClient(), activation()))
         self.assertTrue(wqpu_claim.simulate_claim(FakeClient(), package()))
 
