@@ -34,7 +34,11 @@ permissions:
 
 jobs:
   full-live-chain-compute:
-    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15-intel]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 55
     steps:
       - uses: actions/checkout@v4
