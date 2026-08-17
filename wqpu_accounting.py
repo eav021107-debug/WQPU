@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""WQPU usage receipt + prototype voucher policy for meter v2."""
+"""WQPU dual-meter usage receipts + fail-closed prototype voucher policy."""
 
 from __future__ import print_function
 
@@ -14,6 +14,24 @@ from wqpu_payments import PaymentSession
 
 
 USAGE_DIR = wqpu.HOME / "usage"
+MATCH_FIELDS = (
+    "meter_version",
+    "llama_rpc_op_count",
+    "requests",
+    "request_bytes",
+    "graph_compute_calls",
+    "graph_recompute_calls",
+    "graph_payload_bytes",
+    "tensor_upload_bytes",
+    "node_executions",
+    "estimated_scalar_ops",
+    "matmul_scalar_ops",
+    "attention_scalar_ops",
+    "generic_scalar_ops",
+    "metadata_node_executions",
+    "invalid_frames",
+    "trailing_bytes",
+)
 
 
 def _flag(env_name, network, config_name, default=False):
@@ -38,15 +56,34 @@ def meter_is_eligible(stats):
         return False
 
 
+def meters_match(requester_stats, provider_stats):
+    if not meter_is_eligible(requester_stats) or not meter_is_eligible(provider_stats):
+        return False
+    try:
+        return all(
+            int(requester_stats.get(field) or 0) == int(provider_stats.get(field) or 0)
+            for field in MATCH_FIELDS
+        )
+    except Exception:
+        return False
+
+
+def _provider_report(mesh, request_id, node_id):
+    reports = getattr(mesh, "provider_usage_reports", {}) or {}
+    return dict(((reports.get(request_id) or {}).get(node_id)) or {})
+
+
 def save_usage_receipt(mesh, snapshot):
     network = getattr(getattr(mesh, "chain", None), "network", {}) or {}
     auto_vouchers = _flag("WQPU_AUTO_VOUCHERS", network, "payments_enabled", False)
+    request_id = str(getattr(mesh, "current_request_id", "") or "")
     receipt = {
-        "version": 2,
+        "version": 3,
         "kind": "wqpu-rpc-usage-receipt",
+        "request_id": request_id or None,
         "created_at": int(time.time()),
         "model": wqpu.model_name(),
-        "meter": "llama.cpp-rpc-estimated-scalar-ops-v2",
+        "meter": "llama.cpp-rpc-dual-estimated-scalar-ops-v2",
         "prototype_accounting": True,
         "automatic_real_value_payments_default": bool(network.get("payments_enabled", False)),
         "auto_vouchers_requested": auto_vouchers,
@@ -66,17 +103,35 @@ def save_usage_receipt(mesh, snapshot):
             continue
         info = mesh.peer_info.get(node_id) or {}
         wallet = str(info.get("wallet") or "").lower()
-        eligible = meter_is_eligible(stats)
+        requester_eligible = meter_is_eligible(stats)
+        provider_report = _provider_report(mesh, request_id, node_id) if request_id else {}
+        provider_stats = provider_report.get("rpc") if isinstance(provider_report.get("rpc"), dict) else {}
+        dual_match = meters_match(stats, provider_stats) if provider_stats else False
+
         worker = {
             "node_id": node_id,
             "wallet": wallet or None,
             "hostname": info.get("hostname"),
             "prototype_compute_units": units,
-            "meter_eligible_for_prototype_voucher": eligible,
+            "requester_meter_eligible": requester_eligible,
+            "provider_attestation_received": bool(provider_report),
+            "dual_meter_match": dual_match,
             "rpc": stats,
         }
-        if not eligible:
-            worker["voucher_error"] = "meter stream incomplete, malformed, or unsupported"
+        if provider_report:
+            worker["provider_rpc"] = provider_stats
+            worker["provider_attestation"] = {
+                "provider_node_id": provider_report.get("provider_node_id"),
+                "provider_wallet": provider_report.get("provider_wallet"),
+                "signature": provider_report.get("signature"),
+            }
+
+        if not requester_eligible:
+            worker["voucher_error"] = "requester meter stream incomplete, malformed, or unsupported"
+        elif not provider_report:
+            worker["voucher_error"] = "signed worker meter report not received"
+        elif not dual_match:
+            worker["voucher_error"] = "requester and worker meters disagree"
         elif payments and wallet:
             try:
                 worker["voucher"] = payments.issue(wallet, units)
