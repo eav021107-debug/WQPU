@@ -12,8 +12,8 @@ def main():
         sys.argv = [sys.argv[0]] + sys.argv[2:]
         return wqpu_claim.main()
 
-    import wqpu_runtime
-    return wqpu_runtime.main()
+    import wqpu_autopay
+    return wqpu_autopay.main()
 
 
 if __name__ == "__main__":
