@@ -73,23 +73,24 @@ contract WQPUSessionEscrowTest {
         uint128 maxAmount,
         uint128 price,
         uint64 validUntil,
-        bytes memory auth
+        bytes memory authorization
     ) private {
-        bytes memory voucher = _voucher(provider, sessionId, amount, units);
+        WQPUComputeMarket.SpendAuthorizationData memory auth = WQPUComputeMarket.SpendAuthorizationData({
+            requester: requester,
+            sessionKey: sessionKey,
+            sessionId: sessionId,
+            maxAmount: maxAmount,
+            pricePerMillionUnits: price,
+            validUntil: validUntil
+        });
+        WQPUComputeMarket.ProviderVoucherData memory voucher = WQPUComputeMarket.ProviderVoucherData({
+            provider: provider,
+            cumulativeAmount: amount,
+            cumulativeUnits: units
+        });
+        bytes memory voucherSignature = _voucher(provider, sessionId, amount, units);
         vm.prank(RELAYER);
-        market.claimEscrowWithSession(
-            requester,
-            provider,
-            sessionId,
-            amount,
-            units,
-            voucher,
-            sessionKey,
-            maxAmount,
-            price,
-            validUntil,
-            auth
-        );
+        market.claimEscrowWithSession(auth, voucher, voucherSignature, authorization);
     }
 
     function testOneDepositPaysMultipleProvidersWithoutNewWalletTransactions() public {
@@ -97,10 +98,10 @@ contract WQPUSessionEscrowTest {
         uint128 maxAmount = uint128(5 ether);
         uint128 price = uint128(1 ether);
         uint64 validUntil = uint64(block.timestamp + 1 days);
-        bytes memory auth = _auth(sessionId, maxAmount, price, validUntil);
+        bytes memory authorization = _auth(sessionId, maxAmount, price, validUntil);
 
-        _claim(PROVIDER_A, sessionId, 1 ether, 1_000_000, maxAmount, price, validUntil, auth);
-        _claim(PROVIDER_B, sessionId, 2 ether, 2_000_000, maxAmount, price, validUntil, auth);
+        _claim(PROVIDER_A, sessionId, 1 ether, 1_000_000, maxAmount, price, validUntil, authorization);
+        _claim(PROVIDER_B, sessionId, 2 ether, 2_000_000, maxAmount, price, validUntil, authorization);
 
         require(token.balanceOf(PROVIDER_A) == 1 ether, "provider A not paid");
         require(token.balanceOf(PROVIDER_B) == 2 ether, "provider B not paid");
@@ -114,26 +115,33 @@ contract WQPUSessionEscrowTest {
         uint128 maxAmount = uint128(5 ether);
         uint128 oldPrice = uint128(1 ether);
         uint64 validUntil = uint64(block.timestamp + 1 days);
-        bytes memory auth = _auth(sessionId, maxAmount, oldPrice, validUntil);
+        bytes memory authorization = _auth(sessionId, maxAmount, oldPrice, validUntil);
 
         registry.setGlobalPrice(uint128(2 ether));
-        bytes memory voucher = _voucher(PROVIDER_A, sessionId, 1 ether, 1_000_000);
+
+        WQPUComputeMarket.SpendAuthorizationData memory auth = WQPUComputeMarket.SpendAuthorizationData({
+            requester: requester,
+            sessionKey: sessionKey,
+            sessionId: sessionId,
+            maxAmount: maxAmount,
+            pricePerMillionUnits: oldPrice,
+            validUntil: validUntil
+        });
+        WQPUComputeMarket.ProviderVoucherData memory voucher = WQPUComputeMarket.ProviderVoucherData({
+            provider: PROVIDER_A,
+            cumulativeAmount: 1 ether,
+            cumulativeUnits: 1_000_000
+        });
+        bytes memory voucherSignature = _voucher(PROVIDER_A, sessionId, 1 ether, 1_000_000);
 
         vm.prank(RELAYER);
         (bool ok,) = address(market).call(
             abi.encodeWithSelector(
                 market.claimEscrowWithSession.selector,
-                requester,
-                PROVIDER_A,
-                sessionId,
-                1 ether,
-                1_000_000,
+                auth,
                 voucher,
-                sessionKey,
-                maxAmount,
-                oldPrice,
-                validUntil,
-                auth
+                voucherSignature,
+                authorization
             )
         );
 
