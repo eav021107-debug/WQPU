@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 import wqpu_chain
 
@@ -31,6 +34,7 @@ class DecodeClient(wqpu_chain.RegistryClient):
     def __init__(self, encoded):
         self.rpc_url = "mock"
         self.registry = "0x" + "11" * 20
+        self.expected_chain_id = None
         self.timeout = 1
         self._rpc_id = 0
         self.encoded = encoded
@@ -64,16 +68,56 @@ class ChainTests(unittest.TestCase):
             def __init__(self):
                 self.rpc_url = "mock"
                 self.registry = "0x" + "11" * 20
+                self.expected_chain_id = "0x7a69"
                 self.timeout = 1
                 self._rpc_id = 0
 
             def rpc(self, method, params):
                 self.assertion = (method, params)
-                return "0x7a69"
+                return "0x7A69"
 
         client = Client()
         self.assertEqual(client.chain_id(), "0x7a69")
         self.assertEqual(client.assertion, ("eth_chainId", []))
+
+    def test_wrong_chain_is_rejected(self):
+        class Client(wqpu_chain.RegistryClient):
+            def __init__(self):
+                self.rpc_url = "mock"
+                self.registry = "0x" + "11" * 20
+                self.expected_chain_id = "0x1"
+                self.timeout = 1
+                self._rpc_id = 0
+
+            def rpc(self, method, params):
+                return "0x7a69"
+
+        with self.assertRaises(wqpu_chain.ChainError):
+            Client().chain_id()
+
+    def test_published_network_config_only_loads_when_enabled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "network.json"
+            path.write_text(json.dumps({
+                "public": {
+                    "enabled": False,
+                    "rpc_url": "https://ignored.example",
+                    "registry": "0x" + "11" * 20,
+                }
+            }))
+            self.assertEqual(wqpu_chain.load_network_config(path), {})
+
+            path.write_text(json.dumps({
+                "public": {
+                    "enabled": True,
+                    "chain_id": 31337,
+                    "rpc_url": "https://rpc.example",
+                    "registry": "0x" + "11" * 20,
+                }
+            }))
+            loaded = wqpu_chain.load_network_config(path)
+            self.assertEqual(loaded["chain_id"], 31337)
+            self.assertEqual(loaded["rpc_url"], "https://rpc.example")
 
     def test_find_wallet(self):
         wanted = "0x" + "22" * 20
