@@ -1,0 +1,76 @@
+name: WQPU signed status
+
+on:
+  push:
+    paths:
+      - 'wqpu.py'
+      - 'wqpu_runtime.py'
+      - 'wqpu_chain.py'
+      - 'wqpu_network_guard.py'
+      - 'wqpu_node_identity.py'
+      - 'wqpu_node_status.py'
+      - 'wqpu_transport_relay.py'
+      - 'scripts/testnet_stack.py'
+      - 'scripts/check_signed_status_relay.py'
+      - 'tests/test_network_guard.py'
+      - 'tests/test_node_identity.py'
+      - 'tests/test_node_status.py'
+      - 'tests/test_transport_network_uid.py'
+      - '.github/workflows/signed-status.yml'
+  pull_request:
+    paths:
+      - 'wqpu.py'
+      - 'wqpu_runtime.py'
+      - 'wqpu_chain.py'
+      - 'wqpu_network_guard.py'
+      - 'wqpu_node_identity.py'
+      - 'wqpu_node_status.py'
+      - 'wqpu_transport_relay.py'
+      - 'scripts/testnet_stack.py'
+      - 'scripts/check_signed_status_relay.py'
+      - 'tests/test_network_guard.py'
+      - 'tests/test_node_identity.py'
+      - 'tests/test_node_status.py'
+      - 'tests/test_transport_network_uid.py'
+      - '.github/workflows/signed-status.yml'
+
+jobs:
+  signed-status-e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Compile dynamic-status path
+        run: >-
+          python -m py_compile
+          wqpu.py wqpu_runtime.py wqpu_chain.py wqpu_network_guard.py
+          wqpu_node_identity.py wqpu_node_status.py wqpu_transport_relay.py
+          scripts/testnet_stack.py scripts/check_signed_status_relay.py
+      - name: Unit-test signed public identity and load status
+        run: >-
+          python -m unittest
+          tests.test_network_guard tests.test_node_identity tests.test_node_status
+          tests.test_transport_network_uid -v
+      - name: Start operator stack
+        shell: bash
+        run: |
+          unset RUNNER_TRACKING_ID
+          python scripts/testnet_stack.py reset --yes
+          python scripts/testnet_stack.py start \
+            --public-host 127.0.0.1 \
+            --internal-rpc-port 29546 \
+            --rpc-port 19545 \
+            --relayer-port 19787 \
+            --relay-port 19443
+      - name: Signed load heartbeat through real relay
+        run: python scripts/check_signed_status_relay.py
+      - name: Operator doctor after dynamic status traffic
+        run: python scripts/testnet_stack.py doctor
+      - name: Stop operator stack
+        if: always()
+        run: python scripts/testnet_stack.py stop || true
