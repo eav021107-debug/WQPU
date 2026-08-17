@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""End-to-end gasless requester payment smoke test on local Anvil."""
+"""End-to-end gasless requester payment smoke test through the HTTP relayer."""
 
 from __future__ import print_function
 
 import json
+import os
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -13,14 +15,15 @@ sys.path.insert(0, str(ROOT))
 
 from wqpu_chain import RegistryClient  # noqa: E402
 from wqpu_claim import (  # noqa: E402
-    activate_via_rpc,
-    fund_via_rpc,
-    relay_via_rpc,
+    relay,
+    relay_activation,
+    relay_funding,
     simulate_activation,
     simulate_claim,
     simulate_funding,
     wait_receipt,
 )
+from wqpu_relayer import Relayer, RelayerHTTPServer  # noqa: E402
 from wqpu_session import (  # noqa: E402
     active_session,
     ensure_session_key,
@@ -72,8 +75,7 @@ def send(client, sender, to, data):
 
 
 def balance_of(client, token, wallet):
-    raw = eth_call_word(client, token, "balanceOf(address)", address_word(wallet))
-    return int(raw, 16)
+    return int(eth_call_word(client, token, "balanceOf(address)", address_word(wallet)), 16)
 
 
 def permit_digest(client, token, owner, spender, amount, deadline):
@@ -100,135 +102,152 @@ def main():
     accounts = [str(x).lower() for x in client.rpc("eth_accounts", [])]
     if len(accounts) < 2:
         raise RuntimeError("Anvil returned fewer than two unlocked accounts")
-    relayer = accounts[0]
+    relayer_account = accounts[0]
     provider = accounts[1]
 
-    with tempfile.TemporaryDirectory() as tmp:
-        requester_pem = Path(tmp) / "requester.pem"
-        session_pem = Path(tmp) / "session.pem"
-        ensure_session_key(requester_pem)
-        ensure_session_key(session_pem)
-        requester = session_address(client, requester_pem).lower()
-        session_key = session_address(client, session_pem).lower()
+    server = RelayerHTTPServer(
+        ("127.0.0.1", 0),
+        Relayer(client=client, sender=relayer_account, market=market),
+        rate_limit=100,
+    )
+    thread = threading.Thread(target=server.serve_forever)
+    thread.daemon = True
+    thread.start()
+    old_url = os.environ.get("WQPU_RELAYER_URL")
+    os.environ["WQPU_RELAYER_URL"] = "http://127.0.0.1:{}/relay".format(server.server_port)
 
-        deposit = 10 * 10 ** 18
-        transfer_data = selector(client, "transfer(address,uint256)") + address_word(requester) + word(deposit)
-        send(client, relayer, token, transfer_data)
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            requester_pem = Path(tmp) / "requester.pem"
+            session_pem = Path(tmp) / "session.pem"
+            ensure_session_key(requester_pem)
+            ensure_session_key(session_pem)
+            requester = session_address(client, requester_pem).lower()
+            session_key = session_address(client, session_pem).lower()
 
-        block = client.rpc("eth_getBlockByNumber", ["latest", False])
-        now = int(block["timestamp"], 16)
-        session_id = "0x" + "51" * 32
-        max_amount = 5 * 10 ** 18
-        valid_until = now + 3600
+            deposit = 10 * 10 ** 18
+            transfer_data = selector(client, "transfer(address,uint256)") + address_word(requester) + word(deposit)
+            send(client, relayer_account, token, transfer_data)
 
-        # Requester signs token permit only. Relayer performs the actual deposit.
-        permit_raw = strip0x(sign_digest(
-            permit_digest(client, token, requester, market, deposit, valid_until),
-            requester_pem,
-        ))
-        funding = None
-        for recovery in (27, 28):
-            candidate = {
+            block = client.rpc("eth_getBlockByNumber", ["latest", False])
+            now = int(block["timestamp"], 16)
+            session_id = "0x" + "51" * 32
+            max_amount = 5 * 10 ** 18
+            valid_until = now + 3600
+
+            permit_raw = strip0x(sign_digest(
+                permit_digest(client, token, requester, market, deposit, valid_until),
+                requester_pem,
+            ))
+            funding = None
+            for recovery in (27, 28):
+                candidate = {
+                    "market": market,
+                    "requester": requester,
+                    "amount": deposit,
+                    "deadline": valid_until,
+                    "permit_signature": "0x" + permit_raw + "{:02x}".format(recovery),
+                }
+                try:
+                    simulate_funding(client, candidate)
+                    funding = candidate
+                    break
+                except Exception:
+                    pass
+            if funding is None:
+                raise RuntimeError("neither recovery id produced a valid token permit")
+            funding_tx = relay_funding(client, funding)
+            wait_receipt(client, funding_tx)
+            if balance_of(client, token, requester) != 0:
+                raise RuntimeError("permit funding did not move requester tokens into escrow")
+
+            auth_raw = strip0x(sign_digest(
+                spend_authorization_digest(
+                    client, market, requester, session_key, session_id,
+                    max_amount, price, valid_until,
+                ),
+                requester_pem,
+            ))
+            activation = None
+            for recovery in (27, 28):
+                candidate = {
+                    "market": market,
+                    "requester": requester,
+                    "session_key": session_key,
+                    "session_id": session_id,
+                    "max_amount": max_amount,
+                    "price_per_million_units": price,
+                    "valid_until": valid_until,
+                    "authorization_signature": "0x" + auth_raw + "{:02x}".format(recovery),
+                }
+                try:
+                    simulate_activation(client, candidate)
+                    activation = candidate
+                    break
+                except Exception:
+                    pass
+            if activation is None:
+                raise RuntimeError("neither recovery id produced a valid spend authorization")
+            activation_tx = relay_activation(client, activation)
+            wait_receipt(client, activation_tx)
+            active = active_session(client, market, requester, session_id)
+            if not active.get("active") or int(active.get("reserved_remaining") or 0) != max_amount:
+                raise RuntimeError("session activation did not reserve the authorized amount")
+
+            units = 1_000_000
+            amount = price
+            voucher_signature = sign_digest(
+                provider_voucher_digest(
+                    client, market, requester, provider, session_id, amount, units,
+                ),
+                session_pem,
+            )
+            package = {
+                "version": 2,
+                "kind": "wqpu-provider-voucher",
                 "market": market,
                 "requester": requester,
-                "amount": deposit,
-                "deadline": valid_until,
-                "permit_signature": "0x" + permit_raw + "{:02x}".format(recovery),
-            }
-            try:
-                simulate_funding(client, candidate)
-                funding = candidate
-                break
-            except Exception:
-                pass
-        if funding is None:
-            raise RuntimeError("neither recovery id produced a valid token permit")
-        funding_tx = fund_via_rpc(client, funding, relayer)
-        wait_receipt(client, funding_tx)
-        if balance_of(client, token, requester) != 0:
-            raise RuntimeError("permit funding did not transfer requester tokens into escrow")
-
-        # Requester signs bounded session authorization only. Relayer activates/reserves it.
-        auth_raw = strip0x(sign_digest(
-            spend_authorization_digest(
-                client, market, requester, session_key, session_id,
-                max_amount, price, valid_until,
-            ),
-            requester_pem,
-        ))
-        activation = None
-        for recovery in (27, 28):
-            candidate = {
-                "market": market,
-                "requester": requester,
+                "provider": provider,
                 "session_key": session_key,
                 "session_id": session_id,
                 "max_amount": max_amount,
                 "price_per_million_units": price,
                 "valid_until": valid_until,
-                "authorization_signature": "0x" + auth_raw + "{:02x}".format(recovery),
+                "cumulative_amount": amount,
+                "cumulative_units": units,
+                "voucher_signature": voucher_signature,
             }
-            try:
-                simulate_activation(client, candidate)
-                activation = candidate
-                break
-            except Exception:
-                pass
-        if activation is None:
-            raise RuntimeError("neither recovery id produced a valid spend authorization")
-        activation_tx = activate_via_rpc(client, activation, relayer)
-        wait_receipt(client, activation_tx)
-        active = active_session(client, market, requester, session_id)
-        if not active.get("active") or int(active.get("reserved_remaining") or 0) != max_amount:
-            raise RuntimeError("session activation did not reserve the authorized amount")
 
-        # Local session key signs provider work; relayer claims it; provider receives WQPU.
-        units = 1_000_000
-        amount = price
-        voucher_signature = sign_digest(
-            provider_voucher_digest(
-                client, market, requester, provider, session_id, amount, units,
-            ),
-            session_pem,
-        )
-        package = {
-            "version": 2,
-            "kind": "wqpu-provider-voucher",
-            "market": market,
-            "requester": requester,
-            "provider": provider,
-            "session_key": session_key,
-            "session_id": session_id,
-            "max_amount": max_amount,
-            "price_per_million_units": price,
-            "valid_until": valid_until,
-            "cumulative_amount": amount,
-            "cumulative_units": units,
-            "voucher_signature": voucher_signature,
-        }
-
-        simulate_claim(client, package)
-        before = balance_of(client, token, provider)
-        tx_hash = relay_via_rpc(client, package, relayer)
-        wait_receipt(client, tx_hash)
-        after = balance_of(client, token, provider)
-        if after - before != amount:
-            raise RuntimeError("provider received {}, expected {}".format(after - before, amount))
-
-        try:
             simulate_claim(client, package)
-        except Exception:
-            replay_blocked = True
+            before = balance_of(client, token, provider)
+            tx_hash = relay(client, package)
+            wait_receipt(client, tx_hash)
+            after = balance_of(client, token, provider)
+            if after - before != amount:
+                raise RuntimeError("provider received {}, expected {}".format(after - before, amount))
+
+            try:
+                simulate_claim(client, package)
+            except Exception:
+                replay_blocked = True
+            else:
+                replay_blocked = False
+            if not replay_blocked:
+                raise RuntimeError("already-claimed cumulative voucher remained claimable")
+
+            active = active_session(client, market, requester, session_id)
+            if int(active.get("reserved_remaining") or 0) != max_amount - amount:
+                raise RuntimeError("claim did not consume session reservation")
+
+            print("WQPU HTTP relayer round-trip OK: permit -> reserve -> {} wei -> {}".format(amount, provider))
+    finally:
+        if old_url is None:
+            os.environ.pop("WQPU_RELAYER_URL", None)
         else:
-            replay_blocked = False
-        if not replay_blocked:
-            raise RuntimeError("already-claimed cumulative voucher remained claimable")
-
-        active = active_session(client, market, requester, session_id)
-        if int(active.get("reserved_remaining") or 0) != max_amount - amount:
-            raise RuntimeError("claim did not consume session reservation")
-
-        print("WQPU gasless payment round-trip OK: permit -> reserve -> {} wei -> {}".format(amount, provider))
+            os.environ["WQPU_RELAYER_URL"] = old_url
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
     return 0
 
 
