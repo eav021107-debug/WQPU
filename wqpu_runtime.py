@@ -22,16 +22,18 @@ import time
 import wqpu
 from wqpu_chain import RegistryClient, parse_endpoint
 from wqpu_meter import MeterError, UsageBook
-from wqpu_payments import PaymentError, PaymentSession
+from wqpu_payments import PaymentSession
 from wqpu_session import escrow_balance, load_session, save_session, session_address
 from wqpu_wallet import connect_wallet
 
 VERSION = "0.6.0-dev"
 STATE_FILE = wqpu.HOME / "chain.json"
 USAGE_DIR = wqpu.HOME / "usage"
+VOUCHER_INBOX_FILE = wqpu.HOME / "voucher-inbox.json"
 PUBLIC_PROTOCOL = "wqpu-public-v1"
 DEFAULT_SESSION_MAX_AMOUNT = 10 * 10 ** 18
 DEFAULT_SESSION_LIFETIME = 24 * 60 * 60
+MAX_VOUCHER_INBOX = 512
 
 
 def load_state():
@@ -44,6 +46,27 @@ def load_state():
 def save_state(state):
     wqpu.ensure_home()
     STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def load_voucher_inbox():
+    try:
+        data = json.loads(VOUCHER_INBOX_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_voucher_inbox(inbox):
+    wqpu.ensure_home()
+    items = list(inbox.items())
+    if len(items) > MAX_VOUCHER_INBOX:
+        items.sort(key=lambda item: int((item[1] or {}).get("received_at") or 0), reverse=True)
+        inbox = dict(items[:MAX_VOUCHER_INBOX])
+    VOUCHER_INBOX_FILE.write_text(json.dumps(inbox, indent=2) + "\n")
+    try:
+        VOUCHER_INBOX_FILE.chmod(0o600)
+    except Exception:
+        pass
 
 
 def local_endpoint():
@@ -259,6 +282,12 @@ def save_usage_receipt(mesh, snapshot):
     return receipt, path
 
 
+def rewrite_usage_receipt(path, receipt):
+    if not path:
+        return
+    path.write_text(json.dumps(receipt, indent=2) + "\n")
+
+
 class ChainMesh(wqpu.Mesh):
     def __init__(self, cfg, chain, wallet):
         super(ChainMesh, self).__init__(cfg)
@@ -395,6 +424,82 @@ class ChainMesh(wqpu.Mesh):
         except Exception:
             await wqpu.close_writer(cw)
 
+    async def handle_open_request(self, msg, via=None):
+        if msg.get("service") == "payment_voucher":
+            self.receive_payment_voucher(msg.get("voucher"))
+            return
+        await super(ChainMesh, self).handle_open_request(msg, via=via)
+
+    def receive_payment_voucher(self, package):
+        if not isinstance(package, dict):
+            return False
+        try:
+            if len(json.dumps(package, separators=(",", ":"))) > 32768:
+                return False
+            if package.get("kind") != "wqpu-provider-voucher":
+                return False
+            provider = str(package.get("provider") or "").lower()
+            requester = str(package.get("requester") or "").lower()
+            market = str(package.get("market") or "").lower()
+            session_id = str(package.get("session_id") or "").lower()
+            if provider != self.wallet:
+                return False
+            if len(requester) != 42 or not requester.startswith("0x"):
+                return False
+            if len(session_id) != 66 or not session_id.startswith("0x"):
+                return False
+            expected_market = configured_market(self.chain, load_state())
+            if expected_market and market != expected_market:
+                return False
+            amount = int(package.get("cumulative_amount") or 0)
+            units = int(package.get("cumulative_units") or 0)
+            if amount <= 0 or units <= 0:
+                return False
+            if len(str(package.get("voucher_signature") or "")) != 130:
+                return False
+            if len(str(package.get("authorization_signature") or "")) != 132:
+                return False
+        except Exception:
+            return False
+
+        key = "{}|{}|{}".format(market, requester, session_id)
+        inbox = load_voucher_inbox()
+        old = inbox.get(key) or {}
+        if int(old.get("cumulative_amount") or 0) >= amount:
+            return False
+        saved = dict(package)
+        saved["received_at"] = int(time.time())
+        inbox[key] = saved
+        save_voucher_inbox(inbox)
+        return True
+
+    async def send_payment_voucher(self, target, package):
+        ctrl = self.controls.get(target)
+        if ctrl:
+            try:
+                await self.send(ctrl, {
+                    "type": "open",
+                    "service": "payment_voucher",
+                    "voucher": package,
+                })
+                return True
+            except Exception:
+                pass
+        for route_key in list(self.routes.get(target) or []):
+            ctrl = self.outbound.get(route_key)
+            if not ctrl:
+                continue
+            try:
+                await self.send(ctrl, {
+                    "type": "open",
+                    "service": "payment_voucher",
+                    "voucher": package,
+                })
+                return True
+            except Exception:
+                pass
+        return False
+
 
 async def wait_for_registration(chain, wallet, endpoint, fingerprint, timeout=120):
     deadline = time.time() + timeout
@@ -530,18 +635,24 @@ async def run_metered_request(mesh, server_bin, text):
                 str(worker.get("wallet") or worker.get("node_id") or "?")[:12],
                 worker.get("prototype_compute_units", 0),
             ))
-            if worker.get("voucher"):
-                print("[automatic cumulative voucher issued]")
+            voucher = worker.get("voucher")
+            if voucher:
+                delivered = await mesh.send_payment_voucher(worker.get("node_id"), voucher)
+                worker["voucher_delivered"] = bool(delivered)
+                print("[automatic cumulative voucher {}]".format(
+                    "delivered" if delivered else "saved locally; peer delivery pending"
+                ))
             elif worker.get("voucher_error"):
                 print("[voucher not issued: {}]".format(worker["voucher_error"]))
         if path:
+            await wqpu.to_thread(rewrite_usage_receipt, path, receipt)
             print("[usage receipt: {}]".format(path))
 
 
 async def interactive(mesh, server_bin):
     wqpu.ensure_console_stdin()
     print("\nWQPU public peer is online. Type a question.")
-    print("Commands: /status  /peers  /chain  /wallet  /session  /payment  /exit\n")
+    print("Commands: /status  /peers  /chain  /wallet  /session  /payment  /vouchers  /exit\n")
     while not mesh.stop.is_set():
         try:
             line = (await wqpu.to_thread(input, "wqpu> ")).strip()
@@ -583,6 +694,24 @@ async def interactive(mesh, server_bin):
                 ))
             except Exception as exc:
                 print("Payment unavailable: {}".format(exc))
+            continue
+        if line == "/vouchers":
+            inbox = load_voucher_inbox()
+            if not inbox:
+                print("No received provider vouchers yet.")
+            else:
+                print("Stored latest provider vouchers: {}".format(len(inbox)))
+                rows = sorted(
+                    inbox.values(),
+                    key=lambda x: int((x or {}).get("received_at") or 0),
+                    reverse=True,
+                )[:20]
+                for item in rows:
+                    print("- requester {} | amount {} | units {}".format(
+                        str(item.get("requester") or "?")[:12],
+                        item.get("cumulative_amount", 0),
+                        item.get("cumulative_units", 0),
+                    ))
             continue
         if line == "/chain":
             price = mesh.chain_price
