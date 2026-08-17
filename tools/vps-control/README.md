@@ -14,24 +14,24 @@
 - `git_diff`
 - `run_command`
 
-## Установка на VPS
+## Установка на VPS одной командой
+
+Пока PR не слит:
 
 ```bash
-git clone -b agent/vps-control-mcp https://github.com/eav021107-debug/WQPU.git
-cd WQPU
-sudo bash tools/vps-control/scripts/install.sh
+curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/agent/vps-control-mcp/install-vps-control.sh | sudo bash -s -- agent/vps-control-mcp
+```
+
+После слияния в `next-foundation`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/next-foundation/install-vps-control.sh | sudo bash
 ```
 
 По умолчанию рабочая папка:
 
 ```text
 /srv/vps-control-workspace
-```
-
-Можно выбрать другую:
-
-```bash
-sudo VPS_CONTROL_ROOT=/путь/к/проекту bash tools/vps-control/scripts/install.sh
 ```
 
 MCP слушает только VPS локально:
