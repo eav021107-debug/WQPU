@@ -11,7 +11,14 @@ import sys
 RELEASE_VERSION = "0.6.0"
 
 
+def install_public_config_compat():
+    import wqpu_chain
+    import wqpu_public_config
+    wqpu_public_config.install(wqpu_chain)
+
+
 def doctor():
+    install_public_config_compat()
     import wqpu
     from wqpu_chain import load_network_config
     import wqpu_runtime_pin
@@ -38,6 +45,8 @@ def main():
     if args and args[0].lower() in ("--version", "-v", "version"):
         print("WQPU {}".format(RELEASE_VERSION))
         return 0
+
+    install_public_config_compat()
 
     if args and args[0].lower() == "doctor":
         return doctor()
