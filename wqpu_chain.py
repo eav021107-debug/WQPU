@@ -2,7 +2,7 @@
 """Small dependency-free WQPU EVM registry reader.
 
 The runtime never receives a seed phrase/private key. Reads happen through JSON-RPC;
-wallet writes/signatures are done by the browser wallet connector.
+wallet writes are done by the browser wallet connector.
 """
 
 from __future__ import print_function
@@ -11,12 +11,14 @@ import json
 import os
 import time
 import urllib.request
+from pathlib import Path
 
 
 MEMBER_COUNT_SELECTOR = "11aee380"              # memberCount()
 MEMBER_AT_SELECTOR = "ac0250f7"                 # memberAt(uint256)
 GLOBAL_PRICE_SELECTOR = "87a51cc9"              # globalPricePerMillionUnits()
 BPS = 10000
+NETWORK_FILE = Path(__file__).resolve().with_name("network-config.json")
 
 
 class ChainError(RuntimeError):
@@ -65,6 +67,29 @@ def normalize_address(value):
     return value
 
 
+def normalize_chain_id(value):
+    if value is None or value == "":
+        return None
+    if isinstance(value, int):
+        return "0x{:x}".format(value)
+    text = str(value).strip().lower()
+    if text.startswith("0x"):
+        return "0x{:x}".format(int(text, 16))
+    return "0x{:x}".format(int(text))
+
+
+def load_network_config(path=None):
+    target = Path(path) if path else NETWORK_FILE
+    try:
+        root = json.loads(target.read_text())
+    except Exception:
+        return {}
+    public = root.get("public") if isinstance(root, dict) else None
+    if not isinstance(public, dict) or not public.get("enabled"):
+        return {}
+    return dict(public)
+
+
 def parse_endpoint(endpoint):
     endpoint = str(endpoint or "").strip()
     if not endpoint:
@@ -87,9 +112,22 @@ def parse_endpoint(endpoint):
 
 class RegistryClient(object):
     def __init__(self, rpc_url=None, registry=None, timeout=10):
-        self.rpc_url = rpc_url or os.environ.get("WQPU_RPC_URL", "http://127.0.0.1:8545")
-        registry = registry or os.environ.get("WQPU_REGISTRY", "")
+        self.network = load_network_config()
+        self.rpc_url = (
+            rpc_url
+            or os.environ.get("WQPU_RPC_URL")
+            or self.network.get("rpc_url")
+            or ""
+        )
+        registry = (
+            registry
+            or os.environ.get("WQPU_REGISTRY")
+            or self.network.get("registry")
+            or ""
+        )
         self.registry = normalize_address(registry) if registry else ""
+        expected = os.environ.get("WQPU_CHAIN_ID") or self.network.get("chain_id")
+        self.expected_chain_id = normalize_chain_id(expected) if expected not in (None, "") else None
         self.timeout = timeout
         self._rpc_id = 0
 
@@ -99,7 +137,7 @@ class RegistryClient(object):
 
     def rpc(self, method, params):
         if not self.configured:
-            raise ChainError("WQPU chain is not configured (set WQPU_RPC_URL and WQPU_REGISTRY)")
+            raise ChainError("WQPU chain is not configured")
         self._rpc_id += 1
         payload = json.dumps({
             "jsonrpc": "2.0",
@@ -125,8 +163,14 @@ class RegistryClient(object):
         value = self.rpc("eth_chainId", [])
         if not isinstance(value, str) or not value.startswith("0x"):
             raise ChainError("bad eth_chainId result")
-        int(value, 16)
-        return value.lower()
+        value = normalize_chain_id(value)
+        if self.expected_chain_id and value != self.expected_chain_id:
+            raise ChainError(
+                "wrong WQPU chain: expected {}, RPC returned {}".format(
+                    self.expected_chain_id, value
+                )
+            )
+        return value
 
     def eth_call(self, data):
         result = self.rpc("eth_call", [{"to": self.registry, "data": "0x" + data}, "latest"])
@@ -192,7 +236,7 @@ class RegistryClient(object):
     def discover(self, exclude_wallet=None, max_nodes=512, max_age=180):
         exclude = normalize_address(exclude_wallet) if exclude_wallet else None
         count = min(self.member_count(), int(max_nodes))
-        now = self.latest_timestamp()
+        now = self.latest_timestamp() if max_age else 0
         nodes = []
         for index in range(count):
             try:
@@ -234,13 +278,15 @@ def chain_config_from_env():
         "configured": client.configured,
         "rpc_url": client.rpc_url,
         "registry": client.registry,
+        "chain_id": client.expected_chain_id,
+        "network": client.network,
     }
 
 
 if __name__ == "__main__":
     client = RegistryClient()
     if not client.configured:
-        raise SystemExit("set WQPU_RPC_URL and WQPU_REGISTRY")
+        raise SystemExit("WQPU public chain is not configured")
     print(json.dumps({
         "chain_id": client.chain_id(),
         "price_per_million_units": client.global_price(),
