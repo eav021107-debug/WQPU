@@ -25,7 +25,9 @@ TEST_HOME = ROOT / ".wqpu-testnet" / "status-e2e-node"
 os.environ["WQPU_HOME"] = str(TEST_HOME)
 
 import wqpu  # noqa: E402
+import wqpu_chain  # noqa: E402
 import wqpu_network_guard  # noqa: E402
+import wqpu_public_config  # noqa: E402
 import wqpu_public_security  # noqa: E402
 import wqpu_runtime as runtime  # noqa: E402
 from wqpu_chain import RegistryClient  # noqa: E402
@@ -59,7 +61,10 @@ async def close_mesh(mesh):
 
 async def check():
     state = json.loads((STACK / "state.json").read_text())
-    config = json.loads((STACK / "network-config.json").read_text())["public"]
+    raw_config = json.loads((STACK / "network-config.json").read_text())
+    config = wqpu_public_config.normalize_public(
+        wqpu_chain, raw_config, raw_config["public"]
+    )
     operator = json.loads((STACK / "operator.json").read_text())
     wallet = str(operator["address"]).lower()
     private_key = str(operator["private_key"])
@@ -110,7 +115,6 @@ async def check():
         if not any(node_id == worker.me for node_id, _ in requester.peers()):
             raise RuntimeError("valid signed worker was not schedulable")
 
-        # The status signer caches unchanged values briefly, so move beyond that window.
         await asyncio.sleep(2.1)
         runtime.system_load_bps = lambda: 8500
         await worker.broadcast_nodes()
@@ -120,8 +124,8 @@ async def check():
         if not any(node_id == worker.me for node_id, _ in requester.peers()):
             raise RuntimeError("fresh signed worker status became unschedulable")
 
-        # Keep the valid signature but lie about the advertised load. Relay/requester
-        # must reject this because public fields no longer match the signed status body.
+        # Keep the valid signature but lie about the advertised load. Requester must
+        # reject this because public fields no longer match the signed status body.
         info = worker.my_info()
         tampered = dict(info)
         tampered["load_bps"] = 0
