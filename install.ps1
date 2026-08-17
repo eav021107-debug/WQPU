@@ -75,12 +75,9 @@ if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
 if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) { throw 'WQPU needs OpenSSL. Install Git for Windows or OpenSSL, then run the same command again.' }
 
 Write-Host 'WQPU: downloading runtime...'
-$pythonFiles = @('wqpu.py','wqpu_chain.py','wqpu_wallet.py','wqpu_session.py','wqpu_meter.py','wqpu_accounting.py','wqpu_attestation.py','wqpu_payments.py','wqpu_claim.py','wqpu_vouchers.py','wqpu_runtime.py','wqpu_autopay.py','wqpu_multistream.py','wqpu_runtime_pin.py','wqpu_network_guard.py','wqpu_node_identity.py','wqpu_node_status.py','wqpu_public_config.py','wqpu_public_security.py','wqpu_entry.py')
+$pythonFiles = @('wqpu.py','wqpu_accel.py','wqpu_gpu_patch.py','wqpu_chain.py','wqpu_wallet.py','wqpu_session.py','wqpu_meter.py','wqpu_accounting.py','wqpu_attestation.py','wqpu_payments.py','wqpu_claim.py','wqpu_vouchers.py','wqpu_runtime.py','wqpu_autopay.py','wqpu_multistream.py','wqpu_runtime_pin.py','wqpu_network_guard.py','wqpu_node_identity.py','wqpu_node_status.py','wqpu_public_config.py','wqpu_public_security.py','wqpu_entry.py')
 $files = $pythonFiles + @('network-config.json')
 
-# One immutable source archive avoids dozens of raw.githubusercontent.com requests and
-# therefore avoids rate-limit failures during one-command Windows installs. Keep the old
-# raw-file path only as a compatibility fallback for custom mirrors that are not GitHub.
 $archiveInstalled = $false
 if ($repo -and $sourceRef) {
   $tmpRoot = Join-Path $env:TEMP ("wqpu-source-" + [Guid]::NewGuid().ToString('N'))
