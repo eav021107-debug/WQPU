@@ -21,3 +21,18 @@ jobs:
         run: python -m unittest discover -s tests -v
       - name: Runtime version
         run: python wqpu_runtime.py --version
+
+  solidity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Compile contracts
+        run: >-
+          npx --yes solc@0.8.35 --bin
+          contracts/WQPUToken.sol
+          contracts/WQPURegistry.sol
+          contracts/WQPUComputeMarket.sol
+          -o /tmp/wqpu-solc
