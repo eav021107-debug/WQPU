@@ -20,12 +20,12 @@ jobs:
           python -m py_compile
           wqpu.py wqpu_chain.py wqpu_wallet.py wqpu_session.py
           wqpu_meter.py wqpu_payments.py wqpu_claim.py wqpu_vouchers.py
-          wqpu_runtime.py scripts/devnet.py scripts/check_devnet.py
+          wqpu_runtime.py wqpu_autopay.py scripts/devnet.py scripts/check_devnet.py
           scripts/check_session_payment.py
       - name: Unit tests
         run: python -m unittest discover -s tests -v
       - name: Runtime version
-        run: python wqpu_runtime.py --version
+        run: python wqpu_autopay.py --version
       - name: Validate published network JSON
         run: python -c "import json; json.load(open('network-config.json'))"
 
