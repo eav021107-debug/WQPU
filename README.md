@@ -34,7 +34,7 @@ wqpu claim
 
 The installers are exercised in CI on Linux and Windows.
 
-## What happens on first public-network start
+## Public-network flow
 
 When `network-config.json` contains a published WQPU network, WQPU:
 
@@ -44,7 +44,7 @@ When `network-config.json` contains a published WQPU network, WQPU:
 4. discovers other nodes from `WQPURegistry`;
 5. connects directly or through TLS-pinned bootstrap relays when NAT/CGNAT blocks inbound traffic;
 6. ranks live workers by load/capacity;
-7. starts a local `llama-server` and distributes work through the selected `ggml-rpc-server` workers.
+7. starts a local `llama-server` and distributes work through selected `ggml-rpc-server` workers.
 
 The blockchain stores discovery/accounting state only. Prompts, model data and llama.cpp RPC traffic stay off-chain.
 
@@ -76,17 +76,19 @@ The public runtime implements:
 - provider payouts that can only go to the provider wallet encoded in the voucher;
 - durable voucher inbox/outbox and retry/ACK routing.
 
-The provider can submit accumulated payouts with:
+Provider payout:
 
 ```bash
 wqpu claim --submit
 ```
 
+The network operator can enable automatic voucher issuance from `network-config.json` with `payments_enabled=true`; environment variables remain available for development overrides.
+
 ## Compute metering
 
 Meter v2 parses the pinned llama.cpp serialized RPC graph. It estimates scalar work from tensor shapes; matrix multiplication and flash attention receive shape-aware estimates instead of treating every graph node equally. Malformed, partial or protocol-mismatched streams fail closed and cannot create a voucher.
 
-This is still experimental accounting, not a formally fraud-proof FLOP oracle. For that reason real-value automatic voucher issuance/payment enforcement should only be enabled on networks whose operator accepts this meter version and has completed security testing.
+This is still experimental accounting, not a formally fraud-proof FLOP oracle. Real-value automatic payment should only be enabled after adversarial testing and audit of the selected public deployment.
 
 ## NAT / relay
 
@@ -116,7 +118,7 @@ This starts Anvil and deploys:
 WQPUToken -> WQPURegistry -> WQPUComputeMarket
 ```
 
-The test suite also exercises the full gasless flow:
+The test suite exercises the full gasless flow:
 
 ```text
 permit -> escrow funding -> session reservation -> provider voucher -> HTTP relayer -> provider balance
@@ -126,14 +128,12 @@ Never expose the included Anvil development keys/RPC to the public Internet or u
 
 ## Legacy private mesh
 
-Until a public WQPU network is published in `network-config.json`, the normal installer keeps the private mesh working:
+Until public RPC/contracts/relays are published in `network-config.json`, the normal installer keeps the private mesh working:
 
 ```bash
 wqpu --legacy
 wqpu --join 'WQPU1...'
 ```
-
-This fallback does not change the public-chain architecture; it simply lets the software run before public infrastructure exists.
 
 ## Contracts
 
@@ -157,14 +157,14 @@ GitHub Actions covers:
 - replay rejection/reserved-session accounting;
 - requester -> relay -> NAT worker integration.
 
-## What is code-complete vs external deployment
+## Deployment boundary
 
-WQPU 0.6.0 contains the complete public-network prototype code path. A truly zero-configuration Internet-wide launch additionally requires **external infrastructure** that cannot live inside this repository alone:
+WQPU 0.6.0 contains the complete public-network prototype code path. A truly zero-configuration Internet-wide launch additionally requires external infrastructure that cannot be embedded into a Git repository by itself:
 
 - deploy the chosen WQPU EVM chain/testnet;
-- publish its RPC + contract addresses in `network-config.json`;
+- publish RPC + contract addresses in `network-config.json`;
 - operate at least one public TLS-pinned transport relay;
 - operate at least one funded gas relayer;
-- security/adversarial review and an independent contract/network audit before real-value use.
+- complete security/adversarial review and an independent contract/network audit before real-value use.
 
-See `PUBLIC_CHAIN_TODO.md` for the exact deployment checklist and `ECONOMY.md` for the payment model.
+See `PUBLIC_CHAIN_TODO.md` for the deployment checklist and `ECONOMY.md` for the payment model.
