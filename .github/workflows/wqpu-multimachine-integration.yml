@@ -27,6 +27,7 @@ on:
       - 'client/internal/transport/**'
       - 'client/cmd/wqpu-dev-node/**'
       - 'client/cmd/wqpu-dev-infer/**'
+      - 'client/cmd/wqpu-rpc-verify/**'
       - '.github/workflows/wqpu-multimachine-integration.yml'
   workflow_dispatch:
 
@@ -51,9 +52,19 @@ jobs:
         with:
           go-version: '1.25.9'
 
-      - name: Validate one-command launcher
+      - name: Validate hardened one-command launcher
         shell: bash
-        run: bash -n ./up.sh
+        run: |
+          bash -n ./up.sh
+          ! grep -Eq 'WQPU_CHAIN_DISCOVER|255\.255\.255\.255|start_lan_beacon|find_lan_rpc' ./up.sh
+          grep -Fq 'WQPU_DEV_LOCAL_FALLBACK' ./up.sh
+          grep -Fq 'wqpu-rpc-verify' ./up.sh
+
+      - name: Build strict bootstrap verifier
+        shell: bash
+        run: |
+          cd client
+          GOWORK=off go build ./cmd/wqpu-rpc-verify
 
       - name: Run shared-chain blockchain-registry distributed inference proof
         shell: bash
