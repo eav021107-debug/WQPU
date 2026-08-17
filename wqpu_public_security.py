@@ -6,7 +6,8 @@ This module is intentionally separate from the legacy mesh. For a v3 public netw
 - signs short-lived load/capacity status with the node TLS private key;
 - verifies received status against the worker TLS fingerprint registered on-chain;
 - signs control/dial/accept transport hellos for relay-side Registry authentication;
-- sends signed status heartbeats over existing outbound relay control connections.
+- sends signed status heartbeats over existing outbound relay control connections;
+- marks NAT/relay workers schedulable only after end-to-end signed Registry verification.
 
 Legacy/v1/v2 networks without a network_uid keep the existing transport behavior.
 """
@@ -97,6 +98,7 @@ def install(cls):
 
     def merge_nodes(self, route_key, nodes):
         uid = _network_uid(self)
+        verified_ids = set()
         if uid:
             accepted = []
             chain_nodes = getattr(self, "chain_nodes", {}) or {}
@@ -113,8 +115,18 @@ def install(cls):
                 except Exception:
                     continue
                 accepted.append(node)
+                node_id = str(node.get("node_id") or "")
+                if node_id:
+                    verified_ids.add(node_id)
             nodes = accepted
-        return original_merge_nodes(self, route_key, nodes)
+        result = original_merge_nodes(self, route_key, nodes)
+        # Direct peers used to be verified by route address. For a relay route, the route
+        # address belongs to the relay, so the end-to-end signed Registry proof above is
+        # the stronger criterion and is what makes the worker schedulable.
+        verified = getattr(self, "verified_node_ids", None)
+        if verified is not None:
+            verified.update(verified_ids)
+        return result
 
     async def broadcast_nodes(self):
         await original_broadcast_nodes(self)
