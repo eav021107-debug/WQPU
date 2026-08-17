@@ -1,12 +1,16 @@
-# WQPU trusted bootstrap RPCs.
+# WQPU trusted first-contact RPC gateways.
 #
-# These addresses locate the WQPU blockchain only. They are NOT compute peers.
+# These addresses locate/read the WQPU blockchain only. They are NOT compute
+# peers and they are never treated as network authorities. Every candidate is
+# verified by the client before use; a successful endpoint is then saved in the
+# machine's local verified RPC addrbook for later starts.
+#
 # Compute/storage peers are discovered exclusively from the authenticated
-# on-chain registry after the blockchain connection has been verified.
+# on-chain registry after blockchain access has been verified.
 #
-# Production entries must use HTTPS or WSS. The one-command client rejects
-# LAN broadcast discovery, arbitrary network-supplied RPCs and insecure HTTP/WS
-# unless an explicit development flag is enabled.
+# Production entries must use HTTPS or WSS. Ship several independent gateways
+# operated by different parties/regions. No single RPC or project-owner VPS may
+# be required for WQPU to operate. Full WQPU chain nodes additionally use
+# bootstrap-p2p.txt + CometBFT PEX + persistent config/addrbook.json.
 #
-# One trusted production RPC URL per line will be added when the first public
-# WQPU bootstrap endpoint is deployed.
+# One production RPC URL per line will be added when public WQPU gateways exist.
