@@ -4,7 +4,7 @@ $root = Join-Path $env:LOCALAPPDATA 'WQPU'
 $bin = Join-Path $root 'bin'
 $join = $env:WQPU_JOIN
 $expectedWqpu = 'WQPU 0.6.0'
-$cacheBuster = 'wqpu-0.6.0-r1'
+$cacheBuster = 'wqpu-0.6.0-r2'
 $chainState = Join-Path $HOME '.wqpu\chain.json'
 
 New-Item -ItemType Directory -Force -Path $root,$bin | Out-Null
@@ -55,7 +55,7 @@ if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
 if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) { throw 'WQPU needs OpenSSL. Install Git for Windows or OpenSSL, then run the same command again.' }
 
 Write-Host 'WQPU: downloading runtime...'
-$pythonFiles = @('wqpu.py','wqpu_chain.py','wqpu_wallet.py','wqpu_session.py','wqpu_meter.py','wqpu_accounting.py','wqpu_payments.py','wqpu_claim.py','wqpu_vouchers.py','wqpu_runtime.py','wqpu_autopay.py','wqpu_runtime_pin.py','wqpu_entry.py')
+$pythonFiles = @('wqpu.py','wqpu_chain.py','wqpu_wallet.py','wqpu_session.py','wqpu_meter.py','wqpu_accounting.py','wqpu_attestation.py','wqpu_payments.py','wqpu_claim.py','wqpu_vouchers.py','wqpu_runtime.py','wqpu_autopay.py','wqpu_runtime_pin.py','wqpu_entry.py')
 $files = $pythonFiles + @('network-config.json')
 foreach ($file in $files) { Invoke-WebRequest -UseBasicParsing "$raw/$file`?installer=$cacheBuster" -OutFile (Join-Path $root $file) }
 
