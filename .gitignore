@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# Foundry
+out/
+cache/
+
+# Local WQPU development chain
+.wqpu-devnet.json
+.wqpu-devnet.env
+.wqpu-devnet-anvil.log
+.wqpu-devnet-anvil.pid

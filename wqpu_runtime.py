@@ -1,0 +1,837 @@
+#!/usr/bin/env python3
+"""WQPU public-chain runtime.
+
+Public mode uses the blockchain registry for discovery/identity/price. The browser
+wallet registers the node and authorizes a bounded local payment session; wallet
+private keys never enter WQPU.
+"""
+
+from __future__ import print_function
+
+import argparse
+import asyncio
+import hashlib
+import json
+import os
+import secrets
+import signal
+import socket
+import sys
+import time
+
+import wqpu
+from wqpu_chain import RegistryClient, parse_endpoint
+from wqpu_meter import MeterError, UsageBook
+from wqpu_payments import PaymentSession
+from wqpu_session import escrow_balance, load_session, save_session, session_address
+from wqpu_wallet import connect_wallet
+
+VERSION = "0.6.0-dev"
+STATE_FILE = wqpu.HOME / "chain.json"
+USAGE_DIR = wqpu.HOME / "usage"
+VOUCHER_INBOX_FILE = wqpu.HOME / "voucher-inbox.json"
+PUBLIC_PROTOCOL = "wqpu-public-v1"
+DEFAULT_SESSION_MAX_AMOUNT = 10 * 10 ** 18
+DEFAULT_SESSION_LIFETIME = 24 * 60 * 60
+MAX_VOUCHER_INBOX = 512
+
+
+def load_state():
+    try:
+        return json.loads(STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+
+def save_state(state):
+    wqpu.ensure_home()
+    STATE_FILE.write_text(json.dumps(state, indent=2) + "\n")
+
+
+def load_voucher_inbox():
+    try:
+        data = json.loads(VOUCHER_INBOX_FILE.read_text())
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_voucher_inbox(inbox):
+    wqpu.ensure_home()
+    items = list(inbox.items())
+    if len(items) > MAX_VOUCHER_INBOX:
+        items.sort(key=lambda item: int((item[1] or {}).get("received_at") or 0), reverse=True)
+        inbox = dict(items[:MAX_VOUCHER_INBOX])
+    VOUCHER_INBOX_FILE.write_text(json.dumps(inbox, indent=2) + "\n")
+    try:
+        VOUCHER_INBOX_FILE.chmod(0o600)
+    except Exception:
+        pass
+
+
+def local_endpoint():
+    configured = os.environ.get("WQPU_PUBLIC_ENDPOINT", "").strip()
+    if configured:
+        parse_endpoint(configured)
+        return configured
+    host = ""
+    try:
+        host = socket.gethostbyname(socket.gethostname())
+    except Exception:
+        pass
+    if not host or host.startswith("127."):
+        host = socket.getfqdn() or socket.gethostname()
+    return "{}:{}".format(host, wqpu.PORT)
+
+
+def capacity_units():
+    return max(1, int(wqpu.total_ram_mb() or 1))
+
+
+def system_load_bps():
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            class FILETIME(ctypes.Structure):
+                _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+            def value(ft):
+                return (int(ft.high) << 32) | int(ft.low)
+
+            def sample():
+                idle, kernel, user = FILETIME(), FILETIME(), FILETIME()
+                ok = ctypes.windll.kernel32.GetSystemTimes(
+                    ctypes.byref(idle), ctypes.byref(kernel), ctypes.byref(user)
+                )
+                if not ok:
+                    raise OSError("GetSystemTimes failed")
+                return value(idle), value(kernel), value(user)
+
+            a = sample()
+            time.sleep(0.05)
+            b = sample()
+            idle = b[0] - a[0]
+            total = (b[1] - a[1]) + (b[2] - a[2])
+            if total > 0:
+                return max(0, min(10000, int(((total - idle) * 10000) / total)))
+        except Exception:
+            return 0
+    try:
+        load = os.getloadavg()[0]
+        cpus = max(1, os.cpu_count() or 1)
+        return max(0, min(10000, int((load / cpus) * 10000)))
+    except Exception:
+        return 0
+
+
+def public_secret(chain_id, registry):
+    material = "{}|{}|{}".format(PUBLIC_PROTOCOL, chain_id.lower(), registry.lower())
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def peer_from_registry(node):
+    host, port = parse_endpoint(node["endpoint"])
+    fp = str(node["fingerprint"] or "").lower()
+    if fp.startswith("0x"):
+        fp = fp[2:]
+    return {
+        "host": host,
+        "port": port,
+        "fingerprint": fp,
+        "wallet": node.get("wallet"),
+        "capacity": int(node.get("capacity") or 0),
+        "load_bps": int(node.get("load_bps") or 0),
+        "updated_at": int(node.get("updated_at") or 0),
+    }
+
+
+def registration_matches(node, endpoint, fingerprint):
+    if not node or not node.get("active"):
+        return False
+    registered_fp = str(node.get("fingerprint") or "").lower().replace("0x", "")
+    expected_fp = str(fingerprint or "").lower().replace("0x", "")
+    return str(node.get("endpoint") or "") == endpoint and registered_fp == expected_fp
+
+
+def configured_market(chain, state):
+    return (
+        os.environ.get("WQPU_MARKET")
+        or state.get("market")
+        or chain.network.get("market")
+        or ""
+    ).strip().lower()
+
+
+def latest_block_timestamp(chain):
+    block = chain.rpc("eth_getBlockByNumber", ["latest", False])
+    return int(block["timestamp"], 16)
+
+
+def make_session_request(chain, market):
+    max_amount = int(os.environ.get("WQPU_SESSION_MAX_AMOUNT", str(DEFAULT_SESSION_MAX_AMOUNT)))
+    lifetime = int(os.environ.get("WQPU_SESSION_LIFETIME", str(DEFAULT_SESSION_LIFETIME)))
+    if max_amount <= 0 or max_amount >= 2 ** 128:
+        raise RuntimeError("WQPU_SESSION_MAX_AMOUNT must fit uint128")
+    if lifetime < 60:
+        raise RuntimeError("WQPU_SESSION_LIFETIME must be at least 60 seconds")
+    now = latest_block_timestamp(chain)
+    price = int(chain.global_price())
+    if price <= 0 or price >= 2 ** 128:
+        raise RuntimeError("invalid WQPU global price")
+    return {
+        "market": market,
+        "sessionKey": session_address(chain),
+        "sessionId": "0x" + secrets.token_hex(32),
+        "maxAmount": max_amount,
+        "pricePerMillionUnits": price,
+        "validUntil": now + lifetime,
+    }
+
+
+def session_is_usable(chain, wallet, market):
+    if not market:
+        return True
+    saved = load_session()
+    if not saved:
+        return False
+    try:
+        now = latest_block_timestamp(chain)
+        local_key = session_address(chain)
+        current_price = int(chain.global_price())
+        return (
+            str(saved.get("requester") or "").lower() == wallet.lower()
+            and str(saved.get("market") or "").lower() == market.lower()
+            and str(saved.get("chain_id") or "").lower() == chain.chain_id().lower()
+            and str(saved.get("session_key") or "").lower() == local_key.lower()
+            and str(saved.get("authorization_signature") or "").startswith("0x")
+            and int(saved.get("valid_until") or 0) > now + 60
+            and int(saved.get("max_amount") or 0) > 0
+            and int(saved.get("price_per_million_units") or 0) == current_price
+        )
+    except Exception:
+        return False
+
+
+def persist_session(wallet, chain_id, request, signature):
+    if not request or not signature:
+        return
+    save_session({
+        "requester": wallet.lower(),
+        "market": request["market"].lower(),
+        "chain_id": chain_id.lower(),
+        "session_key": request["sessionKey"].lower(),
+        "session_id": request["sessionId"].lower(),
+        "max_amount": int(request["maxAmount"]),
+        "price_per_million_units": int(request["pricePerMillionUnits"]),
+        "valid_until": int(request["validUntil"]),
+        "authorization_signature": signature,
+        "authorized_at": int(time.time()),
+    })
+
+
+def save_usage_receipt(mesh, snapshot):
+    receipt = {
+        "version": 1,
+        "kind": "wqpu-rpc-usage-receipt",
+        "created_at": int(time.time()),
+        "model": wqpu.model_name(),
+        "meter": "llama.cpp-rpc-graph-node-executions-v1",
+        "prototype_accounting": True,
+        "workers": [],
+    }
+    auto_vouchers = os.environ.get("WQPU_AUTO_VOUCHERS", "0") == "1"
+    payments = None
+    if auto_vouchers:
+        try:
+            payments = PaymentSession(mesh.chain)
+            payments.validate()
+        except Exception as exc:
+            receipt["payment_error"] = str(exc)
+
+    for node_id, stats in snapshot.items():
+        units = int(stats.get("node_executions") or 0)
+        if units <= 0:
+            continue
+        info = mesh.peer_info.get(node_id) or {}
+        wallet = str(info.get("wallet") or "").lower()
+        worker = {
+            "node_id": node_id,
+            "wallet": wallet or None,
+            "hostname": info.get("hostname"),
+            "prototype_compute_units": units,
+            "rpc": stats,
+        }
+        if payments and wallet:
+            try:
+                worker["voucher"] = payments.issue(wallet, units)
+            except Exception as exc:
+                worker["voucher_error"] = str(exc)
+        receipt["workers"].append(worker)
+
+    if not receipt["workers"]:
+        return receipt, None
+
+    USAGE_DIR.mkdir(parents=True, exist_ok=True)
+    path = USAGE_DIR / "request-{}-{}.json".format(int(time.time()), secrets.token_hex(4))
+    path.write_text(json.dumps(receipt, indent=2) + "\n")
+    try:
+        path.chmod(0o600)
+    except Exception:
+        pass
+    return receipt, path
+
+
+def rewrite_usage_receipt(path, receipt):
+    if not path:
+        return
+    path.write_text(json.dumps(receipt, indent=2) + "\n")
+
+
+class ChainMesh(wqpu.Mesh):
+    def __init__(self, cfg, chain, wallet):
+        super(ChainMesh, self).__init__(cfg)
+        self.chain = chain
+        self.wallet = (wallet or "").lower()
+        self.chain_price = None
+        self.chain_nodes = {}
+        self.chain_peers = {}
+        self.verified_node_ids = set()
+        self.payment_session = load_session()
+        self.usage_book = None
+
+    def my_info(self):
+        info = super(ChainMesh, self).my_info()
+        info.update({
+            "wallet": self.wallet,
+            "capacity": capacity_units(),
+            "load_bps": system_load_bps(),
+            "network": PUBLIC_PROTOCOL,
+        })
+        return info
+
+    def merge_chain_nodes(self, nodes):
+        found = {}
+        peers_by_key = {}
+        for node in nodes:
+            wallet = str(node.get("wallet") or "").lower()
+            if not wallet or wallet == self.wallet:
+                continue
+            try:
+                peer = peer_from_registry(node)
+            except Exception:
+                continue
+            key = wqpu.peer_key(peer["host"], peer["port"])
+            peers_by_key[key] = peer
+            found[wallet] = peer
+        self.chain_nodes = found
+        self.chain_peers = peers_by_key
+
+    def merge_nodes(self, route_key, nodes):
+        candidate = self.chain_peers.get(route_key)
+        if candidate:
+            expected_wallet = str(candidate.get("wallet") or "").lower()
+            expected_fp = str(candidate.get("fingerprint") or "").lower().replace("0x", "")
+            for node in nodes:
+                wallet = str(node.get("wallet") or "").lower()
+                fp = str(node.get("fingerprint") or "").lower().replace("0x", "")
+                nid = str(node.get("node_id") or "")
+                if nid and wallet == expected_wallet and fp == expected_fp:
+                    self.verified_node_ids.add(nid)
+        super(ChainMesh, self).merge_nodes(route_key, nodes)
+
+    async def refresh_chain(self):
+        try:
+            nodes = await wqpu.to_thread(self.chain.discover, self.wallet or None, 512, 0)
+            self.merge_chain_nodes(nodes)
+            self.chain_price = await wqpu.to_thread(self.chain.global_price)
+        except Exception:
+            return
+
+    async def connector_loop(self):
+        tick = 0
+        while not self.stop.is_set():
+            if tick % 4 == 0:
+                await self.refresh_chain()
+
+            for key, peer in list(self.chain_peers.items()):
+                if key in self.outbound:
+                    continue
+                try:
+                    await asyncio.wait_for(self.connect_control(peer), 5)
+                except Exception:
+                    pass
+
+            try:
+                await self.broadcast_nodes()
+            except Exception:
+                pass
+            for ctrl in list(self.outbound.values()):
+                try:
+                    await self.send(ctrl, {"type": "ping"})
+                except Exception:
+                    pass
+
+            tick += 1
+            await asyncio.sleep(5)
+
+    def peers(self):
+        peers = [item for item in super(ChainMesh, self).peers() if item[0] in self.verified_node_ids]
+
+        def rank(item):
+            _, info = item
+            load = int(info.get("load_bps") or 0)
+            capacity = int(info.get("capacity") or info.get("ram_mb") or 0)
+            return (load, -capacity)
+
+        peers.sort(key=rank)
+        limit = max(1, int(os.environ.get("WQPU_MAX_WORKERS", "8")))
+        return peers[:limit]
+
+    def begin_usage(self):
+        self.usage_book = UsageBook()
+
+    def end_usage(self):
+        book = self.usage_book
+        self.usage_book = None
+        return book.snapshot() if book else {}
+
+    async def _copy_metered(self, reader, writer, meter):
+        try:
+            while True:
+                data = await reader.read(65536)
+                if not data:
+                    break
+                if meter:
+                    try:
+                        meter.feed(data)
+                    except MeterError:
+                        meter = None
+                writer.write(data)
+                await writer.drain()
+        except Exception:
+            pass
+        await wqpu.close_writer(writer)
+
+    async def proxy_handler(self, target, cr, cw):
+        try:
+            rr, rw = await self.open_rpc(target)
+            meter = self.usage_book.meter(target) if self.usage_book else None
+            await asyncio.gather(
+                self._copy_metered(cr, rw, meter),
+                wqpu.copy_stream(rr, cw),
+            )
+        except Exception:
+            await wqpu.close_writer(cw)
+
+    async def handle_open_request(self, msg, via=None):
+        if msg.get("service") == "payment_voucher":
+            self.receive_payment_voucher(msg.get("voucher"))
+            return
+        await super(ChainMesh, self).handle_open_request(msg, via=via)
+
+    def receive_payment_voucher(self, package):
+        if not isinstance(package, dict):
+            return False
+        try:
+            if len(json.dumps(package, separators=(",", ":"))) > 32768:
+                return False
+            if package.get("kind") != "wqpu-provider-voucher":
+                return False
+            provider = str(package.get("provider") or "").lower()
+            requester = str(package.get("requester") or "").lower()
+            market = str(package.get("market") or "").lower()
+            session_id = str(package.get("session_id") or "").lower()
+            if provider != self.wallet:
+                return False
+            if len(requester) != 42 or not requester.startswith("0x"):
+                return False
+            if len(session_id) != 66 or not session_id.startswith("0x"):
+                return False
+            expected_market = configured_market(self.chain, load_state())
+            if expected_market and market != expected_market:
+                return False
+            amount = int(package.get("cumulative_amount") or 0)
+            units = int(package.get("cumulative_units") or 0)
+            if amount <= 0 or units <= 0:
+                return False
+            if len(str(package.get("voucher_signature") or "")) != 130:
+                return False
+            if len(str(package.get("authorization_signature") or "")) != 132:
+                return False
+        except Exception:
+            return False
+
+        key = "{}|{}|{}".format(market, requester, session_id)
+        inbox = load_voucher_inbox()
+        old = inbox.get(key) or {}
+        if int(old.get("cumulative_amount") or 0) >= amount:
+            return False
+        saved = dict(package)
+        saved["received_at"] = int(time.time())
+        inbox[key] = saved
+        save_voucher_inbox(inbox)
+        return True
+
+    async def send_payment_voucher(self, target, package):
+        ctrl = self.controls.get(target)
+        if ctrl:
+            try:
+                await self.send(ctrl, {
+                    "type": "open",
+                    "service": "payment_voucher",
+                    "voucher": package,
+                })
+                return True
+            except Exception:
+                pass
+        for route_key in list(self.routes.get(target) or []):
+            ctrl = self.outbound.get(route_key)
+            if not ctrl:
+                continue
+            try:
+                await self.send(ctrl, {
+                    "type": "open",
+                    "service": "payment_voucher",
+                    "voucher": package,
+                })
+                return True
+            except Exception:
+                pass
+        return False
+
+
+async def wait_for_registration(chain, wallet, endpoint, fingerprint, timeout=120):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            node = await wqpu.to_thread(chain.find_wallet, wallet, 512)
+            if registration_matches(node, endpoint, fingerprint):
+                return node
+        except Exception:
+            pass
+        await asyncio.sleep(2)
+    return None
+
+
+def configured_chain(args, state):
+    rpc_url = args.rpc_url or os.environ.get("WQPU_RPC_URL") or state.get("rpc_url")
+    registry = args.registry or os.environ.get("WQPU_REGISTRY") or state.get("registry")
+    client = RegistryClient(rpc_url=rpc_url, registry=registry)
+    return client if client.configured else None
+
+
+async def authorize_session(chain, state, wallet, endpoint, fingerprint, market):
+    chain_id = await wqpu.to_thread(chain.chain_id)
+    request = await wqpu.to_thread(make_session_request, chain, market)
+    chain_name = os.environ.get("WQPU_CHAIN_NAME") or chain.network.get("chain_name")
+    native_symbol = os.environ.get("WQPU_NATIVE_SYMBOL") or chain.network.get("native_symbol")
+    print("WQPU: payment session needs one wallet authorization...")
+    result = await wqpu.to_thread(
+        connect_wallet,
+        chain.registry,
+        endpoint,
+        fingerprint,
+        capacity_units(),
+        system_load_bps(),
+        chain_id,
+        180,
+        chain.rpc_url,
+        chain_name,
+        native_symbol,
+        False,
+        request,
+    )
+    connected = str(result["wallet"]).lower()
+    if connected != wallet.lower():
+        raise RuntimeError("payment session was authorized by a different wallet")
+    signature = result.get("session_authorization_signature")
+    persist_session(wallet, chain_id, request, signature)
+    state["market"] = market
+    save_state(state)
+    print("WQPU: bounded local payment session authorized.")
+
+
+async def ensure_wallet(chain, state, force=False):
+    wallet = str(state.get("wallet") or "").lower()
+    endpoint = os.environ.get("WQPU_PUBLIC_ENDPOINT", "").strip() or state.get("public_endpoint") or local_endpoint()
+    parse_endpoint(endpoint)
+    fingerprint = "0x" + wqpu.cert_fingerprint()
+    market = configured_market(chain, state)
+
+    registration_ok = False
+    if wallet and not force:
+        try:
+            node = await wqpu.to_thread(chain.find_wallet, wallet, 512)
+            registration_ok = registration_matches(node, endpoint, fingerprint)
+        except Exception:
+            raise RuntimeError("could not verify saved wallet registration on the WQPU chain")
+
+        if registration_ok:
+            if market and not session_is_usable(chain, wallet, market):
+                await authorize_session(chain, state, wallet, endpoint, fingerprint, market)
+            return wallet
+        print("WQPU: saved wallet registration no longer matches this node; reconnecting wallet...")
+
+    chain_id = await wqpu.to_thread(chain.chain_id)
+    chain_name = os.environ.get("WQPU_CHAIN_NAME") or chain.network.get("chain_name")
+    native_symbol = os.environ.get("WQPU_NATIVE_SYMBOL") or chain.network.get("native_symbol")
+    session_request = await wqpu.to_thread(make_session_request, chain, market) if market else None
+
+    print("WQPU: opening browser wallet connector...")
+    result = await wqpu.to_thread(
+        connect_wallet,
+        chain.registry,
+        endpoint,
+        fingerprint,
+        capacity_units(),
+        system_load_bps(),
+        chain_id,
+        180,
+        chain.rpc_url,
+        chain_name,
+        native_symbol,
+        True,
+        session_request,
+    )
+    wallet = str(result["wallet"]).lower()
+
+    print("WQPU: wallet connected: {}".format(wallet))
+    registered = await wait_for_registration(chain, wallet, endpoint, fingerprint)
+    if not registered:
+        raise RuntimeError("wallet transaction was submitted, but this node registration was not confirmed")
+
+    state.update({
+        "wallet": wallet,
+        "rpc_url": chain.rpc_url,
+        "registry": chain.registry,
+        "market": market or None,
+        "chain_id": chain_id,
+        "public_endpoint": endpoint,
+        "registration_tx": result.get("tx_hash"),
+    })
+    save_state(state)
+    persist_session(
+        wallet,
+        chain_id,
+        session_request,
+        result.get("session_authorization_signature"),
+    )
+    print("WQPU: node registration confirmed on-chain.")
+    if session_request:
+        print("WQPU: bounded local payment session authorized.")
+    return wallet
+
+
+async def run_metered_request(mesh, server_bin, text):
+    mesh.begin_usage()
+    try:
+        await wqpu.ask(mesh, server_bin, text)
+    finally:
+        snapshot = mesh.end_usage()
+        receipt, path = await wqpu.to_thread(save_usage_receipt, mesh, snapshot)
+        for worker in receipt.get("workers") or []:
+            print("[worker {} | prototype units {}]".format(
+                str(worker.get("wallet") or worker.get("node_id") or "?")[:12],
+                worker.get("prototype_compute_units", 0),
+            ))
+            voucher = worker.get("voucher")
+            if voucher:
+                delivered = await mesh.send_payment_voucher(worker.get("node_id"), voucher)
+                worker["voucher_delivered"] = bool(delivered)
+                print("[automatic cumulative voucher {}]".format(
+                    "delivered" if delivered else "saved locally; peer delivery pending"
+                ))
+            elif worker.get("voucher_error"):
+                print("[voucher not issued: {}]".format(worker["voucher_error"]))
+        if path:
+            await wqpu.to_thread(rewrite_usage_receipt, path, receipt)
+            print("[usage receipt: {}]".format(path))
+
+
+async def interactive(mesh, server_bin):
+    wqpu.ensure_console_stdin()
+    print("\nWQPU public peer is online. Type a question.")
+    print("Commands: /status  /peers  /chain  /wallet  /session  /payment  /vouchers  /exit\n")
+    while not mesh.stop.is_set():
+        try:
+            line = (await wqpu.to_thread(input, "wqpu> ")).strip()
+        except (EOFError, KeyboardInterrupt):
+            line = "/exit"
+        if not line:
+            continue
+        if line == "/exit":
+            mesh.stop.set()
+            break
+        if line == "/status":
+            print("WQPU {} | public chain peer | reachable workers: {}".format(
+                VERSION, len(mesh.peers())
+            ))
+            continue
+        if line == "/wallet":
+            print(mesh.wallet or "No wallet connected")
+            continue
+        if line == "/session":
+            session = load_session()
+            if not session:
+                print("No payment session authorized.")
+            else:
+                print("Session key: {}".format(session.get("session_key")))
+                print("Limit: {} token-wei".format(session.get("max_amount")))
+                print("Price / 1M units: {}".format(session.get("price_per_million_units")))
+                print("Valid until: {}".format(session.get("valid_until")))
+            continue
+        if line == "/payment":
+            try:
+                payments = PaymentSession(mesh.chain)
+                payments.validate()
+                balance = escrow_balance(mesh.chain, payments.market, payments.requester)
+                print("Escrow: {} token-wei | local vouchers: {} / {}".format(
+                    balance, payments.local_spent(), payments.max_amount
+                ))
+                print("Automatic vouchers: {}".format(
+                    "on" if os.environ.get("WQPU_AUTO_VOUCHERS", "0") == "1" else "off"
+                ))
+            except Exception as exc:
+                print("Payment unavailable: {}".format(exc))
+            continue
+        if line == "/vouchers":
+            inbox = load_voucher_inbox()
+            if not inbox:
+                print("No received provider vouchers yet.")
+            else:
+                print("Stored latest provider vouchers: {}".format(len(inbox)))
+                rows = sorted(
+                    inbox.values(),
+                    key=lambda x: int((x or {}).get("received_at") or 0),
+                    reverse=True,
+                )[:20]
+                for item in rows:
+                    print("- requester {} | amount {} | units {}".format(
+                        str(item.get("requester") or "?")[:12],
+                        item.get("cumulative_amount", 0),
+                        item.get("cumulative_units", 0),
+                    ))
+            continue
+        if line == "/chain":
+            price = mesh.chain_price
+            print("RPC: {}".format(mesh.chain.rpc_url))
+            print("Registry: {}".format(mesh.chain.registry))
+            print("Market: {}".format(configured_market(mesh.chain, load_state()) or "unconfigured"))
+            print("Global price / 1M units: {}".format(price if price is not None else "unavailable"))
+            print("Known active wallets: {}".format(len(mesh.chain_nodes)))
+            continue
+        if line == "/peers":
+            peers = mesh.peers()
+            if not peers:
+                print("No reachable workers yet.")
+            for nid, info in peers:
+                print("- {} | load {}% | capacity {} | wallet {} | {}".format(
+                    info.get("hostname", "peer"),
+                    round(int(info.get("load_bps") or 0) / 100.0, 1),
+                    info.get("capacity", info.get("ram_mb", "?")),
+                    str(info.get("wallet") or "?")[:12],
+                    nid[:8],
+                ))
+            continue
+        try:
+            await run_metered_request(mesh, server_bin, line)
+        except Exception as exc:
+            print("WQPU error: {}".format(exc))
+
+
+async def run_public(args):
+    state = load_state()
+    chain = configured_chain(args, state)
+    if chain is None:
+        raise RuntimeError(
+            "public chain is not configured in network-config.json; "
+            "set WQPU_RPC_URL/WQPU_REGISTRY or use --legacy"
+        )
+
+    wqpu.ensure_cert()
+    chain_id = await wqpu.to_thread(chain.chain_id)
+    wallet = await ensure_wallet(chain, state, force=args.connect_wallet)
+    cfg = {
+        "secret": public_secret(chain_id, chain.registry),
+        "peers": [],
+        "mode": "public-chain",
+        "chain_id": chain_id,
+        "registry": chain.registry,
+    }
+
+    server_bin, rpc_bin, tag = wqpu.ensure_runtime()
+    mesh = ChainMesh(cfg, chain, wallet)
+    await mesh.start_listener()
+    rpc = wqpu.start_proc([
+        str(rpc_bin), "--host", "127.0.0.1", "--port", str(wqpu.RPC_PORT),
+        "--threads", str(wqpu.threads_for()), "--device", "CPU", "--cache"
+    ], "rpc.log")
+
+    print("WQPU {} | llama.cpp {}".format(VERSION, tag))
+    print("Wallet {} | endpoint {}".format(wallet, state.get("public_endpoint") or local_endpoint()))
+    print("Node {} | RAM {} MiB | contributes {}/{} CPU threads".format(
+        socket.gethostname(), wqpu.total_ram_mb(), wqpu.threads_for(), os.cpu_count() or "?"
+    ))
+
+    loop = asyncio.get_event_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, mesh.stop.set)
+        except (NotImplementedError, RuntimeError, ValueError):
+            pass
+
+    connector = asyncio.ensure_future(mesh.connector_loop())
+    try:
+        await mesh.refresh_chain()
+        await interactive(mesh, server_bin)
+    finally:
+        mesh.stop.set()
+        connector.cancel()
+        await wqpu.close_server(mesh.server)
+        wqpu.stop_proc(rpc)
+
+
+def run_async(coro):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(coro)
+    finally:
+        all_tasks = getattr(asyncio, "all_tasks", None)
+        pending = all_tasks(loop=loop) if all_tasks else asyncio.Task.all_tasks(loop=loop)
+        for task in pending:
+            task.cancel()
+        if pending:
+            try:
+                loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            except Exception:
+                pass
+        loop.close()
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="wqpu")
+    ap.add_argument("--version", action="version", version="WQPU {}".format(VERSION))
+    ap.add_argument("--rpc-url", help="WQPU EVM JSON-RPC URL")
+    ap.add_argument("--registry", help="WQPURegistry contract address")
+    ap.add_argument("--connect-wallet", action="store_true", help="connect/register another browser wallet")
+    ap.add_argument("--legacy", action="store_true", help="run the old private join-code mesh")
+    ap.add_argument("--join", help="legacy WQPU1 join code")
+    args = ap.parse_args()
+
+    if args.legacy or args.join:
+        return wqpu.run_async(wqpu.run(args.join or os.environ.get("WQPU_JOIN"))) or 0
+
+    try:
+        run_async(run_public(args))
+        return 0
+    except KeyboardInterrupt:
+        return 130
+    except Exception as exc:
+        print("WQPU error: {}".format(exc), file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

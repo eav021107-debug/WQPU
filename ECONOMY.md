@@ -1,101 +1,81 @@
-# WQPU compute economy prototype
+# WQPU compute economy
 
-This document defines the first economic layer for WQPU. It is deliberately separate from the current networking core until the two-peer transport is stable.
-
-## Goal
-
-A user should eventually do only this:
+## Target UX
 
 ```text
-install WQPU -> connect wallet -> wqpu>
+install WQPU -> connect existing wallet -> node appears in registry -> compute/earn
 ```
 
-No WQPU account database and no privileged WQPU server are required.
+WQPU never asks for a seed phrase or wallet private key. The browser wallet performs registration and signs narrowly scoped authorizations.
 
-## Identity
+## Chain role
 
-The wallet address is the public identity of a WQPU participant.
+The chain is the shared discovery/accounting layer. Prompts, tensors and llama.cpp RPC traffic stay off-chain.
 
-WQPU must never ask for a seed phrase or private key. Wallet ownership is proven by signing messages in the wallet. Compute vouchers use EIP-712 typed signatures so the wallet can show structured data instead of an opaque private-key operation.
+`WQPURegistry.sol` stores node wallet identity, endpoint, TLS fingerprint, capacity and the single global compute price. Registration is persistent; current liveness/load is learned over P2P.
 
-## Discovery
+## One network price
 
-`WQPURegistry.sol` is a permissionless public directory.
+Providers do not choose individual prices. `globalPricePerMillionUnits` is the shared network price. A payment session snapshots the price it was authorized for, so a later network-price change does not silently reprice already-authorized work.
 
-Every participant may publish:
-
-- wallet address (implicitly `msg.sender`);
-- reachable P2P endpoint;
-- asking price per million compute units;
-- currently offered capacity.
-
-There is no privileged registry operator. A newly installed client can read the same registry state as every other client and then connect directly to peers.
-
-The blockchain is only a shared discovery/accounting layer. LLM tensors and prompts must continue to move directly through the WQPU P2P network, not through the blockchain.
+The prototype price controller should be transferred to the chosen production governance mechanism.
 
 ## Token
 
-`WQPUToken.sol` is a fixed-supply ERC-20 prototype.
+`WQPUToken.sol` is fixed supply and supports EIP-2612 permit. There is no post-deployment mint function. Compute rewards move already-existing WQPU from requester escrow to provider wallets.
 
-There is no post-deployment mint function. Therefore fake requests cannot manufacture new WQPU. Payment moves existing WQPU from requesters to providers.
+## Shared escrow + bounded session
 
-Initial distribution is intentionally not fixed in the protocol yet. The constructor receives an initial holder so test deployments can choose a test treasury, DAO, faucet, or other distribution mechanism without changing the token code.
+The requester does not open a transaction for every provider.
 
-## Price
+1. The wallet signs an EIP-2612 permit if escrow needs funding.
+2. A gas relayer submits `depositWithPermit`.
+3. WQPU creates a local secp256k1 session key.
+4. The wallet signs one `SpendAuthorization` containing session key, session ID, maximum amount, price and expiry.
+5. A relayer activates the session; the contract reserves that maximum from requester escrow.
+6. The requester can now sign cumulative provider vouchers locally without wallet popups.
+7. Any relayer may submit a valid claim, but the contract can transfer tokens only to the provider encoded in the voucher.
+8. Unused reserved escrow is released after session expiry plus claim grace.
 
-There is no central price setter.
+A compromised local session key is therefore limited by its on-chain maximum, price and expiry; it cannot transfer arbitrary wallet assets.
 
-Each compute provider publishes an asking price. A requester can choose cheaper providers first, subject to latency, model compatibility, capacity and reputation.
+## Provider vouchers
 
-That creates the desired feedback loop:
+Provider vouchers are cumulative. Replaying an old voucher cannot pay twice, cumulative units cannot move backwards, session/provider totals are tracked independently, and a voucher priced differently from the activated session is rejected.
 
-```text
-high demand + little free compute
-        -> providers can ask more
-        -> contributing compute becomes more attractive
-        -> more compute appears
-        -> competition pushes prices down
-```
+Workers keep only the newest valid cumulative voucher per requester/session. Voucher delivery uses the WQPU control network with ACK/retry so temporary route loss does not silently destroy a payment promise.
 
-The external fiat/exchange price of WQPU is separate from the internal compute price and, if a market exists, is determined by that market.
+## Metering
 
-## Payment channels
+WQPU meter v2 parses the pinned llama.cpp RPC graph and estimates scalar work from tensor shapes. Matrix multiplication and flash attention use shape-aware estimates; malformed, partial or unknown protocol streams fail closed.
 
-Putting every token-generation step on-chain would be too slow and expensive for inference. `WQPUComputeMarket.sol` therefore uses escrowed payment channels:
+The worker also meters incoming work independently. Optional payment enforcement can refuse additional paid compute until previous measured work is covered.
 
-1. requester selects a provider;
-2. requester deposits WQPU into a channel;
-3. provider performs small pieces of work;
-4. requester signs increasing cumulative EIP-712 vouchers;
-5. provider periodically claims the newest voucher on-chain;
-6. unused deposit can be refunded after channel expiry plus a claim grace period.
+This meter is experimental rather than a formally fraud-proof FLOP oracle. Real-value automatic settlement should be enabled only after the selected public deployment has passed adversarial testing and audit.
 
-A voucher contains cumulative payment and cumulative compute units. Replaying an old voucher cannot reduce the amount already paid.
+## Gas relayer
 
-A requester sending work to their own machines does not create tokens: it only moves already-existing tokens.
+The HTTP relayer can submit permit funding, session activation and provider claims. Relayer gas sponsorship does not grant custody of requester/provider WQPU: signed data and contract rules fix the authorized amount and payout address.
 
-## Compute units
+Production relayers should use a dedicated signer/HSM, rate limits and redundant endpoints.
 
-The smart contract intentionally does not define how compute is measured. That belongs to the WQPU transport/runtime layer.
+## Status
 
-The production protocol must pay for verifiable useful work, not simply for "number of requests". Otherwise fake/self-generated requests would be an obvious farming attack.
+Implemented in WQPU 0.6.0:
 
-The next runtime milestone is a metering protocol that attributes actual llama.cpp RPC work to each peer and produces signed cumulative vouchers while a request is running.
+- public blockchain discovery;
+- wallet/TLS node identity;
+- one global price;
+- shared escrow;
+- permit funding;
+- bounded local session authorization;
+- cumulative voucher signing;
+- replay/limit/expiry protection;
+- relayed claims;
+- provider voucher inbox/outbox;
+- NAT/CGNAT transport relay;
+- meter v2;
+- Linux/Windows installers;
+- local Anvil deployment and end-to-end CI.
 
-Until that metering is implemented and audited, this economic layer is a prototype and must not be used with real-value funds.
-
-## Contracts
-
-- `contracts/WQPUToken.sol` — fixed-supply token.
-- `contracts/WQPURegistry.sol` — permissionless peer/price/capacity directory.
-- `contracts/WQPUComputeMarket.sol` — escrow + cumulative signed compute vouchers.
-
-## Integration order
-
-1. Stabilize two-peer WQPU networking.
-2. Deploy contracts to an EVM test network.
-3. Add browser wallet connection to the CLI; never accept seed phrases.
-4. Read peer discovery from `WQPURegistry` automatically at startup.
-5. Add provider bids and automatic provider selection.
-6. Add runtime compute metering and EIP-712 vouchers.
-7. Test adversarial cases before any main-network deployment.
+What remains before real public-value use is deployment/security work: publish the actual WQPU chain/testnet + relays + funded gas relayer, run Internet-scale/adversarial tests, and complete an independent audit.

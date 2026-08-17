@@ -1,0 +1,120 @@
+name: WQPU tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.11']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile Python
+        run: >-
+          python -m py_compile
+          wqpu.py wqpu_chain.py wqpu_wallet.py wqpu_session.py
+          wqpu_meter.py wqpu_accounting.py wqpu_payments.py wqpu_claim.py wqpu_vouchers.py
+          wqpu_runtime.py wqpu_autopay.py wqpu_runtime_pin.py wqpu_entry.py wqpu_relayer.py
+          scripts/devnet.py scripts/check_devnet.py scripts/check_session_payment.py
+          scripts/check_nat_relay.py
+      - name: Unit tests
+        run: python -m unittest discover -s tests -v
+      - name: Three-node NAT relay round-trip
+        run: python scripts/check_nat_relay.py
+      - name: Unified runtime version
+        run: python wqpu_entry.py --version | grep -F 'WQPU 0.6.0'
+      - name: Doctor command
+        run: python wqpu_entry.py doctor
+      - name: Provider claim command
+        run: python wqpu_entry.py claim
+      - name: Validate published network JSON
+        run: python -c "import json; json.load(open('network-config.json'))"
+      - name: Validate pinned llama.cpp protocol
+        run: >-
+          python -c "import json; p=json.load(open('network-config.json'))['public'];
+          assert p['llama_cpp_tag']=='b10456';
+          assert p['llama_rpc_protocol_major']==5;
+          assert p['llama_rpc_op_count']==101"
+
+  installer-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate POSIX installer syntax
+        run: sh -n install.sh
+      - name: Run installer against this commit
+        run: |
+          REF="${{ github.event.pull_request.head.sha || github.sha }}"
+          TEST_HOME="$RUNNER_TEMP/wqpu-home"
+          mkdir -p "$TEST_HOME"
+          HOME="$TEST_HOME" \
+          WQPU_NO_START=1 \
+          WQPU_RAW_BASE="https://raw.githubusercontent.com/eav021107-debug/WQPU/$REF" \
+          sh install.sh
+          "$TEST_HOME/.local/bin/wqpu" --version | grep -F 'WQPU 0.6.0'
+          "$TEST_HOME/.local/bin/wqpu" doctor
+          "$TEST_HOME/.local/bin/wqpu" claim | grep -F 'No pending WQPU provider vouchers.'
+
+  installer-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Validate PowerShell installer syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path 'install.ps1'), [ref]$tokens, [ref]$errors) | Out-Null
+          if ($errors.Count -gt 0) {
+            $errors | ForEach-Object { Write-Error $_.Message }
+            exit 1
+          }
+      - name: Run installer against this commit
+        shell: pwsh
+        run: |
+          $ref = '${{ github.event.pull_request.head.sha || github.sha }}'
+          $env:LOCALAPPDATA = Join-Path $env:RUNNER_TEMP 'wqpu-localappdata'
+          $env:WQPU_NO_START = '1'
+          $env:WQPU_RAW_BASE = "https://raw.githubusercontent.com/eav021107-debug/WQPU/$ref"
+          .\install.ps1
+          $launcher = Join-Path $env:LOCALAPPDATA 'WQPU\bin\wqpu.cmd'
+          $version = (& $launcher --version | Out-String).Trim()
+          if ($version -ne 'WQPU 0.6.0') { throw "Unexpected installed version: $version" }
+          & $launcher doctor
+          if ($LASTEXITCODE -ne 0) { throw 'wqpu doctor failed' }
+          $claim = (& $launcher claim | Out-String).Trim()
+          if ($claim -ne 'No pending WQPU provider vouchers.') { throw "Unexpected claim output: $claim" }
+
+  solidity:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Compile contracts with solc
+        run: >-
+          npx --yes solc@0.8.35 --bin
+          contracts/WQPUToken.sol
+          contracts/WQPURegistry.sol
+          contracts/WQPUComputeMarket.sol
+          -o /tmp/wqpu-solc
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Foundry build
+        run: forge build
+      - name: Contract tests
+        run: forge test -vv
+      - name: Deploy local WQPU devnet
+        run: python scripts/devnet.py
+      - name: Registry client round-trip
+        run: python scripts/check_devnet.py
+      - name: HTTP relayer permit/session payment round-trip
+        run: python scripts/check_session_payment.py

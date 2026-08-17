@@ -1,125 +1,170 @@
-# WQPU 0.5.3
+# WQPU 0.6.0
 
-WQPU is an experimental **equal-peer distributed LLM network** built around `llama.cpp` RPC.
+WQPU is an experimental equal-peer distributed LLM network built around a pinned `llama.cpp` RPC protocol and an EVM accounting layer.
 
-There is no permanent coordinator and no dedicated relay program. Every computer runs the same `wqpu.py` and has the same rights and functions.
+Target public-network UX:
 
 ```text
-Mac <----> Windows <----> Linux/VPS <----> other WQPU peers
-  \____________ equal-peer WQPU mesh ______________/
+install WQPU -> connect existing wallet -> node joins automatically -> wqpu>
 ```
 
-## What every node does
+Every computer runs the same peer software. A computer that receives a prompt coordinates only that request and may combine several less-busy workers. There is no permanent inference coordinator.
 
-Every online WQPU node:
-
-- contributes part of its CPU/RAM through a localhost-only `ggml-rpc-server`;
-- listens for WQPU peer connections when its network allows it;
-- connects outbound to known peers;
-- exchanges learned peer addresses and TLS fingerprints;
-- can temporarily relay an RPC stream for two other peers;
-- can ask its own questions.
-
-When a question is typed on a computer, **that computer coordinates only its own request**. It temporarily connects available workers, starts its own local `llama-server`, gets the answer, then tears the request coordinator down.
-
-Several computers can originate requests at the same time. There is no permanent leader election.
-
-## Install and immediately enter the CLI
+## Install
 
 ### macOS / Linux
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh?v=0.5.3-r2" | sh
+curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh | sh
 ```
 
 ### Windows PowerShell
 
 ```powershell
-irm 'https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1?v=0.5.3-r2' | iex
+irm https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1 | iex
 ```
 
-The `r2` installer revision deliberately uses a new cache key and verifies that the downloaded core actually reports `WQPU 0.5.3` before it is allowed to start.
-
-The installer immediately starts the interactive CLI in the **same terminal**. WQPU 0.5.3 restores console input inside the core itself if the installer was launched through a pipe, instead of relying on shell-specific stdin redirection.
-
-```text
-wqpu> hello
-wqpu> /status
-wqpu> /peers
-wqpu> /exit
-```
-
-## Python compatibility
-
-WQPU is compatible with Python 3.6+.
-
-The installer does not depend on one exact Python version. It uses an already installed compatible Python when possible, tries the operating system package manager only when required, and can prepare a private Python runtime for WQPU without replacing the system Python.
-
-## Creating and joining a network
-
-The first node can start with no join code. It creates a private network secret locally.
-
-To invite another computer, a reachable node types:
-
-```text
-/invite PUBLIC_HOST:7443
-```
-
-WQPU prints a private `WQPU1...` join code.
-
-On macOS/Linux, pass the join code as an argument to the installer:
+Useful checks:
 
 ```bash
-curl -fsSL "https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.sh?v=0.5.3-r2" | sh -s -- 'WQPU1...'
+wqpu --version
+wqpu doctor
+wqpu claim
 ```
 
-Do **not** use `WQPU_JOIN='...' curl ... | sh`: that environment variable belongs to `curl`, not to the `sh` process on the right side of the pipe.
+The installers are exercised in CI on Linux and Windows.
 
-On Windows:
+## Public-network flow
 
-```powershell
-$env:WQPU_JOIN='WQPU1...'; irm 'https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install.ps1?v=0.5.3-r2' | iex
+When `network-config.json` contains a published WQPU network, WQPU:
+
+1. opens a localhost browser wallet connector;
+2. connects an existing EVM wallet — WQPU never receives the seed phrase/private key;
+3. registers the node wallet, endpoint, capacity and TLS fingerprint on-chain;
+4. discovers other nodes from `WQPURegistry`;
+5. connects directly or through TLS-pinned bootstrap relays when NAT/CGNAT blocks inbound traffic;
+6. ranks live workers by load/capacity;
+7. starts a local `llama-server` and distributes work through selected `ggml-rpc-server` workers.
+
+The blockchain stores discovery/accounting state only. Prompts, model data and llama.cpp RPC traffic stay off-chain.
+
+## Model runtime
+
+WQPU pins `llama.cpp` to release `b10456` so every node speaks the same RPC protocol. Downloaded release archives are SHA-256 checked when GitHub publishes an asset digest.
+
+Default model:
+
+```text
+ggml-org/gemma-3-1b-it-GGUF:Q4_K_M
 ```
 
-Supplying a join code always switches the local node to that WQPU network and clears stale peer-cache entries from any previous test network. This makes repeat/recovery joins safe.
+Override it with `WQPU_MODEL`.
 
-The first address is only an introduction. After connection, nodes exchange peer information and cache other reachable peers. Any reachable WQPU node can perform the same introduction/relay function; there is no special VPS role in the protocol.
+## Wallet and payments
 
-## Internet/NAT reality
+The public runtime implements:
 
-A brand-new computer cannot discover a private network on the global Internet from literally zero information. It needs at least one address of an existing peer for first contact.
+- fixed-supply `WQPUToken`;
+- one global compute price for all users;
+- shared requester escrow;
+- EIP-2612 permit funding;
+- a local secp256k1 session key authorized once by the wallet with a maximum spend, price and expiry;
+- on-chain reservation of the session limit before vouchers can be used;
+- cumulative per-provider EIP-712 vouchers;
+- replay protection and session/provider cumulative accounting;
+- HTTP gas relayer for permit funding, session activation and provider claims;
+- provider payouts that can only go to the provider wallet encoded in the voucher;
+- durable voucher inbox/outbox and retry/ACK routing.
 
-WQPU avoids a dedicated relay service by making **every node capable of relaying**. Nodes reachable from the Internet naturally become useful routes for peers behind NAT, but they receive no extra permissions and run exactly the same software.
-
-If every single peer is behind restrictive NAT/firewalls and none is reachable, the mesh needs a port-forwarded/publicly reachable ordinary WQPU peer before those isolated groups can meet. Reliable universal NAT hole punching without any external rendezvous infrastructure is not physically guaranteed, so WQPU does not pretend otherwise.
-
-## Security
-
-- WQPU peer traffic uses TLS.
-- The join code carries a private network secret plus trusted bootstrap peer fingerprints.
-- Learned fingerprints are propagated through authenticated peers.
-- `llama.cpp` RPC stays on `127.0.0.1:50052` and is never intentionally exposed directly to the Internet.
-- Keep `WQPU1...` join codes private.
-
-This is still an experimental prototype, not a hardened public compute marketplace.
-
-## Resource policy
-
-By default WQPU uses about 50% of logical CPU threads for contribution. Override temporarily with:
+Provider payout:
 
 ```bash
-WQPU_CPU_FRACTION=0.35 wqpu
+wqpu claim --submit
 ```
 
-Model quality is determined by the selected GGUF model/quantization. Distribution itself does not requantize the model. The default small Gemma model is only for connectivity testing.
+The network operator can enable automatic voucher issuance from `network-config.json` with `payments_enabled=true`; environment variables remain available for development overrides.
 
-## Decentralized compute economy prototype
+## Compute metering
 
-The repository now also contains the first blockchain-side market layer. It is deliberately not wired into the 0.5.3 runtime yet, so networking tests remain isolated from payment experiments.
+Meter v2 parses the pinned llama.cpp serialized RPC graph. It estimates scalar work from tensor shapes; matrix multiplication and flash attention receive shape-aware estimates instead of treating every graph node equally. Malformed, partial or protocol-mismatched streams fail closed and cannot create a voucher.
 
-- `contracts/WQPUToken.sol` — fixed-supply WQPU token; there is no post-deployment mint function.
-- `contracts/WQPURegistry.sol` — permissionless public directory where any wallet can announce its peer endpoint, price and capacity.
-- `contracts/WQPUComputeMarket.sol` — requester deposits existing WQPU and providers claim cumulative wallet-signed compute vouchers.
-- `ECONOMY.md` — economic model and integration plan.
+This is still experimental accounting, not a formally fraud-proof FLOP oracle. Real-value automatic payment should only be enabled after adversarial testing and audit of the selected public deployment.
 
-The target UX is still one install command followed by wallet connection and then `wqpu>`. Seed phrases and private keys must never be entered into WQPU.
+## NAT / relay
+
+A node behind a home router or CGNAT can keep an outbound TLS connection to a configured WQPU bootstrap relay. A requester can reach that worker through the relay without opening an inbound router port.
+
+The relay is transport only. Worker wallet identity and TLS fingerprint are still checked against the blockchain registry. CI includes a three-node integration test:
+
+```text
+requester -> relay -> outbound-only worker
+```
+
+with a real bidirectional RPC byte stream.
+
+## Local EVM devnet
+
+Install Foundry, then run:
+
+```bash
+python scripts/devnet.py 0xYOUR_EXISTING_WALLET
+source .wqpu-devnet.env
+wqpu
+```
+
+This starts Anvil and deploys:
+
+```text
+WQPUToken -> WQPURegistry -> WQPUComputeMarket
+```
+
+The test suite exercises the full gasless flow:
+
+```text
+permit -> escrow funding -> session reservation -> provider voucher -> HTTP relayer -> provider balance
+```
+
+Never expose the included Anvil development keys/RPC to the public Internet or use them with real funds.
+
+## Legacy private mesh
+
+Until public RPC/contracts/relays are published in `network-config.json`, the normal installer keeps the private mesh working:
+
+```bash
+wqpu --legacy
+wqpu --join 'WQPU1...'
+```
+
+## Contracts
+
+- `contracts/WQPUToken.sol` — fixed-supply ERC-20 + EIP-2612 permit.
+- `contracts/WQPURegistry.sol` — node wallet/endpoint/TLS/capacity directory + one global price.
+- `contracts/WQPUComputeMarket.sol` — shared escrow, bounded sessions, vouchers, claims and refunds.
+
+## Validation
+
+GitHub Actions covers:
+
+- Python 3.8 and 3.11;
+- unit/adversarial parser and payment tests;
+- Linux installer;
+- Windows installer;
+- Solidity compilation and Foundry tests;
+- local Token -> Registry -> Market deployment;
+- Python -> EVM registry round-trip;
+- OpenSSL wallet/session signatures;
+- HTTP-relayed permit/session/provider-payment round-trip;
+- replay rejection/reserved-session accounting;
+- requester -> relay -> NAT worker integration.
+
+## Deployment boundary
+
+WQPU 0.6.0 contains the complete public-network prototype code path. A truly zero-configuration Internet-wide launch additionally requires external infrastructure that cannot be embedded into a Git repository by itself:
+
+- deploy the chosen WQPU EVM chain/testnet;
+- publish RPC + contract addresses in `network-config.json`;
+- operate at least one public TLS-pinned transport relay;
+- operate at least one funded gas relayer;
+- complete security/adversarial review and an independent contract/network audit before real-value use.
+
+See `PUBLIC_CHAIN_TODO.md` for the deployment checklist and `ECONOMY.md` for the payment model.
