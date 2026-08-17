@@ -6,9 +6,12 @@ on:
     paths:
       - 'up.sh'
       - 'bootstrap-rpcs.txt'
+      - 'bootstrap-p2p.txt'
       - 'network.sh'
       - 'chain/devnet.sh'
       - 'chain/devnet_config.py'
+      - 'chain/p2p_config.py'
+      - 'chain/test_p2p_config.py'
       - 'chain/runtime.lock'
       - 'chain/runtime_patch*.py'
       - 'chain/cmd/wqpu-compute-bootstrap/**'
@@ -52,13 +55,22 @@ jobs:
         with:
           go-version: '1.25.9'
 
-      - name: Validate hardened one-command launcher
+      - name: Validate decentralized bootstrap launcher
         shell: bash
         run: |
           bash -n ./up.sh
+          bash -n ./chain/devnet.sh
           ! grep -Eq 'WQPU_CHAIN_DISCOVER|255\.255\.255\.255|start_lan_beacon|find_lan_rpc' ./up.sh
+          grep -Fq 'BOOTSTRAP_CACHE' ./up.sh
+          grep -Fq 'bootstrap-p2p.txt' ./up.sh
           grep -Fq 'WQPU_DEV_LOCAL_FALLBACK' ./up.sh
           grep -Fq 'wqpu-rpc-verify' ./up.sh
+
+      - name: Test CometBFT PEX configuration
+        shell: bash
+        run: |
+          cd chain
+          python3 -m unittest test_p2p_config.py
 
       - name: Build strict bootstrap verifier
         shell: bash
@@ -73,3 +85,12 @@ jobs:
           WQPU_USE_SYSTEM_GO: '1'
           WQPU_NETWORK_HOME: ${{ runner.temp }}/wqpu-network
         run: bash ./network.sh ci
+
+      - name: Verify PEX and persistent CometBFT addrbook config
+        shell: bash
+        run: |
+          config="${{ runner.temp }}/wqpu-network/devnet-home/config/config.toml"
+          grep -Fq 'pex = true' "$config"
+          grep -Fq 'seed_mode = false' "$config"
+          grep -Fq 'addr_book_strict = true' "$config"
+          grep -Fq 'addr_book_file = "config/addrbook.json"' "$config"
