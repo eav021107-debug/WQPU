@@ -91,7 +91,11 @@ def main():
     wqpu_network_guard.install(runtime)
 
     import wqpu_autopay
+    import wqpu_multistream
     import wqpu_public_security
+    # Real llama.cpp opens multiple RPC sockets per logical request. Aggregate only
+    # individually verified worker stream reports before comparing with requester usage.
+    wqpu_multistream.install(wqpu_autopay.AutoPayChainMesh)
     wqpu_public_security.install(wqpu_autopay.AutoPayChainMesh)
     return wqpu_autopay.main()
 
