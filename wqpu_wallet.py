@@ -12,8 +12,10 @@ import os
 import secrets
 import threading
 import time
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 
 
 ANNOUNCE_SELECTOR = "581dc5c3"  # announce(string,bytes32,uint64,uint16)
@@ -57,8 +59,7 @@ function encodeDeposit(amount){return '0x'+CFG.session.depositSelector+hexPad(am
 function encodeMapRead(selector,account){return '0x'+selector+addrWord(account)}
 function encodeActivate(account,sig){
   const s=CFG.session, raw=sig.replace(/^0x/,''), padded=raw.padEnd(Math.ceil((raw.length/2)/32)*64,'0');
-  return '0x'+s.activateSelector
-    +addrWord(account)+addrWord(s.sessionKey)+s.sessionId.replace(/^0x/,'')
+  return '0x'+s.activateSelector+addrWord(account)+addrWord(s.sessionKey)+s.sessionId.replace(/^0x/,'')
     +hexPad(s.maxAmount)+hexPad(s.pricePerMillionUnits)+hexPad(s.validUntil)
     +hexPad(224)+hexPad(raw.length/2)+padded;
 }
@@ -138,6 +139,33 @@ document.getElementById('connect').onclick=async()=>{
 </script></body></html>'''.replace("__CFG__", cfg)
 
 
+def _network_token():
+    env = os.environ.get("WQPU_TOKEN", "").strip()
+    if env:
+        return env.lower()
+    try:
+        path = Path(__file__).resolve().with_name("network-config.json")
+        data = json.loads(path.read_text())
+        token = str((data.get("public") or {}).get("token") or "").strip()
+        return token.lower()
+    except Exception:
+        return ""
+
+
+def _rpc_selector(rpc_url, signature):
+    if not rpc_url:
+        raise RuntimeError("WQPU RPC URL is required for wallet onboarding")
+    raw = "0x" + signature.encode("utf-8").hex()
+    payload = json.dumps({"jsonrpc":"2.0","id":1,"method":"web3_sha3","params":[raw]}).encode("utf-8")
+    request = urllib.request.Request(rpc_url, data=payload, headers={"Content-Type":"application/json"})
+    with urllib.request.urlopen(request, timeout=10) as response:
+        body = json.load(response)
+    result = str(body.get("result") or "")
+    if not result.startswith("0x") or len(result) != 66:
+        raise RuntimeError("WQPU RPC could not derive ABI selector")
+    return result[2:10]
+
+
 class WalletConnector(object):
     def __init__(self, registry, endpoint, fingerprint, capacity, load_bps=0,
                  chain_id=None, rpc_url=None, chain_name=None, native_symbol=None,
@@ -149,8 +177,25 @@ class WalletConnector(object):
         self.register_node=bool(register_node); self.session=dict(session) if session else None
         self.challenge=secrets.token_hex(24); self.result=None; self.event=threading.Event()
 
-    def connect(self, timeout=240, open_browser=True):
+    def _prepare_session(self):
+        if not self.session:
+            return None
+        session = dict(self.session)
+        session.setdefault("token", _network_token())
+        selectors = {
+            "approveSelector": "approve(address,uint256)",
+            "depositSelector": "deposit(uint256)",
+            "activateSelector": "activateSession((address,address,bytes32,uint128,uint128,uint64),bytes)",
+            "escrowBalanceSelector": "escrowBalance(address)",
+            "reservedEscrowSelector": "reservedEscrow(address)",
+        }
+        for key, signature in selectors.items():
+            session[key] = _rpc_selector(self.rpc_url, signature)
+        return session
+
+    def connect(self, timeout=300, open_browser=True):
         connector=self
+        self.session = self._prepare_session()
         config={"registry":self.registry,"endpoint":self.endpoint,"fingerprint":self.fingerprint,
                 "capacity":self.capacity,"loadBps":self.load_bps,"chainId":self.chain_id,
                 "rpcUrl":self.rpc_url,"chainName":self.chain_name,"nativeSymbol":self.native_symbol,
@@ -204,7 +249,7 @@ class WalletConnector(object):
 
 
 def connect_wallet(registry, endpoint, fingerprint, capacity, load_bps=0, chain_id=None,
-                   timeout=240, rpc_url=None, chain_name=None, native_symbol=None,
+                   timeout=300, rpc_url=None, chain_name=None, native_symbol=None,
                    register_node=True, session=None):
     return WalletConnector(registry,endpoint,fingerprint,capacity,load_bps,chain_id,rpc_url,
                            chain_name,native_symbol,register_node,session).connect(timeout=timeout)
