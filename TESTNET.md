@@ -29,8 +29,10 @@ Those join scripts install WQPU, replace the bundled network config with the gen
 config, and start the node. When `faucet_url` is present, the browser wallet connector
 requests test ETH/WQPU before it asks the wallet to register the node.
 
-Automatic real-value-style vouchers remain disabled in generated testnet config unless
-`--payments` is explicitly passed. Testnet faucet funds have no real value.
+The faucet tops a wallet up to configured test balances rather than blindly adding the
+same amount on every request/restart. Automatic real-value-style vouchers remain disabled
+in generated testnet config unless `--payments` is explicitly passed. Testnet faucet
+funds have no real value.
 
 ## HTTPS for an Internet-facing testnet
 
@@ -74,12 +76,48 @@ python scripts/testnet_stack.py start --public-host YOUR_SERVER_IP_OR_DNS
 `reset --yes` is destructive. Already connected clients must receive the new generated
 network config after a reset.
 
+## Backup and move the same testnet
+
+Stop the stack first, then create a portable backup outside `.wqpu-testnet/`:
+
+```bash
+python scripts/testnet_stack.py stop
+python scripts/testnet_stack.py backup ~/wqpu-testnet-backup.tar.gz
+```
+
+The backup contains:
+
+- the persisted Anvil chain state;
+- the testnet operator private key and deployment metadata;
+- the WQPU transport relay certificate/private key/node identity.
+
+That is enough to preserve the same Token/Registry/Market addresses, balances and
+transport TLS fingerprint on another server. The archive is created with owner-only file
+permissions (`0600` where supported), includes a manifest with SHA-256/size checks, and
+restore only accepts the expected regular files (no symlinks/path traversal).
+
+**Treat the backup as a secret.** Anyone who obtains it receives the testnet operator and
+relay private keys. The archive is not a production key-management mechanism.
+
+On the destination server:
+
+```bash
+python scripts/testnet_stack.py restore ~/wqpu-testnet-backup.tar.gz --yes
+python scripts/testnet_stack.py start --public-host NEW_SERVER_IP_OR_DNS
+```
+
+If the Internet hostname/server changed, provide the appropriate trusted public HTTPS
+certificate again with `--tls-cert/--tls-key`. External HTTPS certificate files are not
+embedded in the WQPU backup.
+
 ## Operations
 
 ```bash
 python scripts/testnet_stack.py status
 python scripts/testnet_stack.py config
 python scripts/testnet_stack.py stop
+python scripts/testnet_stack.py backup ~/wqpu-testnet-backup.tar.gz
+python scripts/testnet_stack.py restore ~/wqpu-testnet-backup.tar.gz --yes
 python scripts/testnet_stack.py reset --yes
 ```
 
