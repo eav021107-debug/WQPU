@@ -4,6 +4,7 @@
 from __future__ import print_function
 
 import json
+import os
 import shutil
 import sys
 
@@ -15,6 +16,18 @@ def install_public_config_compat():
     import wqpu_chain
     import wqpu_public_config
     wqpu_public_config.install(wqpu_chain)
+
+
+def force_tunneled_rpc_transport():
+    """Prevent llama.cpp RPC from negotiating a direct RDMA path around WQPU.
+
+    b10456 may enable RDMA automatically when libibverbs is present. A transport proxy
+    cannot safely forward that negotiated out-of-band path, and using it would also
+    bypass WQPU TLS identity, relay routing and dual metering. An impossible device name
+    makes llama.cpp's RDMA probe fail closed so child llama/rpc processes stay on TCP
+    inside the authenticated WQPU tunnel.
+    """
+    os.environ["GGML_RDMA_DEV"] = "__wqpu_tcp_tunnel_only__"
 
 
 def doctor():
@@ -35,6 +48,7 @@ def doctor():
         "market": network.get("market") if network else None,
         "relayer_url": network.get("relayer_url") if network else None,
         "bootstrap_relays": len((network.get("relays") or [])) if network else 0,
+        "rpc_transport": "tcp-inside-wqpu-tunnel",
     }
     print(json.dumps(checks, indent=2))
     return 0 if checks["openssl"] else 1
@@ -55,6 +69,11 @@ def main():
         import wqpu_claim
         sys.argv = [sys.argv[0]] + sys.argv[2:]
         return wqpu_claim.main()
+
+    # llama.cpp b10456 can auto-negotiate RDMA after its HELLO. WQPU must keep that
+    # stream inside its authenticated/metered relay rather than allowing an out-of-band
+    # transport to bypass the security boundary.
+    force_tunneled_rpc_transport()
 
     import wqpu
     import wqpu_runtime_pin
