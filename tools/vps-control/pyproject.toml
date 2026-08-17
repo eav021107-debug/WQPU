@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vps-control-mcp"
+version = "0.2.0"
+description = "Project-aware VPS coding bridge for ChatGPT via MCP or GPT Actions."
+requires-python = ">=3.10"
+dependencies = ["mcp>=2.0,<3", "starlette>=0.50,<1", "uvicorn>=0.35,<1"]
+
+[project.scripts]
+vps-control = "vps_control.server:main"
+vps-control-actions = "vps_control.action_api:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
