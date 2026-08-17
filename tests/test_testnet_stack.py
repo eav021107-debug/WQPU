@@ -39,6 +39,17 @@ class TestnetStackTests(unittest.TestCase):
         self.assertFalse(public["payments_enabled"])
         self.assertEqual(public["llama_cpp_tag"], "b10456")
 
+    def test_https_config_switches_all_public_http_endpoints(self):
+        cfg = stack.build_network_config(
+            "testnet.example", 8545, 8787, 7443, "cd" * 32,
+            "0x" + "11" * 20, "0x" + "22" * 20, "0x" + "33" * 20,
+            scheme="https",
+        )
+        public = cfg["public"]
+        self.assertEqual(public["rpc_url"], "https://testnet.example:8545")
+        self.assertEqual(public["relayer_url"], "https://testnet.example:8787/relay")
+        self.assertEqual(public["faucet_url"], "https://testnet.example:8787/faucet")
+
     def test_new_anvil_dumps_state_without_loading_missing_file(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
@@ -56,6 +67,14 @@ class TestnetStackTests(unittest.TestCase):
             self.assertIn("--dump-state", cmd)
             self.assertEqual(cmd[cmd.index("--load-state") + 1], str(path))
             self.assertEqual(cmd[cmd.index("--dump-state") + 1], str(path))
+
+    def test_bad_public_url_scheme_is_rejected(self):
+        with self.assertRaises(ValueError):
+            stack.build_network_config(
+                "example.test", 1, 2, 3, "ef" * 32,
+                "0x" + "11" * 20, "0x" + "22" * 20, "0x" + "33" * 20,
+                scheme="ftp",
+            )
 
 
 if __name__ == "__main__":
