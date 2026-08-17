@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Local browser-wallet connector for WQPU.
 
-WQPU never asks for or stores a seed phrase/private key. A browser wallet signs and
-submits the registry transaction, then returns only the public wallet address/tx hash.
+WQPU never asks for or stores a seed phrase/private key. The browser wallet submits
+the registry transaction itself, then returns only the public wallet address/tx hash.
 """
 
 from __future__ import print_function
@@ -30,7 +30,7 @@ button{font-size:18px;padding:12px 18px;border:0;border-radius:10px;cursor:point
 code{word-break:break-all}.muted{color:#8b949e}.ok{color:#3fb950}.err{color:#f85149}
 </style></head><body>
 <h1>Connect WQPU wallet</h1>
-<p>WQPU never receives your seed phrase or private key. Your wallet signs the node registration itself.</p>
+<p>WQPU never receives your seed phrase or private key. Your wallet submits the node registration itself.</p>
 <p class="muted">Endpoint: <code id="endpoint"></code></p>
 <button id="connect">Connect wallet and register node</button>
 <p id="status" class="muted"></p>
@@ -77,12 +77,10 @@ document.getElementById('connect').onclick = async () => {
    statusEl.textContent='Switching to the WQPU network…';
    await ensureNetwork();
    const chainId = await ethereum.request({method:'eth_chainId'});
-   const message = 'WQPU node connection\n'+CFG.challenge+'\n'+CFG.endpoint+'\n'+CFG.fingerprint;
-   const signature = await ethereum.request({method:'personal_sign',params:[message,account]});
    statusEl.textContent='Confirm node registration transaction in your wallet…';
    const data = encodeAnnounce(CFG.endpoint,CFG.fingerprint,CFG.capacity,CFG.loadBps);
    const txHash = await ethereum.request({method:'eth_sendTransaction',params:[{from:account,to:CFG.registry,data}]});
-   await post({wallet:account,chainId,signature,txHash,challenge:CFG.challenge});
+   await post({wallet:account,chainId,txHash,challenge:CFG.challenge});
    statusEl.className='ok'; statusEl.textContent='Connected. You can return to the terminal.';
  } catch(e) {
    statusEl.className='err'; statusEl.textContent=e && e.message ? e.message : String(e);
@@ -160,17 +158,13 @@ class WalletConnector(object):
                         raise ValueError("challenge mismatch")
                     wallet = str(body.get("wallet", "")).lower()
                     tx_hash = str(body.get("txHash", ""))
-                    signature = str(body.get("signature", ""))
                     if not wallet.startswith("0x") or len(wallet) != 42:
                         raise ValueError("bad wallet")
                     if not tx_hash.startswith("0x") or len(tx_hash) != 66:
                         raise ValueError("bad transaction hash")
-                    if not signature.startswith("0x"):
-                        raise ValueError("bad signature")
                     connector.result = {
                         "wallet": wallet,
                         "chain_id": body.get("chainId"),
-                        "signature": signature,
                         "tx_hash": tx_hash,
                         "connected_at": int(time.time()),
                     }
