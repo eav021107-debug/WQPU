@@ -6,7 +6,12 @@ import wqpu_public_security
 
 class FakeMesh(object):
     def __init__(self):
-        self.started = {}
+        # Pre-create synchronization points so the test cannot race the scheduled
+        # service coroutine while looking up its Event in the dictionary.
+        self.started = {
+            "one": asyncio.Event(),
+            "two": asyncio.Event(),
+        }
         self.release = asyncio.Event()
 
     async def handle_open_request(self, message, via=None):
