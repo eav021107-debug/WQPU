@@ -255,6 +255,15 @@ def escrow_balance(client, market, requester):
     return int(result[:64], 16)
 
 
+def session_spent(client, market, requester, session_id):
+    selector = _selector(client, "sessionSpent(address,bytes32)")
+    data = selector + _address_word(requester) + _bytes32(session_id, "session id").hex()
+    result = _call(client, market, data)
+    if len(result) < 64:
+        raise SessionError("short session spent")
+    return int(result[:64], 16)
+
+
 def _read_der_length(data, offset):
     if offset >= len(data):
         raise SessionError("short DER signature")
