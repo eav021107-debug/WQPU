@@ -12,11 +12,15 @@ def main():
         sys.argv = [sys.argv[0]] + sys.argv[2:]
         return wqpu_claim.main()
 
-    # Freeze the ggml RPC wire format for every WQPU node. Public and legacy modes both
-    # go through this entrypoint, so they cannot silently drift to different upstream builds.
     import wqpu
     import wqpu_runtime_pin
     wqpu.ensure_runtime = wqpu_runtime_pin.ensure_runtime
+
+    # Keep accounting policy outside the large runtime module so a malformed/partial
+    # meter stream can fail closed without touching the transport implementation.
+    import wqpu_accounting
+    import wqpu_runtime as runtime
+    runtime.save_usage_receipt = wqpu_accounting.save_usage_receipt
 
     import wqpu_autopay
     return wqpu_autopay.main()
