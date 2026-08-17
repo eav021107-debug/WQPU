@@ -71,14 +71,18 @@ def wait_rpc(url, timeout=20):
     raise RuntimeError("Anvil did not become ready at {}".format(url))
 
 
-def start_anvil(rpc_url):
+def start_anvil(rpc_url, listen_host):
     if rpc_url != DEFAULT_RPC:
         raise RuntimeError("Automatic Anvil start supports only {}".format(DEFAULT_RPC))
+
+    if listen_host not in ("127.0.0.1", "localhost"):
+        print("WARNING: WQPU devnet uses a PUBLICLY KNOWN development key.")
+        print("Do not expose this Anvil RPC to the public Internet or use real funds.")
 
     log = LOG.open("a", encoding="utf-8")
     cmd = [
         "anvil",
-        "--host", "0.0.0.0",
+        "--host", listen_host,
         "--port", "8545",
         "--chain-id", str(DEFAULT_CHAIN_ID),
         "--mnemonic", DEFAULT_MNEMONIC,
@@ -152,6 +156,7 @@ def main():
     ap = argparse.ArgumentParser(description="Start/deploy the local WQPU Anvil devnet")
     ap.add_argument("wallet", nargs="?", help="optional existing wallet to fund with dev ETH + WQPU")
     ap.add_argument("--rpc-url", default=DEFAULT_RPC)
+    ap.add_argument("--listen-host", default="127.0.0.1", help="Anvil listen host; use 0.0.0.0 only for isolated LAN testing")
     ap.add_argument("--price", type=int, default=DEFAULT_PRICE, help="token wei per 1,000,000 compute units")
     ap.add_argument("--supply", type=int, default=DEFAULT_SUPPLY, help="whole WQPU tokens")
     args = ap.parse_args()
@@ -162,7 +167,7 @@ def main():
         actual_chain = chain_id(args.rpc_url)
     except Exception:
         print("WQPU devnet: starting Anvil...")
-        started_pid = start_anvil(args.rpc_url)
+        started_pid = start_anvil(args.rpc_url, args.listen_host)
         actual_chain = chain_id(args.rpc_url)
 
     if actual_chain != DEFAULT_CHAIN_ID:
@@ -219,7 +224,9 @@ def main():
         "export WQPU_RPC_URL='{}'\n"
         "export WQPU_REGISTRY='{}'\n"
         "export WQPU_TOKEN='{}'\n"
-        "export WQPU_MARKET='{}'\n".format(args.rpc_url, registry, token, market)
+        "export WQPU_MARKET='{}'\n"
+        "export WQPU_CHAIN_NAME='WQPU Devnet'\n"
+        "export WQPU_NATIVE_SYMBOL='ETH'\n".format(args.rpc_url, registry, token, market)
     )
 
     print("\nWQPU devnet ready.")
@@ -228,7 +235,7 @@ def main():
     print("Registry: {}".format(registry))
     print("Market:   {}".format(market))
     print("\nmacOS/Linux: source .wqpu-devnet.env && wqpu")
-    print("Windows: set WQPU_RPC_URL and WQPU_REGISTRY to the values above, then run wqpu")
+    print("Windows: set WQPU_RPC_URL/WQPU_REGISTRY and WQPU_CHAIN_NAME='WQPU Devnet', then run wqpu")
     print("This is a local test chain. The Anvil mnemonic/private key is public and unsafe for real funds.")
     return 0
 
