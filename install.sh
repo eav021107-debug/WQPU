@@ -6,7 +6,7 @@ ROOT="${HOME}/.local/share/wqpu"
 BIN="${HOME}/.local/bin"
 JOIN="${WQPU_JOIN:-${1:-}}"
 EXPECTED_WQPU="WQPU 0.6.0-dev"
-CACHE_BUSTER="chain-0.6.0-dev-r2"
+CACHE_BUSTER="chain-0.6.0-dev-r3"
 CHAIN_STATE="${HOME}/.wqpu/chain.json"
 
 need() { command -v "$1" >/dev/null 2>&1; }
@@ -120,6 +120,12 @@ if [ -n "$rc" ]; then
 fi
 
 echo "WQPU installed: $CORE_VERSION with $($PYTHON --version 2>&1)."
+
+if [ "${WQPU_NO_START:-0}" = "1" ]; then
+  echo "WQPU install-only mode: not starting the node."
+  exit 0
+fi
+
 if [ -n "$JOIN" ]; then
   exec "$BIN/wqpu" --join "$JOIN"
 elif { [ -n "${WQPU_RPC_URL:-}" ] && [ -n "${WQPU_REGISTRY:-}" ]; } || [ -f "$CHAIN_STATE" ] || [ "$PUBLIC_ENABLED" = "1" ]; then
