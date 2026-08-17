@@ -72,7 +72,7 @@ jobs:
         run: |
           curl -fsS http://127.0.0.1:18545/health
           curl -fsS http://127.0.0.1:18787/health
-          curl -fsS http://127.0.0.1:18787/network-config.json | grep -F '"enabled": true'
+          curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; d=json.load(sys.stdin); assert d["public"]["enabled"] is True; assert d["public"]["testnet"] is True'
           curl -fsS http://127.0.0.1:18787/join.sh | grep -F 'WQPU_NO_START=1'
           curl -fsS http://127.0.0.1:18787/join.ps1 | grep -F "WQPU_NO_START = '1'"
       - name: Verify public RPC is restricted
