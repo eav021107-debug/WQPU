@@ -7,9 +7,11 @@ on:
       - 'wqpu_rpc_gateway.py'
       - 'wqpu_relayer.py'
       - 'wqpu_transport_relay.py'
+      - 'wqpu_wallet.py'
       - 'contracts/**'
       - 'tests/test_rpc_gateway.py'
       - 'tests/test_testnet_stack.py'
+      - 'tests/test_wallet_faucet.py'
       - '.github/workflows/testnet-stack.yml'
   pull_request:
     paths:
@@ -17,9 +19,11 @@ on:
       - 'wqpu_rpc_gateway.py'
       - 'wqpu_relayer.py'
       - 'wqpu_transport_relay.py'
+      - 'wqpu_wallet.py'
       - 'contracts/**'
       - 'tests/test_rpc_gateway.py'
       - 'tests/test_testnet_stack.py'
+      - 'tests/test_wallet_faucet.py'
       - '.github/workflows/testnet-stack.yml'
 
 jobs:
@@ -34,9 +38,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile stack modules
-        run: python -m py_compile wqpu_rpc_gateway.py wqpu_relayer.py scripts/testnet_stack.py
+        run: python -m py_compile wqpu_rpc_gateway.py wqpu_relayer.py wqpu_wallet.py scripts/testnet_stack.py
       - name: Test stack policy/config
-        run: python -m unittest tests.test_rpc_gateway tests.test_testnet_stack -v
+        run: python -m unittest tests.test_rpc_gateway tests.test_testnet_stack tests.test_wallet_faucet -v
 
   integration:
     runs-on: ubuntu-latest
@@ -48,42 +52,50 @@ jobs:
       - uses: foundry-rs/foundry-toolchain@v1
         with:
           version: stable
-      - name: Start and exercise complete testnet stack
+      - name: Start complete testnet stack
         shell: bash
         run: |
-          set -euo pipefail
-          cleanup() { python scripts/testnet_stack.py stop || true; }
-          trap cleanup EXIT
-
+          # GitHub Actions kills processes carrying this step-specific marker when the
+          # step exits. Remove it only for the operator stack children so status can be
+          # tested from a later step exactly like an operator would use it.
+          unset RUNNER_TRACKING_ID
           python scripts/testnet_stack.py start \
             --public-host 127.0.0.1 \
             --internal-rpc-port 28546 \
             --rpc-port 18545 \
             --relayer-port 18787 \
             --relay-port 17443
-
-          # Status is a separate process invocation, just like an operator would use.
-          python scripts/testnet_stack.py status
+      - name: Check stack status
+        run: python scripts/testnet_stack.py status
+      - name: Check published config and join scripts
+        shell: bash
+        run: |
           curl -fsS http://127.0.0.1:18545/health
           curl -fsS http://127.0.0.1:18787/health
           curl -fsS http://127.0.0.1:18787/network-config.json | grep -F '"enabled": true'
           curl -fsS http://127.0.0.1:18787/join.sh | grep -F 'WQPU_NO_START=1'
           curl -fsS http://127.0.0.1:18787/join.ps1 | grep -F "WQPU_NO_START = '1'"
-
-          # Public wallet RPC works, but unlocked/admin methods are blocked.
-          CHAIN=$(curl -fsS -H 'content-type: application/json' \
-            --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' \
-            http://127.0.0.1:18545)
+      - name: Verify public RPC is restricted
+        shell: bash
+        run: |
+          CHAIN=$(curl -fsS -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' http://127.0.0.1:18545)
           echo "$CHAIN" | grep -F '0x7a69'
-          BLOCKED=$(curl -fsS -H 'content-type: application/json' \
-            --data '{"jsonrpc":"2.0","id":2,"method":"eth_accounts","params":[]}' \
-            http://127.0.0.1:18545)
+          BLOCKED=$(curl -fsS -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":2,"method":"eth_accounts","params":[]}' http://127.0.0.1:18545)
           echo "$BLOCKED" | grep -F 'blocked by WQPU testnet gateway'
-
-          # Faucet uses only the private operator signer behind the relayer.
+      - name: Faucet funds a fresh wallet
+        shell: bash
+        run: |
           WALLET=0x1111111111111111111111111111111111111111
-          curl -fsS -H 'content-type: application/json' \
-            --data "{\"wallet\":\"$WALLET\"}" \
-            http://127.0.0.1:18787/faucet | grep -F 'transactions'
+          RESPONSE=$(curl -fsS -H 'content-type: application/json' --data "{\"wallet\":\"$WALLET\"}" http://127.0.0.1:18787/faucet)
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -F 'transactions'
           BALANCE=$(cast balance "$WALLET" --rpc-url http://127.0.0.1:18545)
+          echo "funded balance=$BALANCE"
           test "$BALANCE" != "0"
+      - name: Stop testnet stack
+        if: always()
+        run: |
+          python scripts/testnet_stack.py stop || true
+          echo '--- rpc gateway log ---'; cat .wqpu-testnet/logs/rpc-gateway.log 2>/dev/null || true
+          echo '--- relayer log ---'; cat .wqpu-testnet/logs/relayer.log 2>/dev/null || true
+          echo '--- transport log ---'; cat .wqpu-testnet/logs/transport-relay.log 2>/dev/null || true
