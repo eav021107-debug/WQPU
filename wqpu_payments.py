@@ -67,6 +67,7 @@ class PaymentSession(object):
         self.max_amount = int(self.session.get("max_amount") or 0)
         self.price = int(self.session.get("price_per_million_units") or 0)
         self.valid_until = int(self.session.get("valid_until") or 0)
+        self.authorization_signature = str(self.session.get("authorization_signature") or "")
         if self.max_amount <= 0 or self.price <= 0:
             raise PaymentError("invalid payment session limits")
 
@@ -177,6 +178,7 @@ class PaymentSession(object):
             "cumulative_amount": cumulative_amount,
             "cumulative_units": cumulative_units,
             "voucher_signature": signature,
+            "authorization_signature": self.authorization_signature,
         }
 
 
