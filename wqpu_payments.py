@@ -13,7 +13,13 @@ import os
 import time
 from pathlib import Path
 
-from wqpu_session import escrow_balance, load_session, session_address, sign_provider_voucher
+from wqpu_session import (
+    escrow_balance,
+    load_session,
+    session_address,
+    session_spent,
+    sign_provider_voucher,
+)
 
 
 PRICE_UNITS = 1_000_000
@@ -125,12 +131,18 @@ class PaymentSession(object):
         if delta_amount <= 0:
             raise PaymentError("compute increment is too small for current price precision")
 
-        projected_spend = self.local_spent() + delta_amount
+        local_total = self.local_spent()
+        projected_spend = local_total + delta_amount
         if projected_spend > self.max_amount:
             raise PaymentError("payment session spending limit reached")
+
+        claimed = session_spent(self.chain, self.market, self.requester, self.session_id)
+        if claimed > local_total:
+            raise PaymentError("local payment state is behind on-chain session state")
+        outstanding = local_total - claimed
         onchain_escrow = escrow_balance(self.chain, self.market, self.requester)
-        if delta_amount > onchain_escrow:
-            raise PaymentError("WQPU escrow balance is too low")
+        if outstanding + delta_amount > onchain_escrow:
+            raise PaymentError("WQPU escrow cannot cover outstanding vouchers")
 
         signature = sign_provider_voucher(
             self.chain,
@@ -179,4 +191,5 @@ if __name__ == "__main__":
         "local_spent": session.local_spent(),
         "max_amount": session.max_amount,
         "escrow": escrow_balance(client, session.market, session.requester),
+        "claimed": session_spent(client, session.market, session.requester, session.session_id),
     }, indent=2))
