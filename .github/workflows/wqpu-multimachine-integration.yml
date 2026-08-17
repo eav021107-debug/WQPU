@@ -4,12 +4,15 @@ on:
   push:
     branches: [next-foundation]
     paths:
+      - 'up.sh'
+      - 'bootstrap-rpcs.txt'
       - 'network.sh'
       - 'chain/devnet.sh'
       - 'chain/devnet_config.py'
       - 'chain/runtime.lock'
       - 'chain/runtime_patch*.py'
       - 'chain/cmd/wqpu-compute-bootstrap/**'
+      - 'chain/cmd/wqpu-slot-helper/**'
       - 'chain/x/wqpu/precompile/**'
       - 'client/internal/chainclient/**'
       - 'client/internal/chainregistry/**'
@@ -48,7 +51,11 @@ jobs:
         with:
           go-version: '1.25.9'
 
-      - name: Run shared-chain independent-node distributed inference proof
+      - name: Validate one-command launcher
+        shell: bash
+        run: bash -n ./up.sh
+
+      - name: Run shared-chain blockchain-registry distributed inference proof
         shell: bash
         env:
           WQPU_SOURCE_DIR: ${{ github.workspace }}
