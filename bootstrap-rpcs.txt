@@ -1,0 +1,5 @@
+# WQPU bootstrap RPC seeds.
+# One RPC URL per line. These locate the WQPU blockchain only.
+# Compute peers are discovered exclusively from the on-chain registry.
+#
+# Keep empty for local automatic LAN bootstrap during devnet testing.
