@@ -3,8 +3,8 @@ $raw = if ($env:WQPU_RAW_BASE) { $env:WQPU_RAW_BASE.TrimEnd('/') } else { 'https
 $root = Join-Path $env:LOCALAPPDATA 'WQPU'
 $bin = Join-Path $root 'bin'
 $join = $env:WQPU_JOIN
-$expectedWqpu = 'WQPU 0.6.0-dev'
-$cacheBuster = 'meter-v2-0.6.0-dev-r1'
+$expectedWqpu = 'WQPU 0.6.0'
+$cacheBuster = 'wqpu-0.6.0-r1'
 $chainState = Join-Path $HOME '.wqpu\chain.json'
 
 New-Item -ItemType Directory -Force -Path $root,$bin | Out-Null
