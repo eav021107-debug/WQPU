@@ -6,6 +6,7 @@ on:
       - 'scripts/check_direct_llama_rpc.py'
       - 'scripts/check_real_rpc_wire.py'
       - 'scripts/check_real_inference.py'
+      - 'scripts/check_real_multiworker.py'
       - '.github/workflows/real-inference.yml'
       - 'wqpu_entry.py'
       - 'wqpu_runtime_pin.py'
@@ -21,6 +22,7 @@ on:
       - 'scripts/check_direct_llama_rpc.py'
       - 'scripts/check_real_rpc_wire.py'
       - 'scripts/check_real_inference.py'
+      - 'scripts/check_real_multiworker.py'
       - '.github/workflows/real-inference.yml'
       - 'wqpu_entry.py'
       - 'wqpu_runtime_pin.py'
@@ -58,9 +60,11 @@ jobs:
           wqpu_autopay.py wqpu_multistream.py wqpu_meter.py wqpu_accounting.py wqpu_attestation.py
           wqpu_network_guard.py wqpu_node_identity.py wqpu_node_status.py
           wqpu_public_config.py wqpu_public_security.py wqpu_transport_relay.py
+          wqpu_session.py wqpu_payments.py wqpu_claim.py wqpu_vouchers.py
           scripts/testnet_stack.py scripts/testnet_doctor.py
           scripts/check_two_client_relay.py scripts/check_real_rpc_wire.py
           scripts/check_direct_llama_rpc.py scripts/check_real_inference.py
+          scripts/check_real_multiworker.py
       - name: Start isolated operator stack
         shell: bash
         run: |
@@ -83,12 +87,18 @@ jobs:
           WQPU_REAL_MODEL: ggml-org/gemma-3-1b-it-GGUF:Q4_K_M
           GGML_RDMA_DEV: __wqpu_tcp_tunnel_only__
         run: python scripts/check_direct_llama_rpc.py
-      - name: Real pinned llama.cpp chat through authenticated WQPU relay
+      - name: Real measured-payment inference through one authenticated WQPU worker
         env:
           WQPU_LLAMA_TAG: b10456
           WQPU_REAL_MODEL: ggml-org/gemma-3-1b-it-GGUF:Q4_K_M
           GGML_RDMA_DEV: __wqpu_tcp_tunnel_only__
         run: python scripts/check_real_inference.py
+      - name: One real model across two independently paid WQPU workers
+        env:
+          WQPU_LLAMA_TAG: b10456
+          WQPU_REAL_MODEL: ggml-org/gemma-3-1b-it-GGUF:Q4_K_M
+          GGML_RDMA_DEV: __wqpu_tcp_tunnel_only__
+        run: python scripts/check_real_multiworker.py
       - name: Operator remains healthy after real inference
         run: python scripts/testnet_doctor.py
       - name: Stop operator stack
