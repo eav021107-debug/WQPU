@@ -11,7 +11,9 @@ on:
       - 'chain/devnet.sh'
       - 'chain/devnet_config.py'
       - 'chain/p2p_config.py'
+      - 'chain/node_id.py'
       - 'chain/test_p2p_config.py'
+      - 'chain/test_node_id.py'
       - 'chain/runtime.lock'
       - 'chain/runtime_patch*.py'
       - 'chain/cmd/wqpu-compute-bootstrap/**'
@@ -70,7 +72,7 @@ jobs:
         shell: bash
         run: |
           cd chain
-          python3 -m unittest test_p2p_config.py
+          python3 -m unittest test_p2p_config.py test_node_id.py
 
       - name: Build strict bootstrap verifier
         shell: bash
