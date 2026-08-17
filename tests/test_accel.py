@@ -10,18 +10,34 @@ class AcceleratorTests(unittest.TestCase):
         with mock.patch.object(wqpu_accel, "_system", return_value="Darwin"):
             self.assertEqual(wqpu_accel.auto_mode(), "metal")
 
-    def test_auto_prefers_cuda12_for_windows_nvidia(self):
+    def test_auto_prefers_cuda12_for_supported_windows_nvidia(self):
+        with mock.patch.object(wqpu_accel, "_system", return_value="Windows"), \
+             mock.patch.object(wqpu_accel, "_cuda12_auto_supported", return_value=True):
+            self.assertEqual(wqpu_accel.auto_mode(), "cuda12")
+
+    def test_old_windows_nvidia_driver_falls_back_to_vulkan(self):
+        with mock.patch.object(wqpu_accel, "_system", return_value="Windows"), \
+             mock.patch.object(wqpu_accel, "_cuda12_auto_supported", return_value=False), \
+             mock.patch.object(wqpu_accel, "_x64", return_value=True), \
+             mock.patch.object(wqpu_accel, "_vulkan_gpu_present", return_value=True):
+            self.assertEqual(wqpu_accel.auto_mode(), "vulkan")
+
+    def test_cuda12_auto_driver_threshold(self):
         with mock.patch.object(wqpu_accel, "_system", return_value="Windows"), \
              mock.patch.object(wqpu_accel, "_x64", return_value=True), \
              mock.patch.object(wqpu_accel, "_nvidia_present", return_value=True):
-            self.assertEqual(wqpu_accel.auto_mode(), "cuda12")
+            with mock.patch.object(wqpu_accel, "nvidia_driver_version", return_value="551.61"):
+                self.assertTrue(wqpu_accel._cuda12_auto_supported())
+            with mock.patch.object(wqpu_accel, "nvidia_driver_version", return_value="551.60"):
+                self.assertFalse(wqpu_accel._cuda12_auto_supported())
+            with mock.patch.object(wqpu_accel, "nvidia_driver_version", return_value="552.12"):
+                self.assertTrue(wqpu_accel._cuda12_auto_supported())
 
-    def test_windows_vulkan_is_fallback_after_cuda(self):
-        with mock.patch.object(wqpu_accel, "_system", return_value="Windows"), \
-             mock.patch.object(wqpu_accel, "_x64", return_value=True), \
-             mock.patch.object(wqpu_accel, "_nvidia_present", return_value=False), \
-             mock.patch.object(wqpu_accel, "_vulkan_gpu_present", return_value=True):
-            self.assertEqual(wqpu_accel.auto_mode(), "vulkan")
+    def test_version_parser_handles_driver_suffixes(self):
+        self.assertTrue(wqpu_accel._version_at_least("551.61", (551, 61)))
+        self.assertTrue(wqpu_accel._version_at_least("551.61.00", (551, 61)))
+        self.assertFalse(wqpu_accel._version_at_least("550.99", (551, 61)))
+        self.assertFalse(wqpu_accel._version_at_least("unknown", (551, 61)))
 
     def test_linux_vulkan_requires_available_gpu_path(self):
         with mock.patch.object(wqpu_accel, "_system", return_value="Linux"), \
@@ -75,10 +91,12 @@ class AcceleratorTests(unittest.TestCase):
             )
 
     def test_nvidia_vram_sums_visible_devices(self):
-        completed = mock.Mock(returncode=0, stdout="15360\n16384\n", stderr="")
-        with mock.patch.object(wqpu_accel.shutil, "which", return_value="nvidia-smi"), \
-             mock.patch.object(wqpu_accel.subprocess, "run", return_value=completed):
+        with mock.patch.object(wqpu_accel, "_nvidia_query", return_value="15360 MiB\n16384 MiB"):
             self.assertEqual(wqpu_accel.nvidia_vram_mb(), 31744)
+
+    def test_nvidia_driver_uses_lowest_visible_version(self):
+        with mock.patch.object(wqpu_accel, "_nvidia_query", return_value="552.12\n551.61"):
+            self.assertEqual(wqpu_accel.nvidia_driver_version(), "551.61")
 
     def test_invalid_mode_fails_closed(self):
         with mock.patch.dict(os.environ, {"WQPU_ACCEL": "magic"}, clear=False):
