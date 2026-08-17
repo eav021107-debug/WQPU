@@ -6,11 +6,12 @@ UsageBook already meters all of those streams cumulatively per provider. Histori
 worker signed one report per stream and the requester kept only the latest report, making
 real inference fail closed even when every individual report was valid.
 
-This extension keeps the security boundary intact:
-- every stream is independently metered and TLS-signed by the worker;
-- the existing AutoPay receiver verifies wallet, Registry fingerprint and signature first;
+This extension is requester-side only. It never replaces or wraps the worker RPC transport:
+- every physical stream keeps using the proven byte-transparent AutoPay worker path;
+- every resulting report is independently TLS-signed by the worker;
+- the existing receiver verifies wallet, Registry fingerprint and signature first;
 - only verified reports are aggregated;
-- a signed stream_id prevents replay/double-counting;
+- a report ID derived from the verified signature makes relay replay idempotent;
 - requester waits for the verified aggregate to exactly equal its own final meter;
 - timeout/mismatch still means no voucher.
 """
@@ -18,12 +19,8 @@ from __future__ import print_function
 
 import asyncio
 import hashlib
-import json
 
-import wqpu
 import wqpu_accounting
-from wqpu_attestation import sign_report
-from wqpu_meter import RPCRequestMeter
 
 
 INVARIANT_FIELDS = ("meter_version", "llama_rpc_op_count")
@@ -68,13 +65,20 @@ def merge_rpc_stats(previous, current):
     return merged
 
 
-def _legacy_stream_id(report):
-    # Compatibility only. Patched workers always sign an explicit stream_id. Hashing the
-    # verified signature gives old one-stream implementations deterministic replay safety.
+def _report_id(report):
+    """Use signed payload identity for replay safety without touching RPC forwarding.
+
+    Newer reports may carry an explicit signed stream_id. Existing reports are uniquely
+    identified by their verified TLS signature. A truly identical legitimate report can
+    only be under-counted, never double-paid, so the failure mode remains fail-closed.
+    """
+    stream_id = str((report or {}).get("stream_id") or "")
+    if stream_id:
+        return "stream-" + stream_id
     signature = str((report or {}).get("signature") or "")
     if not signature:
         return ""
-    return "legacy-" + hashlib.sha256(signature.encode("ascii", "ignore")).hexdigest()
+    return "sig-" + hashlib.sha256(signature.encode("ascii", "ignore")).hexdigest()
 
 
 def install(cls):
@@ -83,57 +87,6 @@ def install(cls):
 
     original_receive = cls._receive_usage_report
     original_end_usage = cls.end_usage
-
-    async def worker_rpc(self, msg, via):
-        """Worker side: meter and sign each physical RPC stream with its relay stream id."""
-        sid = str(msg.get("stream") or "")
-        if not sid or not via:
-            return
-        rr = rw = lr = lw = None
-        try:
-            rr, rw = await self.open_accept(via, sid)
-            line = await asyncio.wait_for(rr.readline(), 5)
-            if not line.startswith(self.METER_PRELUDE if hasattr(self, "METER_PRELUDE") else b"WQPU-METER2 ") or len(line) > 2048:
-                # AutoPay defines the constant at module level, not on the class. Keep the
-                # exact compatibility behavior without billing an untagged stream.
-                import wqpu_autopay
-                lr, lw = await asyncio.open_connection("127.0.0.1", wqpu.RPC_PORT)
-                lw.write(line)
-                await lw.drain()
-                await wqpu.bridge(rr, rw, lr, lw)
-                return
-
-            import wqpu_autopay
-            meta = json.loads(line[len(wqpu_autopay.METER_PRELUDE):].decode("utf-8"))
-            request_id = str(meta.get("request_id") or "")
-            requester = str(meta.get("requester_node_id") or "")
-            if len(request_id) != 32 or not requester:
-                raise RuntimeError("bad WQPU meter prelude")
-            int(request_id, 16)
-
-            local_port = int(getattr(self, "local_rpc_port", wqpu.RPC_PORT))
-            lr, lw = await asyncio.open_connection("127.0.0.1", local_port)
-            meter = RPCRequestMeter()
-            await asyncio.gather(
-                self._copy_worker_metered(rr, lw, meter),
-                wqpu.copy_stream(lr, rw),
-            )
-            report = sign_report({
-                "version": 2,
-                "kind": "wqpu-worker-usage-attestation",
-                "request_id": request_id,
-                "stream_id": sid,
-                "requester_node_id": requester,
-                "provider_node_id": self.me,
-                "provider_wallet": self.wallet,
-                "rpc": meter.snapshot(),
-            })
-            await self._route_usage_report(requester, report)
-        except Exception:
-            if rw:
-                await wqpu.close_writer(rw)
-            if lw:
-                await wqpu.close_writer(lw)
 
     def receive_usage_report(self, report):
         """Verify one signed stream with the old receiver, then aggregate exactly once."""
@@ -145,17 +98,16 @@ def install(cls):
             return False
 
         old_report = dict(((self.provider_usage_reports.get(request_id) or {}).get(provider_node)) or {})
-        stream_id = str(report.get("stream_id") or "") or _legacy_stream_id(report)
-        if not stream_id:
+        report_id = _report_id(report)
+        if not report_id:
             return False
 
-        seen_root = getattr(self, "_verified_usage_stream_ids", None)
+        seen_root = getattr(self, "_verified_usage_report_ids", None)
         if seen_root is None:
             seen_root = {}
-            self._verified_usage_stream_ids = seen_root
+            self._verified_usage_report_ids = seen_root
         seen = seen_root.setdefault((request_id, provider_node), set())
-        if stream_id in seen:
-            # Idempotent delivery of an already-verified physical stream.
+        if report_id in seen:
             return True
 
         # Critical trust boundary: original receiver verifies report signature against the
@@ -167,7 +119,6 @@ def install(cls):
         try:
             aggregate_rpc = merge_rpc_stats(old_report.get("rpc") or {}, current_saved.get("rpc") or {})
         except Exception:
-            # Never retain a partial replacement if invariants disagree.
             bucket = self.provider_usage_reports.setdefault(request_id, {})
             if old_report:
                 bucket[provider_node] = old_report
@@ -175,11 +126,11 @@ def install(cls):
                 bucket.pop(provider_node, None)
             return False
 
-        seen.add(stream_id)
+        seen.add(report_id)
         aggregate = dict(current_saved)
         aggregate["rpc"] = aggregate_rpc
         aggregate["verified_stream_count"] = len(seen)
-        aggregate["stream_id"] = stream_id
+        aggregate["report_id"] = report_id
         self.provider_usage_reports.setdefault(request_id, {})[provider_node] = aggregate
         return True
 
@@ -213,7 +164,6 @@ def install(cls):
             await asyncio.sleep(0.05)
         return False
 
-    cls._worker_rpc = worker_rpc
     cls._receive_usage_report = receive_usage_report
     cls.end_usage = end_usage
     cls.wait_provider_reports = wait_provider_reports
