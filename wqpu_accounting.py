@@ -14,11 +14,16 @@ from wqpu_payments import PaymentSession
 
 
 USAGE_DIR = wqpu.HOME / "usage"
-MATCH_FIELDS = (
+
+# Dual metering protects payment for useful compute, not incidental RPC housekeeping.
+# Real llama.cpp can issue an extra 4-byte device/alignment/memory probe while RPC sockets
+# are closing or being reserved. Such a 13-byte frame changes `requests/request_bytes` but
+# cannot change graph execution or the WQPU charge. Require exact agreement on every
+# integrity and billable-work field instead. Tensor upload volume remains matched because
+# it is part of the exact remote work stream even though v2 currently prices scalar ops.
+BILLING_MATCH_FIELDS = (
     "meter_version",
     "llama_rpc_op_count",
-    "requests",
-    "request_bytes",
     "graph_compute_calls",
     "graph_recompute_calls",
     "graph_payload_bytes",
@@ -32,6 +37,8 @@ MATCH_FIELDS = (
     "invalid_frames",
     "trailing_bytes",
 )
+# Compatibility name used by early tests/integration code.
+MATCH_FIELDS = BILLING_MATCH_FIELDS
 
 
 def _flag(env_name, network, config_name, default=False):
@@ -56,13 +63,25 @@ def meter_is_eligible(stats):
         return False
 
 
+# Compatibility alias for early v2-meter integration code. Keep the canonical predicate
+# above; both names preserve the same fail-closed semantics.
+meter_eligible = meter_is_eligible
+
+
 def meters_match(requester_stats, provider_stats):
+    """Return true only when independently observed *billable work* is identical.
+
+    `requests` and `request_bytes` remain diagnostics in receipts, but are deliberately
+    excluded because non-billable llama.cpp device probes can occur at different socket
+    lifecycle boundaries. Any malformed/trailing stream or any difference in graph work,
+    tensor upload, operation categories or estimated units still fails closed.
+    """
     if not meter_is_eligible(requester_stats) or not meter_is_eligible(provider_stats):
         return False
     try:
         return all(
             int(requester_stats.get(field) or 0) == int(provider_stats.get(field) or 0)
-            for field in MATCH_FIELDS
+            for field in BILLING_MATCH_FIELDS
         )
     except Exception:
         return False
@@ -131,7 +150,7 @@ def save_usage_receipt(mesh, snapshot):
         elif not provider_report:
             worker["voucher_error"] = "signed worker meter report not received"
         elif not dual_match:
-            worker["voucher_error"] = "requester and worker meters disagree"
+            worker["voucher_error"] = "requester and worker billable-compute meters disagree"
         elif payments and wallet:
             try:
                 worker["voucher"] = payments.issue(wallet, units)

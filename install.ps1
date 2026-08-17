@@ -1,10 +1,15 @@
 $ErrorActionPreference = 'Stop'
 $raw = if ($env:WQPU_RAW_BASE) { $env:WQPU_RAW_BASE.TrimEnd('/') } else { 'https://raw.githubusercontent.com/eav021107-debug/WQPU/main' }
+$repo = 'eav021107-debug/WQPU'
+$sourceRef = if ($env:WQPU_SOURCE_REF) { $env:WQPU_SOURCE_REF } else { 'main' }
+if ($env:WQPU_RAW_BASE -and $raw -match '^https://raw\.githubusercontent\.com/([^/]+/[^/]+)/(.+)$') {
+  $repo = $Matches[1]
+  $sourceRef = $Matches[2]
+}
 $root = Join-Path $env:LOCALAPPDATA 'WQPU'
 $bin = Join-Path $root 'bin'
 $join = $env:WQPU_JOIN
 $expectedWqpu = 'WQPU 0.6.0'
-$cacheBuster = 'wqpu-0.6.0-r2'
 $chainState = Join-Path $HOME '.wqpu\chain.json'
 
 New-Item -ItemType Directory -Force -Path $root,$bin | Out-Null
@@ -39,6 +44,21 @@ function Install-PrivatePython {
   if ($p.ExitCode -ne 0) { throw "Python installer failed with exit code $($p.ExitCode)." }
   if (-not (Test-Python (Join-Path $target 'python.exe') '')) { throw 'Private Python installation did not produce a usable Python.' }
 }
+function Download-WithRetry([string]$Url, [string]$OutFile, [int]$Attempts = 4) {
+  $last = $null
+  for ($attempt = 0; $attempt -lt $Attempts; $attempt++) {
+    try {
+      Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
+      Invoke-WebRequest -UseBasicParsing $Url -OutFile $OutFile
+      return
+    } catch {
+      $last = $_
+      Remove-Item $OutFile -Force -ErrorAction SilentlyContinue
+      if ($attempt + 1 -lt $Attempts) { Start-Sleep -Seconds ([Math]::Min(8, [Math]::Pow(2, $attempt))) }
+    }
+  }
+  throw $last
+}
 
 $py = Find-Python
 if (-not $py) { Install-PrivatePython; $py = Find-Python }
@@ -55,9 +75,40 @@ if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
 if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) { throw 'WQPU needs OpenSSL. Install Git for Windows or OpenSSL, then run the same command again.' }
 
 Write-Host 'WQPU: downloading runtime...'
-$pythonFiles = @('wqpu.py','wqpu_chain.py','wqpu_wallet.py','wqpu_session.py','wqpu_meter.py','wqpu_accounting.py','wqpu_attestation.py','wqpu_payments.py','wqpu_claim.py','wqpu_vouchers.py','wqpu_runtime.py','wqpu_autopay.py','wqpu_runtime_pin.py','wqpu_entry.py')
+$pythonFiles = @('wqpu.py','wqpu_chain.py','wqpu_wallet.py','wqpu_session.py','wqpu_meter.py','wqpu_accounting.py','wqpu_attestation.py','wqpu_payments.py','wqpu_claim.py','wqpu_vouchers.py','wqpu_runtime.py','wqpu_autopay.py','wqpu_multistream.py','wqpu_runtime_pin.py','wqpu_network_guard.py','wqpu_node_identity.py','wqpu_node_status.py','wqpu_public_config.py','wqpu_public_security.py','wqpu_entry.py')
 $files = $pythonFiles + @('network-config.json')
-foreach ($file in $files) { Invoke-WebRequest -UseBasicParsing "$raw/$file`?installer=$cacheBuster" -OutFile (Join-Path $root $file) }
+
+# One immutable source archive avoids dozens of raw.githubusercontent.com requests and
+# therefore avoids rate-limit failures during one-command Windows installs. Keep the old
+# raw-file path only as a compatibility fallback for custom mirrors that are not GitHub.
+$archiveInstalled = $false
+if ($repo -and $sourceRef) {
+  $tmpRoot = Join-Path $env:TEMP ("wqpu-source-" + [Guid]::NewGuid().ToString('N'))
+  $archive = Join-Path $tmpRoot 'wqpu.tar.gz'
+  $extract = Join-Path $tmpRoot 'src'
+  try {
+    New-Item -ItemType Directory -Force -Path $tmpRoot,$extract | Out-Null
+    $archiveUrl = "https://codeload.github.com/$repo/tar.gz/$sourceRef"
+    Download-WithRetry $archiveUrl $archive
+    & tar.exe -xzf $archive -C $extract
+    if ($LASTEXITCODE -ne 0) { throw 'Could not extract WQPU source archive.' }
+    $source = Get-ChildItem -Path $extract -Directory | Select-Object -First 1
+    if (-not $source) { throw 'WQPU source archive is empty.' }
+    foreach ($file in $files) {
+      $sourceFile = Join-Path $source.FullName $file
+      if (-not (Test-Path $sourceFile)) { throw "WQPU source archive is missing $file." }
+      Copy-Item -Force $sourceFile (Join-Path $root $file)
+    }
+    $archiveInstalled = $true
+  } catch {
+    Write-Host "WQPU: source archive unavailable; falling back to individual files ($($_.Exception.Message))"
+  } finally {
+    Remove-Item $tmpRoot -Recurse -Force -ErrorAction SilentlyContinue
+  }
+}
+if (-not $archiveInstalled) {
+  foreach ($file in $files) { Download-WithRetry "$raw/$file" (Join-Path $root $file) }
+}
 
 $exe = $py.Exe; $extra = $py.Extra; $compileArgs = @()
 if ($extra) { $compileArgs += $extra }

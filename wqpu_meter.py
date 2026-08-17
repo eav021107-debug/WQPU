@@ -5,6 +5,11 @@ Meter v2 parses serialized rpc_tensor graphs. Generic operations are estimated b
 output tensor elements; matrix multiplication and flash attention get shape-aware
 scalar-operation estimates. It remains prototype accounting, but a tiny graph node and
 a huge matrix multiply are no longer charged as the same amount of work.
+
+A logical llama.cpp request may use multiple TCP RPC sockets concurrently. Each physical
+socket is parsed by its own RPCRequestMeter; UsageBook combines only completed meter
+snapshots per provider. This prevents bytes from independent TCP streams from ever being
+interleaved inside one frame parser.
 """
 
 from __future__ import print_function
@@ -45,6 +50,28 @@ METADATA_ONLY_OPS = {
     GGML_OP_TRANSPOSE,
 }
 MATMUL_OPS = {GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID, GGML_OP_OUT_PROD}
+
+# These are the fields that are mathematically safe to merge across independent RPC
+# sockets belonging to the same logical request/provider. Invariants describe the meter
+# implementation itself; all work/error counters are additive. Diagnostic fields that are
+# not used for payment matching are merged separately below.
+METER_INVARIANT_FIELDS = ("meter_version", "llama_rpc_op_count")
+METER_ADDITIVE_FIELDS = (
+    "requests",
+    "request_bytes",
+    "graph_compute_calls",
+    "graph_recompute_calls",
+    "graph_payload_bytes",
+    "tensor_upload_bytes",
+    "node_executions",
+    "estimated_scalar_ops",
+    "matmul_scalar_ops",
+    "attention_scalar_ops",
+    "generic_scalar_ops",
+    "metadata_node_executions",
+    "invalid_frames",
+    "trailing_bytes",
+)
 
 
 class MeterError(RuntimeError):
@@ -202,6 +229,41 @@ def parse_graph(payload):
     }
 
 
+def merge_meter_snapshots(previous, current):
+    """Combine independent physical-stream snapshots for one logical provider request.
+
+    Any malformed/trailing stream remains visible in the aggregate, so the accounting
+    predicate still fails closed. Meter implementation/version mismatches are rejected
+    instead of silently combining incompatible units.
+    """
+    left = dict(previous or {})
+    right = dict(current or {})
+    if not left:
+        return right
+    if not right:
+        return left
+
+    for field in METER_INVARIANT_FIELDS:
+        if int(left.get(field) or 0) != int(right.get(field) or 0):
+            raise MeterError("meter snapshot invariant mismatch: {}".format(field))
+
+    merged = dict(left)
+    for field in METER_INVARIANT_FIELDS:
+        merged[field] = int(left.get(field) or 0)
+    for field in METER_ADDITIVE_FIELDS:
+        merged[field] = _bounded_add(
+            int(left.get(field) or 0), int(right.get(field) or 0)
+        )
+
+    merged["protocol_seen"] = bool(left.get("protocol_seen")) or bool(right.get("protocol_seen"))
+    merged["active_seconds"] = float(left.get("active_seconds") or 0.0) + float(right.get("active_seconds") or 0.0)
+    merged["last_graph_nodes"] = int(right.get("last_graph_nodes") or left.get("last_graph_nodes") or 0)
+    merged["tracked_devices"] = max(
+        int(left.get("tracked_devices") or 0), int(right.get("tracked_devices") or 0)
+    )
+    return merged
+
+
 class RPCRequestMeter(object):
     def __init__(self):
         self.buffer = bytearray()
@@ -245,7 +307,12 @@ class RPCRequestMeter(object):
             del self.buffer[:frame_size]
             self.requests += 1
             self.request_bytes += frame_size
-            self._frame(cmd, payload)
+            try:
+                self._frame(cmd, payload)
+            except MeterError:
+                # Preserve transport semantics but make the meter unambiguously ineligible.
+                self.invalid_frames += 1
+                raise
 
     def _add_graph_work(self, graph):
         self.node_executions = _bounded_add(self.node_executions, graph["n_nodes"])
@@ -312,17 +379,25 @@ class RPCRequestMeter(object):
 
 class UsageBook(object):
     def __init__(self):
+        # Each list entry is one physical TCP RPC socket. This is deliberate: feeding
+        # chunks from independent sockets into one parser can create synthetic frames.
         self.meters = {}
 
     def meter(self, peer_id):
         key = str(peer_id)
-        if key not in self.meters:
-            self.meters[key] = RPCRequestMeter()
-        return self.meters[key]
+        meter = RPCRequestMeter()
+        self.meters.setdefault(key, []).append(meter)
+        return meter
 
     def snapshot(self):
-        return {key: meter.snapshot() for key, meter in self.meters.items()}
+        result = {}
+        for key, meters in self.meters.items():
+            aggregate = {}
+            for meter in meters:
+                aggregate = merge_meter_snapshots(aggregate, meter.snapshot())
+            result[key] = aggregate
+        return result
 
     def prototype_units(self, peer_id):
-        meter = self.meters.get(str(peer_id))
-        return int(meter.estimated_scalar_ops) if meter else 0
+        meters = self.meters.get(str(peer_id)) or []
+        return sum(int(meter.estimated_scalar_ops) for meter in meters)

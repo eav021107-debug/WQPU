@@ -10,3 +10,6 @@ cache/
 .wqpu-devnet.env
 .wqpu-devnet-anvil.log
 .wqpu-devnet-anvil.pid
+
+# Local WQPU persistent operator testnet
+.wqpu-testnet/

@@ -1,0 +1,246 @@
+name: WQPU testnet stack
+
+on:
+  push:
+    paths:
+      - 'install-testnet.sh'
+      - 'scripts/testnet_stack.py'
+      - 'wqpu_operator_service.py'
+      - 'wqpu_operator_service_cli.py'
+      - 'wqpu_rpc_gateway.py'
+      - 'wqpu_relayer.py'
+      - 'wqpu_transport_relay.py'
+      - 'wqpu_wallet.py'
+      - 'contracts/**'
+      - 'tests/test_rpc_gateway.py'
+      - 'tests/test_testnet_stack.py'
+      - 'tests/test_wallet_faucet.py'
+      - 'tests/test_relayer_faucet.py'
+      - 'tests/test_operator_service.py'
+      - '.github/workflows/testnet-stack.yml'
+  pull_request:
+    paths:
+      - 'install-testnet.sh'
+      - 'scripts/testnet_stack.py'
+      - 'wqpu_operator_service.py'
+      - 'wqpu_operator_service_cli.py'
+      - 'wqpu_rpc_gateway.py'
+      - 'wqpu_relayer.py'
+      - 'wqpu_transport_relay.py'
+      - 'wqpu_wallet.py'
+      - 'contracts/**'
+      - 'tests/test_rpc_gateway.py'
+      - 'tests/test_testnet_stack.py'
+      - 'tests/test_wallet_faucet.py'
+      - 'tests/test_relayer_faucet.py'
+      - 'tests/test_operator_service.py'
+      - '.github/workflows/testnet-stack.yml'
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.11']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Compile stack modules
+        run: >-
+          python -m py_compile
+          wqpu_rpc_gateway.py wqpu_relayer.py wqpu_wallet.py
+          wqpu_operator_service.py wqpu_operator_service_cli.py
+          scripts/testnet_stack.py
+      - name: Test stack policy/config/backup/autostart
+        run: >-
+          python -m unittest
+          tests.test_rpc_gateway tests.test_testnet_stack tests.test_wallet_faucet
+          tests.test_relayer_faucet tests.test_operator_service -v
+
+  operator-installer:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Validate operator installer shell syntax
+        run: sh -n install-testnet.sh
+      - name: Install current commit without deleting persistent state
+        shell: bash
+        run: |
+          set -euo pipefail
+          REF="${{ github.event.pull_request.head.sha || github.sha }}"
+          TEST_HOME="$RUNNER_TEMP/wqpu-operator-home"
+          OPERATOR_ROOT="$TEST_HOME/.local/share/wqpu-operator"
+          mkdir -p "$OPERATOR_ROOT/.wqpu-testnet"
+          echo preserve-me > "$OPERATOR_ROOT/.wqpu-testnet/sentinel"
+          HOME="$TEST_HOME" \
+          WQPU_OPERATOR_ROOT="$OPERATOR_ROOT" \
+          WQPU_OPERATOR_REF="$REF" \
+          WQPU_OPERATOR_SKIP_FOUNDRY=1 \
+          WQPU_OPERATOR_NO_START=1 \
+          sh install-testnet.sh
+          test "$(cat "$OPERATOR_ROOT/.wqpu-testnet/sentinel")" = "preserve-me"
+          "$TEST_HOME/.local/bin/wqpu-testnet" --help | grep -F 'WQPU one-command persistent EVM testnet operator stack'
+          grep -F "WQPU_TESTNET_CLIENT_REF='$REF'" "$TEST_HOME/.local/bin/wqpu-testnet"
+          grep -F 'wqpu_operator_service_cli.py' "$TEST_HOME/.local/bin/wqpu-testnet"
+          (cd "$OPERATOR_ROOT" && forge build >/dev/null)
+
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: foundry-rs/foundry-toolchain@v1
+        with:
+          version: stable
+      - name: Start complete testnet stack
+        shell: bash
+        run: |
+          unset RUNNER_TRACKING_ID
+          python scripts/testnet_stack.py start \
+            --public-host 127.0.0.1 \
+            --internal-rpc-port 28546 \
+            --rpc-port 18545 \
+            --relayer-port 18787 \
+            --relay-port 17443
+      - name: Check stack status
+        run: python scripts/testnet_stack.py status
+      - name: Check published config and join scripts
+        shell: bash
+        run: |
+          curl -fsS http://127.0.0.1:18545/health
+          curl -fsS http://127.0.0.1:18787/health
+          curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; d=json.load(sys.stdin); assert d["public"]["enabled"] is True; assert d["public"]["testnet"] is True'
+          curl -fsS http://127.0.0.1:18787/join.sh | grep -F 'WQPU_NO_START=1'
+          curl -fsS http://127.0.0.1:18787/join.ps1 | grep -F "WQPU_NO_START = '1'"
+      - name: Verify public RPC is restricted
+        shell: bash
+        run: |
+          CHAIN=$(curl -fsS -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":1,"method":"eth_chainId","params":[]}' http://127.0.0.1:18545)
+          echo "$CHAIN" | grep -F '0x7a69'
+          BLOCKED=$(curl -fsS -H 'content-type: application/json' --data '{"jsonrpc":"2.0","id":2,"method":"eth_accounts","params":[]}' http://127.0.0.1:18545)
+          echo "$BLOCKED" | grep -F 'blocked by WQPU testnet gateway'
+      - name: Faucet funds a fresh wallet to target balances
+        shell: bash
+        run: |
+          WALLET=0x1111111111111111111111111111111111111111
+          RESPONSE=$(curl -fsS -H 'content-type: application/json' --data "{\"wallet\":\"$WALLET\"}" http://127.0.0.1:18787/faucet)
+          echo "$RESPONSE"
+          echo "$RESPONSE" | grep -F 'transactions'
+          BALANCE=$(cast balance "$WALLET" --rpc-url http://127.0.0.1:18545)
+          TOKEN=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["token"])')
+          TOKEN_BALANCE=$(cast call "$TOKEN" 'balanceOf(address)(uint256)' "$WALLET" --rpc-url http://127.0.0.1:18545)
+          REGISTRY=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["registry"])')
+          RELAY_FP=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["relays"][0]["fingerprint"])')
+          echo "native balance=$BALANCE token balance=$TOKEN_BALANCE registry=$REGISTRY relay_fp=$RELAY_FP"
+          test "$BALANCE" != "0"
+          test "$TOKEN_BALANCE" != "0"
+          printf '%s\n' "$REGISTRY" > /tmp/wqpu-registry-before
+          printf '%s\n' "$BALANCE" > /tmp/wqpu-balance-before
+          printf '%s\n' "$TOKEN_BALANCE" > /tmp/wqpu-token-balance-before
+          printf '%s\n' "$RELAY_FP" > /tmp/wqpu-relay-fp-before
+      - name: Stop and resume the same chain without faucet inflation
+        shell: bash
+        run: |
+          python scripts/testnet_stack.py stop
+          test -s .wqpu-testnet/anvil-state.json
+          test -s .wqpu-testnet/deployment.json
+          test -s .wqpu-testnet/operator.json
+          unset RUNNER_TRACKING_ID
+          python scripts/testnet_stack.py start \
+            --public-host 127.0.0.1 \
+            --internal-rpc-port 28546 \
+            --rpc-port 18545 \
+            --relayer-port 18787 \
+            --relay-port 17443
+          python scripts/testnet_stack.py status
+          BEFORE_REGISTRY=$(cat /tmp/wqpu-registry-before)
+          AFTER_REGISTRY=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["registry"])')
+          test "$BEFORE_REGISTRY" = "$AFTER_REGISTRY"
+
+          WALLET=0x1111111111111111111111111111111111111111
+          BEFORE_BALANCE=$(cat /tmp/wqpu-balance-before)
+          BEFORE_TOKEN_BALANCE=$(cat /tmp/wqpu-token-balance-before)
+          SECOND_FAUCET=$(curl -fsS -H 'content-type: application/json' --data "{\"wallet\":\"$WALLET\"}" http://127.0.0.1:18787/faucet)
+          echo "$SECOND_FAUCET"
+          echo "$SECOND_FAUCET" | python -c 'import json,sys; d=json.load(sys.stdin); assert d["already_funded"] is True; assert d["transactions"] == []'
+          AFTER_BALANCE=$(cast balance "$WALLET" --rpc-url http://127.0.0.1:18545)
+          TOKEN=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["token"])')
+          AFTER_TOKEN_BALANCE=$(cast call "$TOKEN" 'balanceOf(address)(uint256)' "$WALLET" --rpc-url http://127.0.0.1:18545)
+          test "$BEFORE_BALANCE" = "$AFTER_BALANCE"
+          test "$BEFORE_TOKEN_BALANCE" = "$AFTER_TOKEN_BALANCE"
+          python -c 'import json; s=json.load(open(".wqpu-testnet/state.json")); assert s["resumed"] is True; assert s["persistent"] is True'
+      - name: Backup reset restore and resume identical network
+        shell: bash
+        run: |
+          python scripts/testnet_stack.py stop
+          python scripts/testnet_stack.py backup /tmp/wqpu-testnet-backup.tar.gz
+          test -s /tmp/wqpu-testnet-backup.tar.gz
+          test "$(stat -c '%a' /tmp/wqpu-testnet-backup.tar.gz)" = "600"
+          python scripts/testnet_stack.py reset --yes
+          test ! -e .wqpu-testnet/operator.json
+          python scripts/testnet_stack.py restore /tmp/wqpu-testnet-backup.tar.gz --yes
+          test -s .wqpu-testnet/operator.json
+          test -s .wqpu-testnet/anvil-state.json
+          test -s .wqpu-testnet/relay-home/key.pem
+          unset RUNNER_TRACKING_ID
+          python scripts/testnet_stack.py start \
+            --public-host 127.0.0.1 \
+            --internal-rpc-port 28546 \
+            --rpc-port 18545 \
+            --relayer-port 18787 \
+            --relay-port 17443
+
+          BEFORE_REGISTRY=$(cat /tmp/wqpu-registry-before)
+          AFTER_REGISTRY=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["registry"])')
+          BEFORE_RELAY_FP=$(cat /tmp/wqpu-relay-fp-before)
+          AFTER_RELAY_FP=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["relays"][0]["fingerprint"])')
+          WALLET=0x1111111111111111111111111111111111111111
+          BEFORE_BALANCE=$(cat /tmp/wqpu-balance-before)
+          BEFORE_TOKEN_BALANCE=$(cat /tmp/wqpu-token-balance-before)
+          AFTER_BALANCE=$(cast balance "$WALLET" --rpc-url http://127.0.0.1:18545)
+          TOKEN=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["token"])')
+          AFTER_TOKEN_BALANCE=$(cast call "$TOKEN" 'balanceOf(address)(uint256)' "$WALLET" --rpc-url http://127.0.0.1:18545)
+          echo "registry=$BEFORE_REGISTRY/$AFTER_REGISTRY relay=$BEFORE_RELAY_FP/$AFTER_RELAY_FP"
+          test "$BEFORE_REGISTRY" = "$AFTER_REGISTRY"
+          test "$BEFORE_RELAY_FP" = "$AFTER_RELAY_FP"
+          test "$BEFORE_BALANCE" = "$AFTER_BALANCE"
+          test "$BEFORE_TOKEN_BALANCE" = "$AFTER_TOKEN_BALANCE"
+      - name: Start HTTPS operator stack
+        shell: bash
+        run: |
+          python scripts/testnet_stack.py stop
+          python scripts/testnet_stack.py reset --yes
+          openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 \
+            -subj '/CN=127.0.0.1' \
+            -addext 'subjectAltName = IP:127.0.0.1' \
+            -keyout /tmp/wqpu-testnet-key.pem -out /tmp/wqpu-testnet-cert.pem >/dev/null 2>&1
+          unset RUNNER_TRACKING_ID
+          python scripts/testnet_stack.py start \
+            --public-host 127.0.0.1 \
+            --internal-rpc-port 28546 \
+            --rpc-port 18545 \
+            --relayer-port 18787 \
+            --relay-port 17443 \
+            --tls-cert /tmp/wqpu-testnet-cert.pem \
+            --tls-key /tmp/wqpu-testnet-key.pem
+          curl -kfsS https://127.0.0.1:18545/health
+          curl -kfsS https://127.0.0.1:18787/health
+          curl -kfsS https://127.0.0.1:18787/network-config.json | python -c 'import json,sys; p=json.load(sys.stdin)["public"]; assert p["rpc_url"].startswith("https://"); assert p["relayer_url"].startswith("https://"); assert p["faucet_url"].startswith("https://")'
+          python -c 'import json; s=json.load(open(".wqpu-testnet/state.json")); assert s["tls_enabled"] is True; assert s["public_scheme"] == "https"'
+      - name: Stop testnet stack
+        if: always()
+        run: |
+          python scripts/testnet_stack.py stop || true
+          echo '--- rpc gateway log ---'; cat .wqpu-testnet/logs/rpc-gateway.log 2>/dev/null || true
+          echo '--- relayer log ---'; cat .wqpu-testnet/logs/relayer.log 2>/dev/null || true
+          echo '--- transport log ---'; cat .wqpu-testnet/logs/transport-relay.log 2>/dev/null || true

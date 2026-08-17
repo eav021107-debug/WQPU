@@ -7,11 +7,17 @@ wallet writes are done by the browser wallet connector.
 
 from __future__ import print_function
 
+import hashlib
 import json
 import os
+import re
 import time
 import urllib.request
 from pathlib import Path
+try:
+    from urllib.parse import urlparse
+except ImportError:  # pragma: no cover - Python 2 is unsupported, kept harmlessly portable.
+    from urlparse import urlparse
 
 
 MEMBER_COUNT_SELECTOR = "11aee380"              # memberCount()
@@ -19,6 +25,11 @@ MEMBER_AT_SELECTOR = "ac0250f7"                 # memberAt(uint256)
 GLOBAL_PRICE_SELECTOR = "87a51cc9"              # globalPricePerMillionUnits()
 BPS = 10000
 NETWORK_FILE = Path(__file__).resolve().with_name("network-config.json")
+PUBLIC_PROTOCOL = "wqpu-public-v1"
+NETWORK_CONFIG_VERSION = 3
+EXPECTED_LLAMA_CPP_TAG = "b10456"
+EXPECTED_LLAMA_RPC_PROTOCOL_MAJOR = 5
+EXPECTED_LLAMA_RPC_OP_COUNT = 101
 
 
 class ChainError(RuntimeError):
@@ -63,19 +74,128 @@ def normalize_address(value):
     value = str(value or "").strip().lower()
     if not value.startswith("0x") or len(value) != 42:
         raise ChainError("invalid EVM address")
-    int(value[2:], 16)
+    try:
+        int(value[2:], 16)
+    except Exception:
+        raise ChainError("invalid EVM address")
     return value
 
 
 def normalize_chain_id(value):
     if value is None or value == "":
         return None
-    if isinstance(value, int):
-        return "0x{:x}".format(value)
-    text = str(value).strip().lower()
-    if text.startswith("0x"):
-        return "0x{:x}".format(int(text, 16))
-    return "0x{:x}".format(int(text))
+    try:
+        if isinstance(value, int):
+            if value < 0:
+                raise ValueError("negative chain id")
+            return "0x{:x}".format(value)
+        text = str(value).strip().lower()
+        number = int(text, 16) if text.startswith("0x") else int(text)
+        if number < 0:
+            raise ValueError("negative chain id")
+        return "0x{:x}".format(number)
+    except Exception:
+        raise ChainError("invalid chain id")
+
+
+def compute_network_uid(chain_id, token, registry, market):
+    chain_id = normalize_chain_id(chain_id)
+    if not chain_id:
+        raise ChainError("network uid requires chain id")
+    token = normalize_address(token)
+    registry = normalize_address(registry)
+    market = normalize_address(market)
+    canonical = "{}|{}|{}|{}|{}".format(
+        PUBLIC_PROTOCOL, chain_id, token, registry, market
+    ).encode("ascii")
+    return "wqpu-" + hashlib.sha256(canonical).hexdigest()[:32]
+
+
+def _require_http_url(value, field):
+    text = str(value or "").strip()
+    parsed = urlparse(text)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        raise ChainError("invalid {} URL".format(field))
+    if parsed.username or parsed.password:
+        raise ChainError("credentials are not allowed in {} URL".format(field))
+    return text
+
+
+def _validate_relay(relay):
+    if not isinstance(relay, dict):
+        raise ChainError("invalid WQPU relay entry")
+    host = str(relay.get("host") or "").strip()
+    if not host:
+        raise ChainError("WQPU relay host is required")
+    try:
+        port = int(relay.get("port"))
+    except Exception:
+        raise ChainError("invalid WQPU relay port")
+    if port < 1 or port > 65535:
+        raise ChainError("invalid WQPU relay port")
+    fingerprint = str(relay.get("fingerprint") or "").lower().replace("0x", "")
+    if not re.match(r"^[0-9a-f]{64}$", fingerprint):
+        raise ChainError("invalid WQPU relay TLS fingerprint")
+
+
+def validate_network_config(root, public):
+    """Validate an enabled published network config.
+
+    v3 is the first fail-closed config: protocol, deterministic identity and pinned
+    llama.cpp RPC ABI must match this client exactly. Legacy v1/v2 configs remain
+    readable for backward-compatible local/dev workflows.
+    """
+    if not isinstance(root, dict) or not isinstance(public, dict):
+        raise ChainError("invalid WQPU network config")
+    raw_version = root.get("version")
+    if raw_version in (None, ""):
+        return dict(public)
+    try:
+        version = int(raw_version)
+    except Exception:
+        raise ChainError("invalid WQPU network config version")
+    if version < 1 or version > NETWORK_CONFIG_VERSION:
+        raise ChainError(
+            "unsupported WQPU network config version {}; client supports through {}".format(
+                version, NETWORK_CONFIG_VERSION
+            )
+        )
+    if version < NETWORK_CONFIG_VERSION:
+        return dict(public)
+
+    if str(public.get("protocol") or "") != PUBLIC_PROTOCOL:
+        raise ChainError("incompatible WQPU public protocol")
+    chain_id = normalize_chain_id(public.get("chain_id"))
+    token = normalize_address(public.get("token"))
+    registry = normalize_address(public.get("registry"))
+    market = normalize_address(public.get("market"))
+    expected_uid = compute_network_uid(chain_id, token, registry, market)
+    if str(public.get("network_uid") or "").lower() != expected_uid:
+        raise ChainError("WQPU network_uid does not match chain/contracts")
+
+    _require_http_url(public.get("rpc_url"), "rpc_url")
+    for field in ("relayer_url", "faucet_url"):
+        if public.get(field):
+            _require_http_url(public.get(field), field)
+
+    if str(public.get("llama_cpp_tag") or "") != EXPECTED_LLAMA_CPP_TAG:
+        raise ChainError("incompatible pinned llama.cpp tag")
+    try:
+        rpc_major = int(public.get("llama_rpc_protocol_major"))
+        op_count = int(public.get("llama_rpc_op_count"))
+    except Exception:
+        raise ChainError("invalid pinned llama.cpp RPC metadata")
+    if rpc_major != EXPECTED_LLAMA_RPC_PROTOCOL_MAJOR:
+        raise ChainError("incompatible llama.cpp RPC protocol major")
+    if op_count != EXPECTED_LLAMA_RPC_OP_COUNT:
+        raise ChainError("incompatible llama.cpp RPC op count")
+
+    relays = public.get("relays") or []
+    if not isinstance(relays, list):
+        raise ChainError("WQPU relays must be a list")
+    for relay in relays:
+        _validate_relay(relay)
+    return dict(public)
 
 
 def load_network_config(path=None):
@@ -87,7 +207,7 @@ def load_network_config(path=None):
     public = root.get("public") if isinstance(root, dict) else None
     if not isinstance(public, dict) or not public.get("enabled"):
         return {}
-    return dict(public)
+    return validate_network_config(root, public)
 
 
 def parse_endpoint(endpoint):

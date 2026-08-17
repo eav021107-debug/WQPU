@@ -4,6 +4,7 @@
 from __future__ import print_function
 
 import json
+import os
 import shutil
 import sys
 
@@ -11,7 +12,26 @@ import sys
 RELEASE_VERSION = "0.6.0"
 
 
+def install_public_config_compat():
+    import wqpu_chain
+    import wqpu_public_config
+    wqpu_public_config.install(wqpu_chain)
+
+
+def force_tunneled_rpc_transport():
+    """Prevent llama.cpp RPC from negotiating a direct RDMA path around WQPU.
+
+    b10456 may enable RDMA automatically when libibverbs is present. A transport proxy
+    cannot safely forward that negotiated out-of-band path, and using it would also
+    bypass WQPU TLS identity, relay routing and dual metering. An impossible device name
+    makes llama.cpp's RDMA probe fail closed so child llama/rpc processes stay on TCP
+    inside the authenticated WQPU tunnel.
+    """
+    os.environ["GGML_RDMA_DEV"] = "__wqpu_tcp_tunnel_only__"
+
+
 def doctor():
+    install_public_config_compat()
     import wqpu
     from wqpu_chain import load_network_config
     import wqpu_runtime_pin
@@ -28,6 +48,7 @@ def doctor():
         "market": network.get("market") if network else None,
         "relayer_url": network.get("relayer_url") if network else None,
         "bootstrap_relays": len((network.get("relays") or [])) if network else 0,
+        "rpc_transport": "tcp-inside-wqpu-tunnel",
     }
     print(json.dumps(checks, indent=2))
     return 0 if checks["openssl"] else 1
@@ -39,6 +60,8 @@ def main():
         print("WQPU {}".format(RELEASE_VERSION))
         return 0
 
+    install_public_config_compat()
+
     if args and args[0].lower() == "doctor":
         return doctor()
 
@@ -46,6 +69,11 @@ def main():
         import wqpu_claim
         sys.argv = [sys.argv[0]] + sys.argv[2:]
         return wqpu_claim.main()
+
+    # llama.cpp b10456 can auto-negotiate RDMA after its HELLO. WQPU must keep that
+    # stream inside its authenticated/metered relay rather than allowing an out-of-band
+    # transport to bypass the security boundary.
+    force_tunneled_rpc_transport()
 
     import wqpu
     import wqpu_runtime_pin
@@ -57,7 +85,18 @@ def main():
     import wqpu_runtime as runtime
     runtime.save_usage_receipt = wqpu_accounting.save_usage_receipt
 
+    # Public-network security is layered on only for ChainMesh. Legacy/private mode
+    # keeps the original Mesh behavior.
+    import wqpu_network_guard
+    wqpu_network_guard.install(runtime)
+
     import wqpu_autopay
+    import wqpu_multistream
+    import wqpu_public_security
+    # Real llama.cpp opens multiple RPC sockets per logical request. Aggregate only
+    # individually verified worker stream reports before comparing with requester usage.
+    wqpu_multistream.install(wqpu_autopay.AutoPayChainMesh)
+    wqpu_public_security.install(wqpu_autopay.AutoPayChainMesh)
     return wqpu_autopay.main()
 
 

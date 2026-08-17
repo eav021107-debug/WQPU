@@ -94,6 +94,31 @@ class AccountingTests(unittest.TestCase):
         changed["estimated_scalar_ops"] += 1
         self.assertFalse(wqpu_accounting.meters_match(stats, changed))
 
+    def test_non_billable_rpc_probe_difference_does_not_block_payment_match(self):
+        requester = clean_stats(999)
+        provider = dict(requester)
+        # One extra b10456 housekeeping frame: 1-byte command + 8-byte length + 4-byte payload.
+        provider["requests"] += 1
+        provider["request_bytes"] += 13
+        self.assertTrue(wqpu_accounting.meters_match(requester, provider))
+
+    def test_any_billable_or_integrity_difference_still_fails_closed(self):
+        requester = clean_stats(999)
+        for field, delta in (
+            ("graph_compute_calls", 1),
+            ("graph_payload_bytes", 1),
+            ("tensor_upload_bytes", 1),
+            ("node_executions", 1),
+            ("estimated_scalar_ops", 1),
+            ("matmul_scalar_ops", 1),
+            ("metadata_node_executions", 1),
+            ("invalid_frames", 1),
+            ("trailing_bytes", 1),
+        ):
+            provider = dict(requester)
+            provider[field] += delta
+            self.assertFalse(wqpu_accounting.meters_match(requester, provider), field)
+
     def test_receipt_uses_estimated_scalar_ops_not_node_count(self):
         stats = clean_stats(987654)
         mesh = FakeMesh(provider_stats=stats)

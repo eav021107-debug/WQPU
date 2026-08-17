@@ -94,6 +94,23 @@ async function ensureNetwork(){
  current=await ethereum.request({method:'eth_chainId'});
  if(current.toLowerCase()!==CFG.chainId.toLowerCase())throw new Error('Wallet did not switch to WQPU network.');
 }
+async function waitReceipt(txHash){
+ if(!txHash)return;
+ for(let i=0;i<80;i++){
+  const receipt=await ethereum.request({method:'eth_getTransactionReceipt',params:[txHash]});
+  if(receipt){if(BigInt(receipt.status||'0x0')!==1n)throw new Error('WQPU testnet faucet transaction failed.');return;}
+  await new Promise(resolve=>setTimeout(resolve,250));
+ }
+ throw new Error('WQPU testnet faucet confirmation timed out.');
+}
+async function ensureFaucet(account){
+ if(!CFG.faucetUrl)return;
+ statusEl.textContent='Preparing WQPU testnet funds…';
+ const r=await fetch(CFG.faucetUrl,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({wallet:account})});
+ if(!r.ok){let msg='';try{msg=(await r.json()).error||''}catch(e){}throw new Error(msg||'WQPU testnet faucet failed.');}
+ const result=await r.json();
+ for(const txHash of (result.transactions||[]))await waitReceipt(txHash);
+}
 function sessionTypedData(account){
  const s=CFG.session;
  return {types:{EIP712Domain:[{name:'name',type:'string'},{name:'version',type:'string'},{name:'chainId',type:'uint256'},{name:'verifyingContract',type:'address'}],SpendAuthorization:[{name:'requester',type:'address'},{name:'sessionKey',type:'address'},{name:'sessionId',type:'bytes32'},{name:'maxAmount',type:'uint128'},{name:'pricePerMillionUnits',type:'uint128'},{name:'validUntil',type:'uint64'}]},primaryType:'SpendAuthorization',domain:{name:'WQPU Compute Market',version:'1',chainId:Number(BigInt(CFG.chainId)),verifyingContract:s.market},message:{requester:account,sessionKey:s.sessionKey,sessionId:s.sessionId,maxAmount:String(s.maxAmount),pricePerMillionUnits:String(s.pricePerMillionUnits),validUntil:String(s.validUntil)}};
@@ -115,6 +132,7 @@ document.getElementById('connect').onclick=async()=>{
   statusEl.textContent='Requesting wallet permission…';
   const accounts=await ethereum.request({method:'eth_requestAccounts'}),account=accounts[0];
   await ensureNetwork();
+  await ensureFaucet(account);
   const chainId=await ethereum.request({method:'eth_chainId'});
   let txHash=null,sessionAuthorizationSignature=null,fundingPermitSignature=null,fundingAmount='0',fundingDeadline='0';
   if(CFG.registerNode){
@@ -142,14 +160,24 @@ document.getElementById('connect').onclick=async()=>{
 </script></body></html>'''.replace("__CFG__",cfg)
 
 
-def _network_token():
-    env=os.environ.get("WQPU_TOKEN","").strip()
-    if env:return env.lower()
+def _network_public_value(name, env_name=None):
+    env = os.environ.get(env_name or "", "").strip() if env_name else ""
+    if env:
+        return env
     try:
-        path=Path(__file__).resolve().with_name("network-config.json")
-        data=json.loads(path.read_text())
-        return str((data.get("public") or {}).get("token") or "").strip().lower()
-    except Exception:return ""
+        path = Path(__file__).resolve().with_name("network-config.json")
+        data = json.loads(path.read_text())
+        return str((data.get("public") or {}).get(name) or "").strip()
+    except Exception:
+        return ""
+
+
+def _network_token():
+    return _network_public_value("token", "WQPU_TOKEN").lower()
+
+
+def _network_faucet_url():
+    return _network_public_value("faucet_url", "WQPU_FAUCET_URL")
 
 
 def _rpc_selector(rpc_url,signature):
@@ -181,7 +209,7 @@ class WalletConnector(object):
 
     def connect(self,timeout=300,open_browser=True):
         connector=self;self.session=self._prepare_session()
-        config={"registry":self.registry,"endpoint":self.endpoint,"fingerprint":self.fingerprint,"capacity":self.capacity,"loadBps":self.load_bps,"chainId":self.chain_id,"rpcUrl":self.rpc_url,"chainName":self.chain_name,"nativeSymbol":self.native_symbol,"registerNode":self.register_node,"session":self.session,"challenge":self.challenge,"announceSelector":ANNOUNCE_SELECTOR}
+        config={"registry":self.registry,"endpoint":self.endpoint,"fingerprint":self.fingerprint,"capacity":self.capacity,"loadBps":self.load_bps,"chainId":self.chain_id,"rpcUrl":self.rpc_url,"chainName":self.chain_name,"nativeSymbol":self.native_symbol,"faucetUrl":_network_faucet_url(),"registerNode":self.register_node,"session":self.session,"challenge":self.challenge,"announceSelector":ANNOUNCE_SELECTOR}
         page=_html(config).encode("utf-8")
         class Handler(BaseHTTPRequestHandler):
             def log_message(self,fmt,*args):return
