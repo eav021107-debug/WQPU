@@ -46,6 +46,25 @@ function encodeAnnounce(endpoint,fingerprint,capacity,loadBps){
   const fp = fingerprint.replace(/^0x/,'').padStart(64,'0');
   return '0x' + CFG.announceSelector + hexPad(128) + fp + hexPad(capacity) + hexPad(loadBps) + hexPad(bytes) + padded;
 }
+async function ensureNetwork(){
+  if(!CFG.chainId) return;
+  let current = await ethereum.request({method:'eth_chainId'});
+  if(current.toLowerCase() === CFG.chainId.toLowerCase()) return;
+  try {
+    await ethereum.request({method:'wallet_switchEthereumChain',params:[{chainId:CFG.chainId}]});
+  } catch(e) {
+    const unknown = e && (e.code === 4902 || (e.data && e.data.originalError && e.data.originalError.code === 4902));
+    if(!unknown || !CFG.rpcUrl || !CFG.chainName || !CFG.nativeSymbol) throw e;
+    await ethereum.request({method:'wallet_addEthereumChain',params:[{
+      chainId:CFG.chainId,
+      chainName:CFG.chainName,
+      rpcUrls:[CFG.rpcUrl],
+      nativeCurrency:{name:CFG.nativeSymbol,symbol:CFG.nativeSymbol,decimals:18}
+    }]});
+  }
+  current = await ethereum.request({method:'eth_chainId'});
+  if(current.toLowerCase() !== CFG.chainId.toLowerCase()) throw new Error('Wallet did not switch to WQPU network.');
+}
 async function post(data){
   await fetch('/done',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)});
 }
@@ -55,10 +74,9 @@ document.getElementById('connect').onclick = async () => {
    statusEl.textContent='Requesting wallet permission…';
    const accounts = await ethereum.request({method:'eth_requestAccounts'});
    const account = accounts[0];
+   statusEl.textContent='Switching to the WQPU network…';
+   await ensureNetwork();
    const chainId = await ethereum.request({method:'eth_chainId'});
-   if(CFG.chainId && chainId.toLowerCase() !== CFG.chainId.toLowerCase()) {
-     throw new Error('Wrong network. Expected chain '+CFG.chainId+', wallet is on '+chainId);
-   }
    const message = 'WQPU node connection\n'+CFG.challenge+'\n'+CFG.endpoint+'\n'+CFG.fingerprint;
    const signature = await ethereum.request({method:'personal_sign',params:[message,account]});
    statusEl.textContent='Confirm node registration transaction in your wallet…';
@@ -74,13 +92,27 @@ document.getElementById('connect').onclick = async () => {
 
 
 class WalletConnector(object):
-    def __init__(self, registry, endpoint, fingerprint, capacity, load_bps=0, chain_id=None):
+    def __init__(
+        self,
+        registry,
+        endpoint,
+        fingerprint,
+        capacity,
+        load_bps=0,
+        chain_id=None,
+        rpc_url=None,
+        chain_name=None,
+        native_symbol=None,
+    ):
         self.registry = str(registry).lower()
         self.endpoint = str(endpoint)
         self.fingerprint = str(fingerprint).lower()
         self.capacity = int(capacity)
         self.load_bps = int(load_bps)
         self.chain_id = chain_id
+        self.rpc_url = rpc_url
+        self.chain_name = chain_name
+        self.native_symbol = native_symbol
         self.challenge = secrets.token_hex(24)
         self.result = None
         self.event = threading.Event()
@@ -94,6 +126,9 @@ class WalletConnector(object):
             "capacity": self.capacity,
             "loadBps": self.load_bps,
             "chainId": self.chain_id,
+            "rpcUrl": self.rpc_url,
+            "chainName": self.chain_name,
+            "nativeSymbol": self.native_symbol,
             "challenge": self.challenge,
             "announceSelector": ANNOUNCE_SELECTOR,
         }
@@ -167,7 +202,18 @@ class WalletConnector(object):
             server.server_close()
 
 
-def connect_wallet(registry, endpoint, fingerprint, capacity, load_bps=0, chain_id=None, timeout=180):
+def connect_wallet(
+    registry,
+    endpoint,
+    fingerprint,
+    capacity,
+    load_bps=0,
+    chain_id=None,
+    timeout=180,
+    rpc_url=None,
+    chain_name=None,
+    native_symbol=None,
+):
     return WalletConnector(
         registry=registry,
         endpoint=endpoint,
@@ -175,6 +221,9 @@ def connect_wallet(registry, endpoint, fingerprint, capacity, load_bps=0, chain_
         capacity=capacity,
         load_bps=load_bps,
         chain_id=chain_id,
+        rpc_url=rpc_url,
+        chain_name=chain_name,
+        native_symbol=native_symbol,
     ).connect(timeout=timeout)
 
 
@@ -185,4 +234,12 @@ if __name__ == "__main__":
     capacity = int(os.environ.get("WQPU_CAPACITY", "1"))
     if not registry or not endpoint or not fingerprint:
         raise SystemExit("set WQPU_REGISTRY, WQPU_PUBLIC_ENDPOINT and WQPU_TLS_FINGERPRINT")
-    print(json.dumps(connect_wallet(registry, endpoint, fingerprint, capacity), indent=2))
+    print(json.dumps(connect_wallet(
+        registry,
+        endpoint,
+        fingerprint,
+        capacity,
+        rpc_url=os.environ.get("WQPU_RPC_URL"),
+        chain_name=os.environ.get("WQPU_CHAIN_NAME"),
+        native_symbol=os.environ.get("WQPU_NATIVE_SYMBOL"),
+    ), indent=2))
