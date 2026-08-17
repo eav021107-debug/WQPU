@@ -55,9 +55,6 @@ jobs:
       - name: Start complete testnet stack
         shell: bash
         run: |
-          # GitHub Actions kills processes carrying this step-specific marker when the
-          # step exits. Remove it only for the operator stack children so status can be
-          # tested from a later step exactly like an operator would use it.
           unset RUNNER_TRACKING_ID
           python scripts/testnet_stack.py start \
             --public-host 127.0.0.1 \
@@ -92,6 +89,33 @@ jobs:
           BALANCE=$(cast balance "$WALLET" --rpc-url http://127.0.0.1:18545)
           echo "funded balance=$BALANCE"
           test "$BALANCE" != "0"
+          REGISTRY=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["registry"])')
+          printf '%s\n' "$REGISTRY" > /tmp/wqpu-registry-before
+          printf '%s\n' "$BALANCE" > /tmp/wqpu-balance-before
+      - name: Stop and resume the same chain
+        shell: bash
+        run: |
+          python scripts/testnet_stack.py stop
+          test -s .wqpu-testnet/anvil-state.json
+          test -s .wqpu-testnet/deployment.json
+          test -s .wqpu-testnet/operator.json
+          unset RUNNER_TRACKING_ID
+          python scripts/testnet_stack.py start \
+            --public-host 127.0.0.1 \
+            --internal-rpc-port 28546 \
+            --rpc-port 18545 \
+            --relayer-port 18787 \
+            --relay-port 17443
+          python scripts/testnet_stack.py status
+          BEFORE_REGISTRY=$(cat /tmp/wqpu-registry-before)
+          AFTER_REGISTRY=$(curl -fsS http://127.0.0.1:18787/network-config.json | python -c 'import json,sys; print(json.load(sys.stdin)["public"]["registry"])')
+          echo "registry before=$BEFORE_REGISTRY after=$AFTER_REGISTRY"
+          test "$BEFORE_REGISTRY" = "$AFTER_REGISTRY"
+          BEFORE_BALANCE=$(cat /tmp/wqpu-balance-before)
+          AFTER_BALANCE=$(cast balance 0x1111111111111111111111111111111111111111 --rpc-url http://127.0.0.1:18545)
+          echo "balance before=$BEFORE_BALANCE after=$AFTER_BALANCE"
+          test "$BEFORE_BALANCE" = "$AFTER_BALANCE"
+          python -c 'import json; s=json.load(open(".wqpu-testnet/state.json")); assert s["resumed"] is True; assert s["persistent"] is True'
       - name: Stop testnet stack
         if: always()
         run: |
