@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
-"""Heavy E2E: real pinned llama.cpp inference through authenticated WQPU relay.
+"""Heavy E2E: real pinned llama.cpp inference, metering and payment through WQPU.
 
 This intentionally uses a real ggml-rpc-server and llama-server rather than synthetic RPC
 frames. The test succeeds only when the remote worker participates in real graph compute,
-the requester/worker meters agree, the worker signs its report with its registered TLS
-identity, and llama-server returns an actual chat completion.
+the requester/worker billing meters agree, the worker signs its report with its registered
+TLS identity, a bounded session voucher is derived from those measured units, and the gas
+relayer pays the same worker wallet.
 """
 from __future__ import print_function
 
 import asyncio
 import json
 import os
+import secrets
 import subprocess
 import sys
 import time
@@ -28,17 +30,21 @@ import wqpu_accounting  # noqa: E402
 import wqpu_attestation  # noqa: E402
 import wqpu_autopay  # noqa: E402
 import wqpu_chain  # noqa: E402
+import wqpu_claim  # noqa: E402
 import wqpu_multistream  # noqa: E402
 import wqpu_network_guard  # noqa: E402
+import wqpu_payments  # noqa: E402
 import wqpu_public_config  # noqa: E402
 import wqpu_public_security  # noqa: E402
 import wqpu_runtime as runtime  # noqa: E402
 import wqpu_runtime_pin  # noqa: E402
+import wqpu_session  # noqa: E402
 from wqpu_chain import RegistryClient  # noqa: E402
 
 STACK = ROOT / ".wqpu-testnet"
 REAL_HOME = STACK / "real-inference-e2e"
 MODEL = os.environ.get("WQPU_REAL_MODEL", "ggml-org/gemma-3-1b-it-GGUF:Q4_K_M")
+PRICE_UNITS = 1_000_000
 
 
 def start_process(command, logfile):
@@ -121,6 +127,101 @@ def chat(port):
         return json.load(response)
 
 
+def activate_payment_for_units(chain, config, operator_key, requester_wallet, requester_wallet_pem, units):
+    """Create exactly-bounded testnet escrow/session after real work is measured.
+
+    The requester EVM key is used only to sign permit + bounded spend authorization.
+    Funding and activation transactions are submitted by the configured gas relayer.
+    """
+    token = str(config["token"]).lower()
+    market = str(config["market"]).lower()
+    price = int(chain.global_price())
+    amount = (int(units) * price) // PRICE_UNITS
+    if amount <= 0:
+        raise RuntimeError("real measured work prices to zero")
+
+    common.run([
+        "cast", "send", token, "transfer(address,uint256)",
+        requester_wallet, str(amount),
+        "--rpc-url", chain.rpc_url, "--private-key", operator_key,
+    ])
+
+    block = chain.rpc("eth_getBlockByNumber", ["latest", False])
+    now = int(block["timestamp"], 16)
+    valid_until = now + 3600
+    permit_raw = wqpu_session.sign_digest(
+        common.permit_digest(chain, token, requester_wallet, market, amount, valid_until),
+        requester_wallet_pem,
+    )
+    funding = common._recoverable_package(
+        permit_raw,
+        lambda signature: {
+            "market": market,
+            "requester": requester_wallet,
+            "amount": amount,
+            "deadline": valid_until,
+            "permit_signature": signature,
+        },
+        wqpu_claim.simulate_funding,
+        chain,
+        "real-inference permit",
+    )
+    funding_tx = wqpu_claim.relay_funding(chain, funding)
+    wqpu_claim.wait_receipt(chain, funding_tx, 120)
+
+    session_pem = common.CLIENTS / "requester" / "session.pem"
+    wqpu_session.ensure_session_key(session_pem)
+    wqpu_session.SESSION_KEY = session_pem
+    wqpu_session.SESSION_STATE = common.CLIENTS / "requester" / "session.json"
+    wqpu_payments.PAYMENT_STATE = common.CLIENTS / "requester" / "payments.json"
+    session_key = wqpu_session.session_address(chain, session_pem).lower()
+    session_id = "0x" + secrets.token_hex(32)
+    auth_raw = wqpu_session.sign_digest(
+        wqpu_session.spend_authorization_digest(
+            chain, market, requester_wallet, session_key, session_id,
+            amount, price, valid_until,
+        ),
+        requester_wallet_pem,
+    )
+    activation = common._recoverable_package(
+        auth_raw,
+        lambda signature: {
+            "market": market,
+            "requester": requester_wallet,
+            "session_key": session_key,
+            "session_id": session_id,
+            "max_amount": amount,
+            "price_per_million_units": price,
+            "valid_until": valid_until,
+            "authorization_signature": signature,
+        },
+        wqpu_claim.simulate_activation,
+        chain,
+        "real-inference spend authorization",
+    )
+    activation_tx = wqpu_claim.relay_activation(chain, activation)
+    wqpu_claim.wait_receipt(chain, activation_tx, 120)
+
+    session = {
+        "requester": requester_wallet,
+        "session_key": session_key,
+        "session_id": session_id,
+        "max_amount": amount,
+        "price_per_million_units": price,
+        "valid_until": valid_until,
+        "market": market,
+        "chain_id": chain.chain_id(),
+        "authorization_signature": activation["authorization_signature"],
+        "funding_tx": funding_tx,
+        "activation_tx": activation_tx,
+    }
+    wqpu_session.save_session(session)
+    active = wqpu_session.active_session(chain, market, requester_wallet, session_id)
+    if not active.get("active") or int(active.get("reserved_remaining") or 0) != amount:
+        raise RuntimeError("real-inference bounded payment session was not activated")
+    return session, amount
+
+
 async def check():
     if REAL_HOME.exists():
         import shutil
@@ -129,6 +230,7 @@ async def check():
     common.CLIENTS = REAL_HOME / "identities"
 
     state = json.loads((STACK / "state.json").read_text())
+    operator = json.loads((STACK / "operator.json").read_text())
     raw_config = json.loads((STACK / "network-config.json").read_text())
     config = wqpu_public_config.normalize_public(
         wqpu_chain, raw_config, raw_config["public"]
@@ -136,8 +238,15 @@ async def check():
     wqpu_chain.validate_network_config(raw_config, config)
     rpc_url = str(state["internal_rpc"])
     registry = str(config["registry"]).lower()
+    token = str(config["token"]).lower()
 
-    requester_key = common.private_key()
+    # Isolate the bounded requester session before AutoPay meshes are constructed.
+    wqpu_session.SESSION_STATE = common.CLIENTS / "requester" / "session.json"
+    wqpu_session.SESSION_KEY = common.CLIENTS / "requester" / "session.pem"
+    wqpu_payments.PAYMENT_STATE = common.CLIENTS / "requester" / "payments.json"
+
+    requester_wallet_pem = common.make_wallet_pem("requester")
+    requester_key = common.private_key_from_pem(requester_wallet_pem)
     worker_key = common.private_key()
     requester_wallet = common.wallet_address(requester_key)
     worker_wallet = common.wallet_address(worker_key)
@@ -155,8 +264,6 @@ async def check():
         raise RuntimeError("real inference identities were not registered")
 
     wqpu_network_guard.install(runtime)
-    # Match the real wqpu_entry.py layering: first aggregate only reports already
-    # accepted by AutoPay's TLS/Registry receiver, then add public transport security.
     wqpu_multistream.install(wqpu_autopay.AutoPayChainMesh)
     wqpu_public_security.install(wqpu_autopay.AutoPayChainMesh)
     relay_peer = dict(config["relays"][0])
@@ -185,6 +292,7 @@ async def check():
         raise RuntimeError("real inference did not use pinned llama.cpp b10456")
 
     old_rpc_port = wqpu.RPC_PORT
+    old_auto_vouchers = os.environ.get("WQPU_AUTO_VOUCHERS")
     worker_port = wqpu.free_port()
     wqpu.RPC_PORT = worker_port
     rpc_proc = start_process([
@@ -236,8 +344,9 @@ async def check():
             raise RuntimeError("real llama-server returned no assistant content")
 
         # Stopping llama-server closes every physical RPC socket. Finalize the requester
-        # aggregate first; the multistream layer then waits until the independently
-        # verified worker stream reports add up to exactly this same logical request.
+        # aggregate first; multistream then waits until verified worker stream reports add
+        # up to billing-equivalent compute. Non-billable 13-byte housekeeping probes are
+        # diagnostic only and cannot affect voucher units.
         stop_process(llama_proc)
         llama_proc = None
         await wqpu.close_server(proxy)
@@ -253,7 +362,7 @@ async def check():
         worker_stats = report.get("rpc") or {}
         if not matched:
             raise RuntimeError(
-                "verified worker multistream aggregate did not match requester: requester={} worker={}".format(
+                "verified worker multistream aggregate did not match billable compute: requester={} worker={}".format(
                     json.dumps(requester_stats, sort_keys=True),
                     json.dumps(worker_stats, sort_keys=True),
                 )
@@ -263,7 +372,7 @@ async def check():
         if not wqpu_accounting.meter_is_eligible(worker_stats):
             raise RuntimeError("worker meter rejected the real pinned llama.cpp stream")
         if not wqpu_accounting.meters_match(requester_stats, worker_stats):
-            raise RuntimeError("real requester/worker llama.cpp meters disagreed")
+            raise RuntimeError("real requester/worker billable-compute meters disagreed")
         graph_commands = int(requester_stats.get("graph_compute_calls") or 0) + int(
             requester_stats.get("graph_recompute_calls") or 0
         )
@@ -275,15 +384,71 @@ async def check():
         if str(report.get("provider_wallet") or "").lower() != worker_wallet:
             raise RuntimeError("real worker report claimed the wrong provider wallet")
 
+        # Now bind the *same real measured units* to a bounded requester authorization.
+        session, expected_amount = activate_payment_for_units(
+            chain, config, str(operator["private_key"]), requester_wallet,
+            requester_wallet_pem, scalar_ops,
+        )
+        os.environ["WQPU_AUTO_VOUCHERS"] = "1"
+        receipt, _ = wqpu_accounting.save_usage_receipt(requester, snapshot)
+        rows = [row for row in (receipt.get("workers") or []) if row.get("node_id") == worker.me]
+        if len(rows) != 1:
+            raise RuntimeError("real measured worker did not produce exactly one receipt row")
+        row = rows[0]
+        voucher = row.get("voucher")
+        if not row.get("dual_meter_match") or not voucher:
+            raise RuntimeError("real matched compute did not issue voucher: {}".format(
+                row.get("voucher_error") or receipt.get("payment_error") or "unknown error"
+            ))
+        if str(voucher.get("provider") or "").lower() != worker_wallet:
+            raise RuntimeError("real compute voucher targets wrong provider wallet")
+        if int(voucher.get("cumulative_units") or 0) != scalar_ops:
+            raise RuntimeError("real compute voucher units differ from measured scalar ops")
+        if int(voucher.get("cumulative_amount") or 0) != expected_amount:
+            raise RuntimeError("real compute voucher amount differs from global price formula")
+
+        delivered = await requester.send_payment_voucher(worker.me, voucher)
+        if not delivered:
+            raise RuntimeError("real compute voucher was not delivered through relay")
+        await asyncio.sleep(0.1)
+
+        before = common.balance_of(chain, token, worker_wallet)
+        claim_tx = wqpu_claim.relay(chain, voucher)
+        wqpu_claim.wait_receipt(chain, claim_tx, 120)
+        after = common.balance_of(chain, token, worker_wallet)
+        if after - before != expected_amount:
+            raise RuntimeError("real worker received {}, expected {} WQPU wei".format(
+                after - before, expected_amount
+            ))
+        try:
+            wqpu_claim.simulate_claim(chain, voucher)
+        except Exception:
+            replay_blocked = True
+        else:
+            replay_blocked = False
+        if not replay_blocked:
+            raise RuntimeError("real compute voucher remained replayable after claim")
+
+        active = wqpu_session.active_session(
+            chain, session["market"], requester_wallet, session["session_id"]
+        )
+        if int(active.get("reserved_remaining") or 0) != 0:
+            raise RuntimeError("exact real-compute reservation was not fully consumed")
+
         usage = result.get("usage") or {}
-        print("WQPU REAL LLAMA INFERENCE E2E OK")
-        print("model={} llama_tag={} worker={} verified_streams={} graph_commands={} scalar_ops={} completion_tokens={}".format(
-            MODEL, tag, worker_wallet, int(report.get("verified_stream_count") or 1), graph_commands, scalar_ops,
-            usage.get("completion_tokens", "?"),
+        print("WQPU REAL LLAMA MEASURED-PAYMENT E2E OK")
+        print("model={} llama_tag={} requester={} worker={} verified_streams={} graph_commands={} scalar_ops={} paid_wei={} completion_tokens={}".format(
+            MODEL, tag, requester_wallet, worker_wallet,
+            int(report.get("verified_stream_count") or 1), graph_commands, scalar_ops,
+            expected_amount, usage.get("completion_tokens", "?"),
         ))
         print("assistant={}".format(content.replace("\n", " ")[:160]))
     finally:
         requester.current_request_id = None
+        if old_auto_vouchers is None:
+            os.environ.pop("WQPU_AUTO_VOUCHERS", None)
+        else:
+            os.environ["WQPU_AUTO_VOUCHERS"] = old_auto_vouchers
         if proxy:
             await wqpu.close_server(proxy)
         stop_process(llama_proc)
