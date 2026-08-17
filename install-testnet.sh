@@ -5,7 +5,9 @@ REPO="${WQPU_OPERATOR_REPO:-eav021107-debug/WQPU}"
 REF="${WQPU_OPERATOR_REF:-main}"
 ROOT="${WQPU_OPERATOR_ROOT:-${HOME}/.local/share/wqpu-operator}"
 BIN="${HOME}/.local/bin"
-ARCHIVE_URL="${WQPU_OPERATOR_ARCHIVE_URL:-https://api.github.com/repos/${REPO}/tarball/${REF}}"
+ARCHIVE_URL="${WQPU_OPERATOR_ARCHIVE_URL:-}"
+CODELOAD_URL="https://codeload.github.com/${REPO}/tar.gz/${REF}"
+API_ARCHIVE_URL="https://api.github.com/repos/${REPO}/tarball/${REF}"
 
 need() { command -v "$1" >/dev/null 2>&1; }
 python_ok() { "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,8) else 1)' >/dev/null 2>&1; }
@@ -60,6 +62,18 @@ install_foundry() {
   need anvil && need forge && need cast || { echo "WQPU operator: Foundry tools are unavailable after install." >&2; exit 1; }
 }
 
+download_source_archive() {
+  dest="$1"
+  if [ -n "$ARCHIVE_URL" ]; then
+    curl -fsSL --retry 3 --retry-all-errors "$ARCHIVE_URL" -o "$dest" && return 0
+    echo "WQPU operator: configured archive URL failed; trying GitHub mirrors..." >&2
+  fi
+  # Codeload serves immutable commit/ref archives without the GitHub REST API. Keep the
+  # API tarball only as a secondary route so a Releases/API outage does not block install.
+  curl -fsSL --retry 3 --retry-all-errors "$CODELOAD_URL" -o "$dest" && return 0
+  curl -fsSL --retry 3 --retry-all-errors -H 'Accept: application/vnd.github+json' "$API_ARCHIVE_URL" -o "$dest"
+}
+
 install_base_tools
 need curl && need tar && need openssl || { echo "WQPU operator prerequisites are unavailable." >&2; exit 1; }
 PYTHON="$(find_python || true)"
@@ -78,7 +92,7 @@ cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT INT TERM
 
 echo "WQPU operator: downloading source ref ${REF}..."
-curl -fsSL --retry 3 -H 'Accept: application/vnd.github+json' "$ARCHIVE_URL" -o "$TMP/wqpu.tar.gz"
+download_source_archive "$TMP/wqpu.tar.gz"
 tar -xzf "$TMP/wqpu.tar.gz" -C "$TMP"
 SRC="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 [ -n "$SRC" ] && [ -f "$SRC/scripts/testnet_stack.py" ] || { echo "WQPU operator archive is invalid." >&2; exit 1; }
