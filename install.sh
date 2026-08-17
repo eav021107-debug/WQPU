@@ -1,17 +1,15 @@
 #!/usr/bin/env sh
 set -eu
 
-RAW="https://raw.githubusercontent.com/eav021107-debug/WQPU/main"
+RAW="${WQPU_RAW_BASE:-https://raw.githubusercontent.com/eav021107-debug/WQPU/main}"
 ROOT="${HOME}/.local/share/wqpu"
 BIN="${HOME}/.local/bin"
 JOIN="${WQPU_JOIN:-${1:-}}"
-MIN_MAJOR=3
-MIN_MINOR=6
-FALLBACK_PY="3.8.20"
-EXPECTED_WQPU="WQPU 0.5.3"
-CORE_CACHE_BUSTER="ttyfix-0.5.3-r2"
+EXPECTED_WQPU="WQPU 0.6.0-dev"
+CACHE_BUSTER="chain-0.6.0-dev-r1"
 
 need() { command -v "$1" >/dev/null 2>&1; }
+python_ok() { "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,6) else 1)' >/dev/null 2>&1; }
 
 if [ "$(id -u)" = "0" ]; then
   SUDO=""
@@ -21,17 +19,23 @@ else
   SUDO=""
 fi
 
-python_ok() {
-  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3,6) else 1)' >/dev/null 2>&1
+install_base_tools() {
+  if need curl && need openssl; then return 0; fi
+  if need apt-get; then
+    $SUDO apt-get update
+    $SUDO apt-get install -y curl ca-certificates openssl >/dev/null 2>&1 || true
+  elif need dnf; then
+    $SUDO dnf install -y curl ca-certificates openssl >/dev/null 2>&1 || true
+  elif need yum; then
+    $SUDO yum install -y curl ca-certificates openssl >/dev/null 2>&1 || true
+  elif need brew; then
+    need curl || brew install curl >/dev/null 2>&1 || true
+    need openssl || brew install openssl >/dev/null 2>&1 || true
+  fi
 }
 
 find_python() {
-  for p in \
-    python3.14 python3.13 python3.12 python3.11 python3.10 \
-    python3.9 python3.8 python3.7 python3.6 \
-    python314 python313 python312 python311 python310 \
-    python39 python38 python37 python36 python3
-  do
+  for p in python3.14 python3.13 python3.12 python3.11 python3.10 python3.9 python3.8 python3.7 python3.6 python3; do
     if need "$p" && python_ok "$p"; then
       command -v "$p"
       return 0
@@ -40,157 +44,60 @@ find_python() {
   return 1
 }
 
-install_base_tools() {
-  if need curl && need openssl; then
-    return 0
-  fi
-
+install_python() {
   if need apt-get; then
     $SUDO apt-get update
-    need curl || $SUDO apt-get install -y curl ca-certificates >/dev/null 2>&1 || true
-    need openssl || $SUDO apt-get install -y openssl >/dev/null 2>&1 || true
+    $SUDO apt-get install -y python3 >/dev/null 2>&1 || true
   elif need dnf; then
-    need curl || $SUDO dnf install -y curl ca-certificates >/dev/null 2>&1 || true
-    need openssl || $SUDO dnf install -y openssl >/dev/null 2>&1 || true
+    $SUDO dnf install -y python3 >/dev/null 2>&1 || true
   elif need yum; then
-    need curl || $SUDO yum install -y curl ca-certificates >/dev/null 2>&1 || true
-    need openssl || $SUDO yum install -y openssl >/dev/null 2>&1 || true
-  elif need brew; then
-    need curl || brew install curl >/dev/null 2>&1 || true
-    need openssl || brew install openssl >/dev/null 2>&1 || true
-  fi
-}
-
-install_packaged_python() {
-  if need apt-get; then
-    $SUDO apt-get update
-    for pkg in python3.13 python3.12 python3.11 python3.10 python3.9 python3.8 python3.7 python3.6 python3; do
-      $SUDO apt-get install -y "$pkg" >/dev/null 2>&1 || true
-      PYTHON="$(find_python || true)"
-      [ -n "$PYTHON" ] && return 0
-    done
-  elif need dnf; then
-    $SUDO dnf install -y epel-release >/dev/null 2>&1 || true
-    for pkg in python3.13 python3.12 python3.11 python3.10 python3.9 python3.8 python39 python38 python37 python36 python3; do
-      $SUDO dnf install -y "$pkg" >/dev/null 2>&1 || true
-      PYTHON="$(find_python || true)"
-      [ -n "$PYTHON" ] && return 0
-    done
-  elif need yum; then
-    $SUDO yum install -y epel-release >/dev/null 2>&1 || true
-    for pkg in python3.13 python3.12 python3.11 python3.10 python3.9 python3.8 python39 python38 python37 python36 python3; do
-      $SUDO yum install -y "$pkg" >/dev/null 2>&1 || true
-      PYTHON="$(find_python || true)"
-      [ -n "$PYTHON" ] && return 0
-    done
+    $SUDO yum install -y python3 >/dev/null 2>&1 || true
   elif need brew; then
     brew install python >/dev/null 2>&1 || true
-    PYTHON="$(find_python || true)"
-    [ -n "$PYTHON" ] && return 0
   fi
-  return 1
-}
-
-build_private_python() {
-  echo "WQPU: system Python is too old; installing a private Python ${FALLBACK_PY} for WQPU only..."
-
-  if need apt-get; then
-    $SUDO apt-get update
-    $SUDO apt-get install -y \
-      build-essential curl ca-certificates \
-      libssl-dev zlib1g-dev libbz2-dev libreadline-dev \
-      libsqlite3-dev libffi-dev liblzma-dev >/dev/null 2>&1 || return 1
-  elif need dnf; then
-    $SUDO dnf groupinstall -y "Development Tools" >/dev/null 2>&1 || true
-    $SUDO dnf install -y \
-      gcc make curl ca-certificates openssl-devel zlib-devel bzip2-devel \
-      readline-devel sqlite-devel libffi-devel xz-devel >/dev/null 2>&1 || return 1
-  elif need yum; then
-    $SUDO yum groupinstall -y "Development Tools" >/dev/null 2>&1 || true
-    $SUDO yum install -y \
-      gcc make curl ca-certificates openssl-devel zlib-devel bzip2-devel \
-      readline-devel sqlite-devel libffi-devel xz-devel >/dev/null 2>&1 || return 1
-  elif need brew; then
-    brew install python >/dev/null 2>&1 || return 1
-    PYTHON="$(find_python || true)"
-    [ -n "$PYTHON" ] && return 0
-    return 1
-  else
-    return 1
-  fi
-
-  SRC="/tmp/wqpu-python-${FALLBACK_PY}"
-  TGZ="/tmp/Python-${FALLBACK_PY}.tgz"
-  PREFIX="${ROOT}/python"
-
-  rm -rf "$SRC" "$TGZ"
-  mkdir -p "$SRC" "$ROOT"
-  curl -fL --retry 3 \
-    "https://www.python.org/ftp/python/${FALLBACK_PY}/Python-${FALLBACK_PY}.tgz" \
-    -o "$TGZ"
-  tar -xzf "$TGZ" -C "$SRC" --strip-components=1
-  cd "$SRC"
-  ./configure --prefix="$PREFIX" --with-ensurepip=no >/dev/null
-  JOBS="$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)"
-  [ "$JOBS" -gt 2 ] 2>/dev/null && JOBS=2
-  make -j"$JOBS" >/dev/null
-  make install >/dev/null
-  cd /
-  rm -rf "$SRC" "$TGZ"
-
-  PYTHON="${PREFIX}/bin/python3"
-  python_ok "$PYTHON"
 }
 
 install_base_tools
-
-if ! need curl; then
-  echo "WQPU could not install curl." >&2
-  exit 1
-fi
-if ! need openssl; then
-  echo "WQPU could not install openssl." >&2
-  exit 1
-fi
+need curl || { echo "WQPU could not install curl." >&2; exit 1; }
+need openssl || { echo "WQPU could not install OpenSSL." >&2; exit 1; }
 
 PYTHON="$(find_python || true)"
 if [ -z "$PYTHON" ]; then
-  echo "WQPU: no compatible Python found; trying system packages..."
-  install_packaged_python || true
+  echo "WQPU: installing Python..."
+  install_python
   PYTHON="$(find_python || true)"
 fi
-
 if [ -z "$PYTHON" ]; then
-  build_private_python || {
-    CURRENT="$(python3 --version 2>&1 || true)"
-    echo "WQPU could not prepare a compatible Python. Current: ${CURRENT:-none}" >&2
-    exit 1
-  }
+  echo "WQPU needs Python 3.6 or newer." >&2
+  exit 1
 fi
 
 mkdir -p "$ROOT" "$BIN"
 
-echo "WQPU: downloading fresh core..."
-curl -fsSL --retry 3 \
-  "${RAW}/wqpu.py?installer=${CORE_CACHE_BUSTER}" \
-  -o "$ROOT/wqpu.py"
-chmod 755 "$ROOT/wqpu.py"
+echo "WQPU: downloading runtime..."
+for file in wqpu.py wqpu_chain.py wqpu_wallet.py wqpu_runtime.py; do
+  curl -fsSL --retry 3 "${RAW}/${file}?installer=${CACHE_BUSTER}" -o "$ROOT/$file"
+done
+chmod 755 "$ROOT/wqpu.py" "$ROOT/wqpu_chain.py" "$ROOT/wqpu_wallet.py" "$ROOT/wqpu_runtime.py"
 
-"$PYTHON" -m py_compile "$ROOT/wqpu.py" || {
-  echo "WQPU downloaded correctly, but this Python cannot run it: $($PYTHON --version 2>&1)" >&2
-  exit 1
-}
+"$PYTHON" -m py_compile \
+  "$ROOT/wqpu.py" \
+  "$ROOT/wqpu_chain.py" \
+  "$ROOT/wqpu_wallet.py" \
+  "$ROOT/wqpu_runtime.py" || {
+    echo "WQPU files were downloaded but did not pass the Python compatibility check." >&2
+    exit 1
+  }
 
-CORE_VERSION="$("$PYTHON" "$ROOT/wqpu.py" --version 2>&1 || true)"
+CORE_VERSION="$("$PYTHON" "$ROOT/wqpu_runtime.py" --version 2>&1 || true)"
 if [ "$CORE_VERSION" != "$EXPECTED_WQPU" ]; then
-  echo "WQPU core version mismatch: expected '$EXPECTED_WQPU', got '${CORE_VERSION:-unknown}'." >&2
-  echo "Refusing to start a stale cached core." >&2
+  echo "WQPU version mismatch: expected '$EXPECTED_WQPU', got '${CORE_VERSION:-unknown}'." >&2
   exit 1
 fi
 
 cat > "$BIN/wqpu" <<EOF
 #!/usr/bin/env sh
-exec "$PYTHON" "$ROOT/wqpu.py" "\$@"
+exec "$PYTHON" "$ROOT/wqpu_runtime.py" "\$@"
 EOF
 chmod 755 "$BIN/wqpu"
 export PATH="$BIN:$PATH"
@@ -204,8 +111,7 @@ if [ -n "$rc" ]; then
   grep -F '$HOME/.local/bin' "$rc" >/dev/null 2>&1 || printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$rc"
 fi
 
-echo "WQPU installed: $CORE_VERSION with $($PYTHON --version 2>&1). Starting this computer as an equal peer..."
-
+echo "WQPU installed: $CORE_VERSION with $($PYTHON --version 2>&1)."
 if [ -n "$JOIN" ]; then
   exec "$BIN/wqpu" --join "$JOIN"
 else
