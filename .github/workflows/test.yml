@@ -19,8 +19,8 @@ jobs:
         run: >-
           python -m py_compile
           wqpu.py wqpu_chain.py wqpu_wallet.py wqpu_session.py
-          wqpu_meter.py wqpu_payments.py wqpu_claim.py wqpu_vouchers.py
-          wqpu_runtime.py wqpu_autopay.py wqpu_entry.py wqpu_relayer.py
+          wqpu_meter.py wqpu_accounting.py wqpu_payments.py wqpu_claim.py wqpu_vouchers.py
+          wqpu_runtime.py wqpu_autopay.py wqpu_runtime_pin.py wqpu_entry.py wqpu_relayer.py
           scripts/devnet.py scripts/check_devnet.py scripts/check_session_payment.py
           scripts/check_nat_relay.py
       - name: Unit tests
@@ -33,6 +33,12 @@ jobs:
         run: python wqpu_entry.py claim
       - name: Validate published network JSON
         run: python -c "import json; json.load(open('network-config.json'))"
+      - name: Validate pinned llama.cpp protocol
+        run: >-
+          python -c "import json; p=json.load(open('network-config.json'))['public'];
+          assert p['llama_cpp_tag']=='b10456';
+          assert p['llama_rpc_protocol_major']==5;
+          assert p['llama_rpc_op_count']==101"
 
   installer-linux:
     runs-on: ubuntu-latest
