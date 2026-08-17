@@ -4,7 +4,7 @@ $root = Join-Path $env:LOCALAPPDATA 'WQPU'
 $bin = Join-Path $root 'bin'
 $join = $env:WQPU_JOIN
 $expectedWqpu = 'WQPU 0.6.0-dev'
-$cacheBuster = 'chain-0.6.0-dev-r1'
+$cacheBuster = 'chain-0.6.0-dev-r2'
 $chainState = Join-Path $HOME '.wqpu\chain.json'
 
 New-Item -ItemType Directory -Force -Path $root,$bin | Out-Null
@@ -69,7 +69,8 @@ if (-not (Get-Command openssl -ErrorAction SilentlyContinue)) {
 }
 
 Write-Host 'WQPU: downloading runtime...'
-$files = @('wqpu.py','wqpu_chain.py','wqpu_wallet.py','wqpu_runtime.py')
+$pythonFiles = @('wqpu.py','wqpu_chain.py','wqpu_wallet.py','wqpu_runtime.py')
+$files = $pythonFiles + @('network-config.json')
 foreach ($file in $files) {
   Invoke-WebRequest -UseBasicParsing "$raw/$file`?installer=$cacheBuster" -OutFile (Join-Path $root $file)
 }
@@ -79,9 +80,17 @@ $extra = $py.Extra
 $compileArgs = @()
 if ($extra) { $compileArgs += $extra }
 $compileArgs += @('-m','py_compile')
-foreach ($file in $files) { $compileArgs += (Join-Path $root $file) }
+foreach ($file in $pythonFiles) { $compileArgs += (Join-Path $root $file) }
 & $exe @compileArgs
 if ($LASTEXITCODE -ne 0) { throw 'Downloaded WQPU runtime did not pass the Python compatibility check.' }
+
+$configPath = Join-Path $root 'network-config.json'
+try {
+  $networkConfig = Get-Content -Raw $configPath | ConvertFrom-Json
+} catch {
+  throw 'Downloaded WQPU network configuration is invalid.'
+}
+$publicEnabled = [bool]$networkConfig.public.enabled
 
 $runtime = Join-Path $root 'wqpu_runtime.py'
 $versionArgs = @()
@@ -109,9 +118,9 @@ $ver = if ($extra) { (& $exe $extra --version 2>&1) } else { (& $exe --version 2
 Write-Host "WQPU installed: $coreVersion with $ver." -ForegroundColor Green
 if (-not [string]::IsNullOrWhiteSpace($join)) {
   & $launcher --join $join
-} elseif (($env:WQPU_RPC_URL -and $env:WQPU_REGISTRY) -or (Test-Path $chainState)) {
+} elseif (($env:WQPU_RPC_URL -and $env:WQPU_REGISTRY) -or (Test-Path $chainState) -or $publicEnabled) {
   & $launcher
 } else {
-  Write-Host 'WQPU public chain is not configured yet; starting the existing private mesh.'
+  Write-Host 'WQPU public chain is not published yet; starting the existing private mesh.'
   & $launcher --legacy
 }
