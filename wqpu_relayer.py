@@ -141,9 +141,11 @@ class Relayer(object):
     def _cast_send(self, to, data="0x", value=0):
         if not shutil.which("cast"):
             raise RelayerError("cast is required for private-key relayer mode")
-        cmd = [
-            "cast", "send", normalize_address(to),
-            "--data", str(data),
+        cmd = ["cast", "send", normalize_address(to)]
+        if data and str(data) != "0x":
+            # Current Cast accepts raw encoded calldata as the positional SIG argument.
+            cmd.append(str(data))
+        cmd += [
             "--rpc-url", self.client.rpc_url,
             "--private-key", self.private_key,
             "--json",
