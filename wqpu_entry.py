@@ -12,6 +12,12 @@ def main():
         sys.argv = [sys.argv[0]] + sys.argv[2:]
         return wqpu_claim.main()
 
+    # Freeze the ggml RPC wire format for every WQPU node. Public and legacy modes both
+    # go through this entrypoint, so they cannot silently drift to different upstream builds.
+    import wqpu
+    import wqpu_runtime_pin
+    wqpu.ensure_runtime = wqpu_runtime_pin.ensure_runtime
+
     import wqpu_autopay
     return wqpu_autopay.main()
 
