@@ -121,6 +121,13 @@ class RegistryClient(object):
             raise ChainError("RPC error: {}".format(body["error"]))
         return body.get("result")
 
+    def chain_id(self):
+        value = self.rpc("eth_chainId", [])
+        if not isinstance(value, str) or not value.startswith("0x"):
+            raise ChainError("bad eth_chainId result")
+        int(value, 16)
+        return value.lower()
+
     def eth_call(self, data):
         result = self.rpc("eth_call", [{"to": self.registry, "data": "0x" + data}, "latest"])
         if not isinstance(result, str) or not result.startswith("0x"):
@@ -170,6 +177,18 @@ class RegistryClient(object):
             "active": active,
         }
 
+    def find_wallet(self, wallet, max_nodes=512):
+        target = normalize_address(wallet)
+        count = min(self.member_count(), int(max_nodes))
+        for index in range(count):
+            try:
+                node = self.member_at(index)
+            except Exception:
+                continue
+            if node["wallet"] == target:
+                return node
+        return None
+
     def discover(self, exclude_wallet=None, max_nodes=512, max_age=180):
         exclude = normalize_address(exclude_wallet) if exclude_wallet else None
         count = min(self.member_count(), int(max_nodes))
@@ -194,7 +213,6 @@ class RegistryClient(object):
                 continue
             nodes.append(node)
 
-        # Fastest first: low utilization, then more free capacity, then fresher heartbeat.
         nodes.sort(key=lambda n: (n["load_bps"], -n["available_capacity"], -n["updated_at"]))
         return nodes
 
@@ -224,6 +242,7 @@ if __name__ == "__main__":
     if not client.configured:
         raise SystemExit("set WQPU_RPC_URL and WQPU_REGISTRY")
     print(json.dumps({
+        "chain_id": client.chain_id(),
         "price_per_million_units": client.global_price(),
         "nodes": client.discover(),
         "checked_at": int(time.time()),
