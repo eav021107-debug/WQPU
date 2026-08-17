@@ -3,12 +3,13 @@ pragma solidity ^0.8.35;
 
 /// @title WQPU Registry
 /// @notice Permissionless on-chain directory of active WQPU compute nodes.
-/// @dev Nodes publish reachability/capacity/load. Price is global for the whole network.
+/// @dev Nodes publish reachability/capacity/load/TLS identity. Price is global for the network.
 contract WQPURegistry {
     uint16 public constant BPS = 10_000;
 
     struct Node {
         string endpoint;
+        bytes32 tlsFingerprint;
         uint64 capacity;
         uint16 loadBps;
         uint64 updatedAt;
@@ -25,6 +26,7 @@ contract WQPURegistry {
     event NodeAnnounced(
         address indexed wallet,
         string endpoint,
+        bytes32 tlsFingerprint,
         uint64 capacity,
         uint16 loadBps,
         uint64 updatedAt
@@ -43,10 +45,12 @@ contract WQPURegistry {
     /// @notice Register/update a node. The caller wallet is the node identity.
     function announce(
         string calldata endpoint,
+        bytes32 tlsFingerprint,
         uint64 capacity,
         uint16 loadBps
     ) external {
         require(bytes(endpoint).length != 0, "empty endpoint");
+        require(tlsFingerprint != bytes32(0), "empty fingerprint");
         require(capacity != 0, "zero capacity");
         require(loadBps <= BPS, "bad load");
 
@@ -57,13 +61,21 @@ contract WQPURegistry {
 
         nodes[msg.sender] = Node({
             endpoint: endpoint,
+            tlsFingerprint: tlsFingerprint,
             capacity: capacity,
             loadBps: loadBps,
             updatedAt: uint64(block.timestamp),
             active: true
         });
 
-        emit NodeAnnounced(msg.sender, endpoint, capacity, loadBps, uint64(block.timestamp));
+        emit NodeAnnounced(
+            msg.sender,
+            endpoint,
+            tlsFingerprint,
+            capacity,
+            loadBps,
+            uint64(block.timestamp)
+        );
     }
 
     /// @notice Cheap heartbeat/load update without rewriting endpoint/capacity.
