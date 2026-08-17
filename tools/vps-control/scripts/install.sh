@@ -23,7 +23,16 @@ mkdir -p "$APP_DIR" "$WORKSPACE"
 cp -a "$SOURCE_DIR/." "$APP_DIR/"
 chown -R "$SERVICE_USER:$SERVICE_USER" "$APP_DIR" "$WORKSPACE"
 
-python3 -m venv "$APP_DIR/.venv"
+if ! python3 -m venv "$APP_DIR/.venv"; then
+  if command -v apt-get >/dev/null 2>&1; then
+    apt-get update
+    apt-get install -y python3-venv
+    python3 -m venv "$APP_DIR/.venv"
+  else
+    echo "python3 venv support is required"
+    exit 1
+  fi
+fi
 "$APP_DIR/.venv/bin/pip" install --upgrade pip
 "$APP_DIR/.venv/bin/pip" install "$APP_DIR"
 
