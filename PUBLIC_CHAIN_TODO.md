@@ -1,13 +1,38 @@
-# WQPU public-chain launch blockers
+# WQPU public deployment checklist
 
-The blockchain runtime itself is now wired into the WQPU prototype. These items still prevent the final no-configuration public launch:
+The WQPU 0.6.0 code path is implemented. The remaining work is deployment/security infrastructure, not missing client plumbing.
 
-1. Choose/deploy the WQPU EVM chain or test network.
-2. Deploy `WQPUToken`, then `WQPURegistry(initialPrice)`, then `WQPUComputeMarket(token, registry)`.
-3. Publish default RPC URL, chain ID, token address, registry address and market address in the client release.
-4. Add NAT traversal/relay policy for nodes whose registered endpoint is not directly reachable.
-5. Define and implement per-provider llama.cpp compute units.
-6. Generate EIP-712 cumulative vouchers from measured work and implement provider claims.
-7. Add adversarial tests and audit contracts before real-value use.
+## Already implemented
 
-Once item 1-3 are done, a fresh public-mode install can open the wallet connector automatically and discover nodes without a join code. Items 4-7 are required before calling the system production-ready.
+- wallet connector without private-key custody;
+- on-chain node discovery and TLS fingerprint binding;
+- one global network price;
+- load-aware multi-worker scheduling;
+- pinned `llama.cpp` RPC runtime;
+- meter v2 with fail-closed parsing;
+- shared escrow and EIP-2612 permit funding;
+- bounded local session key;
+- cumulative provider vouchers and replay protection;
+- HTTP gas relayer;
+- durable voucher delivery/claim flow;
+- TLS-pinned bootstrap relay support for NAT/CGNAT nodes;
+- Linux and Windows one-command installers;
+- local EVM devnet and end-to-end CI.
+
+## Required to publish a real public network
+
+1. Choose/deploy the WQPU EVM chain or testnet.
+2. Deploy `WQPUToken`, `WQPURegistry(initialPrice)`, then `WQPUComputeMarket(token, registry)`.
+3. Run at least one public TLS transport relay and record its certificate fingerprint.
+4. Run at least one funded gas relayer. Production should use a dedicated signer/HSM rather than an unlocked RPC account.
+5. Fill `network-config.json` with chain ID, RPC, token, registry, market, gas-relayer URL and bootstrap relay(s), then set `public.enabled=true`.
+6. Run the full CI/devnet suite against the chosen deployment and perform multi-host Internet testing.
+7. Complete adversarial/security testing and an independent contract/network audit before enabling real-value automatic payments.
+
+After steps 1-5, a fresh install follows the intended path:
+
+```text
+install -> connect existing wallet -> register -> discover peers -> run
+```
+
+No join code or manual peer list is required for public mode.
