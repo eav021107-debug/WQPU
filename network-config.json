@@ -8,6 +8,7 @@
     "rpc_url": null,
     "token": null,
     "registry": null,
-    "market": null
+    "market": null,
+    "relayer_url": null
   }
 }
