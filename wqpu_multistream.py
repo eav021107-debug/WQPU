@@ -2,9 +2,9 @@
 """Aggregate verified worker meters across llama.cpp's multiple RPC sockets.
 
 A logical llama.cpp request may open several TCP RPC streams to one worker. Requester-side
-UsageBook already meters all of those streams cumulatively per provider. Historically the
-worker signed one report per stream and the requester kept only the latest report, making
-real inference fail closed even when every individual report was valid.
+UsageBook meters each physical socket independently and aggregates the completed snapshots
+per provider. The worker signs one report per physical stream; this extension verifies each
+report first and then applies the exact same merge semantics on the requester.
 
 This extension is requester-side only. It never replaces or wraps the worker RPC transport:
 - every physical stream keeps using the proven byte-transparent AutoPay worker path;
@@ -21,48 +21,19 @@ import asyncio
 import hashlib
 
 import wqpu_accounting
-
-
-INVARIANT_FIELDS = ("meter_version", "llama_rpc_op_count")
-ADDITIVE_FIELDS = tuple(
-    field for field in wqpu_accounting.MATCH_FIELDS if field not in INVARIANT_FIELDS
-)
+from wqpu_meter import MeterError, merge_meter_snapshots
 
 
 class MultiStreamError(RuntimeError):
     pass
 
 
-def _int(stats, field):
-    return int((stats or {}).get(field) or 0)
-
-
 def merge_rpc_stats(previous, current):
-    """Combine two complete per-socket snapshots without weakening eligibility checks."""
-    left = dict(previous or {})
-    right = dict(current or {})
-    if not left:
-        return right
-    if not right:
-        return left
-
-    for field in INVARIANT_FIELDS:
-        if _int(left, field) != _int(right, field):
-            raise MultiStreamError("worker meter invariant mismatch: {}".format(field))
-
-    merged = dict(left)
-    for field in INVARIANT_FIELDS:
-        merged[field] = _int(left, field)
-    for field in ADDITIVE_FIELDS:
-        merged[field] = _int(left, field) + _int(right, field)
-
-    merged["protocol_seen"] = bool(left.get("protocol_seen")) or bool(right.get("protocol_seen"))
-    merged["active_seconds"] = float(left.get("active_seconds") or 0.0) + float(right.get("active_seconds") or 0.0)
-    merged["last_graph_nodes"] = int(right.get("last_graph_nodes") or left.get("last_graph_nodes") or 0)
-    merged["tracked_devices"] = max(
-        int(left.get("tracked_devices") or 0), int(right.get("tracked_devices") or 0)
-    )
-    return merged
+    """Use the same physical-stream merge rules as requester-side UsageBook."""
+    try:
+        return merge_meter_snapshots(previous, current)
+    except MeterError as exc:
+        raise MultiStreamError(str(exc))
 
 
 def _report_id(report):
