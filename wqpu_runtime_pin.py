@@ -22,6 +22,20 @@ import wqpu
 DEFAULT_LLAMA_TAG = "b10456"
 NETWORK_ATTEMPTS = 4
 
+# Exact official release assets for the WQPU-pinned runtime. Keeping the asset name and
+# SHA-256 in-repo removes a fragile GitHub Releases API lookup from every clean install
+# while preserving cryptographic verification of the downloaded binary archive.
+PINNED_ASSETS = {
+    "b10456": {
+        "-bin-ubuntu-x64.tar.gz": "d07b3f80f3a1ed1de46bfba5671b4af40a87417e1dbf35d0603ad2d623ddc577",
+        "-bin-ubuntu-arm64.tar.gz": "7b59bce92d07f636c8137e481967ab4bfd677beb0668323d9352b2dbd1e3ea75",
+        "-bin-macos-arm64.tar.gz": "5ab514e2b1c8b0276af2536ea2b58643952b6fe79c9bc83bb2e1a336b4ddeb6f",
+        "-bin-macos-x64.tar.gz": "5913d3975299438980ea932b3538954e0c99a42ceae497dfb5085677ed21f489",
+        "-bin-win-cpu-x64.zip": "52ea16a7c5de7230638fbd2e90a4f78185f6c47d06d65a328e3522823fbf2a2d",
+        "-bin-win-cpu-arm64.zip": "351d9dd847b8c711cf0d8a73be1c22d2f0227738d7972a8fcb3729a731919efa",
+    },
+}
+
 
 def network_runtime_config():
     try:
@@ -55,7 +69,7 @@ def _sha256(path):
 def _verify_asset(path, asset):
     expected = str(asset.get("digest") or "").strip().lower()
     if not expected:
-        return
+        raise RuntimeError("pinned llama.cpp asset has no SHA-256 digest")
     if not expected.startswith("sha256:"):
         raise RuntimeError("unsupported llama.cpp asset digest format")
     actual = _sha256(path)
@@ -115,6 +129,42 @@ def _download_asset(url, path, attempts=NETWORK_ATTEMPTS):
     raise RuntimeError("could not download pinned llama.cpp runtime: {}".format(last))
 
 
+def _static_asset(tag, suffix):
+    digest = (PINNED_ASSETS.get(str(tag)) or {}).get(str(suffix))
+    if not digest:
+        return None
+    name = "llama-{}{}".format(tag, suffix)
+    return {
+        "name": name,
+        "digest": "sha256:" + digest,
+        "browser_download_url": "https://github.com/ggml-org/llama.cpp/releases/download/{}/{}".format(tag, name),
+        "source": "wqpu-pinned-manifest",
+    }
+
+
+def _asset_for(tag, suffix):
+    static = _static_asset(tag, suffix)
+    if static:
+        return static
+
+    # Development override for tags not published in the WQPU manifest. Production
+    # network configs should pin only a manifest-backed tag so all peers share a known
+    # archive digest without trusting mutable release metadata at install time.
+    release = _release_json(tag)
+    actual_tag = str(release.get("tag_name") or "")
+    if actual_tag != tag:
+        raise RuntimeError("llama.cpp release tag mismatch")
+    asset = next(
+        (item for item in release.get("assets") or [] if str(item.get("name") or "").endswith(suffix)),
+        None,
+    )
+    if not asset:
+        raise RuntimeError("no llama.cpp {} asset for {}".format(tag, suffix))
+    if not str(asset.get("digest") or "").lower().startswith("sha256:"):
+        raise RuntimeError("llama.cpp development override asset is missing SHA-256")
+    return asset
+
+
 def ensure_runtime():
     wqpu.ensure_home()
     tag = desired_tag()
@@ -130,18 +180,8 @@ def ensure_runtime():
             pass
 
     print("WQPU: downloading pinned llama.cpp {}...".format(tag))
-    release = _release_json(tag)
-    actual_tag = str(release.get("tag_name") or "")
-    if actual_tag != tag:
-        raise RuntimeError("llama.cpp release tag mismatch")
-
     suffix = wqpu.asset_suffix()
-    asset = next(
-        (item for item in release.get("assets") or [] if str(item.get("name") or "").endswith(suffix)),
-        None,
-    )
-    if not asset:
-        raise RuntimeError("no llama.cpp {} asset for {}".format(tag, suffix))
+    asset = _asset_for(tag, suffix)
 
     target = wqpu.RUNTIME / tag
     if target.exists():
@@ -171,5 +211,6 @@ def ensure_runtime():
         "rpc": str(rpc),
         "asset": asset.get("name"),
         "asset_digest": asset.get("digest"),
+        "asset_source": asset.get("source", "release-api"),
     }, indent=2) + "\n")
     return server, rpc, tag
