@@ -10,6 +10,9 @@
     "registry": null,
     "market": null,
     "relayer_url": null,
-    "relays": []
+    "relays": [],
+    "llama_cpp_tag": "b10456",
+    "llama_rpc_protocol_major": 5,
+    "llama_rpc_op_count": 101
   }
 }
