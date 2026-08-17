@@ -28,6 +28,7 @@ import wqpu_accounting  # noqa: E402
 import wqpu_attestation  # noqa: E402
 import wqpu_autopay  # noqa: E402
 import wqpu_chain  # noqa: E402
+import wqpu_multistream  # noqa: E402
 import wqpu_network_guard  # noqa: E402
 import wqpu_public_config  # noqa: E402
 import wqpu_public_security  # noqa: E402
@@ -154,6 +155,9 @@ async def check():
         raise RuntimeError("real inference identities were not registered")
 
     wqpu_network_guard.install(runtime)
+    # Match the real wqpu_entry.py layering: first aggregate only reports already
+    # accepted by AutoPay's TLS/Registry receiver, then add public transport security.
+    wqpu_multistream.install(wqpu_autopay.AutoPayChainMesh)
     wqpu_public_security.install(wqpu_autopay.AutoPayChainMesh)
     relay_peer = dict(config["relays"][0])
     mesh_cfg = {
@@ -231,26 +235,38 @@ async def check():
         if not content:
             raise RuntimeError("real llama-server returned no assistant content")
 
-        # Stopping llama-server closes the RPC connection, which finalizes the worker's
-        # independent meter and causes its TLS-signed report to travel back through relay.
+        # Stopping llama-server closes every physical RPC socket. Finalize the requester
+        # aggregate first; the multistream layer then waits until the independently
+        # verified worker stream reports add up to exactly this same logical request.
         stop_process(llama_proc)
         llama_proc = None
         await wqpu.close_server(proxy)
         proxy = None
-        await requester.wait_provider_reports([worker.me], request_id, 30)
         snapshot = requester.end_usage()
         requester_stats = snapshot.get(worker.me)
+        if not requester_stats:
+            raise RuntimeError("real llama.cpp requester produced no usage meter")
+        matched = await requester.wait_provider_reports(snapshot.keys(), request_id, 30)
         report = (requester.provider_usage_reports.get(request_id) or {}).get(worker.me)
-        if not requester_stats or not report:
+        if not report:
             raise RuntimeError("real llama.cpp worker produced no signed usage report")
         worker_stats = report.get("rpc") or {}
-        if not wqpu_accounting.meter_eligible(requester_stats):
+        if not matched:
+            raise RuntimeError(
+                "verified worker multistream aggregate did not match requester: requester={} worker={}".format(
+                    json.dumps(requester_stats, sort_keys=True),
+                    json.dumps(worker_stats, sort_keys=True),
+                )
+            )
+        if not wqpu_accounting.meter_is_eligible(requester_stats):
             raise RuntimeError("requester meter rejected the real pinned llama.cpp stream")
-        if not wqpu_accounting.meter_eligible(worker_stats):
+        if not wqpu_accounting.meter_is_eligible(worker_stats):
             raise RuntimeError("worker meter rejected the real pinned llama.cpp stream")
         if not wqpu_accounting.meters_match(requester_stats, worker_stats):
             raise RuntimeError("real requester/worker llama.cpp meters disagreed")
-        graph_commands = int(requester_stats.get("graph_compute_commands") or 0)
+        graph_commands = int(requester_stats.get("graph_compute_calls") or 0) + int(
+            requester_stats.get("graph_recompute_calls") or 0
+        )
         scalar_ops = int(requester_stats.get("estimated_scalar_ops") or 0)
         if graph_commands <= 0 or scalar_ops <= 0:
             raise RuntimeError("llama-server answered without measured remote graph compute")
@@ -261,8 +277,8 @@ async def check():
 
         usage = result.get("usage") or {}
         print("WQPU REAL LLAMA INFERENCE E2E OK")
-        print("model={} llama_tag={} worker={} graph_commands={} scalar_ops={} completion_tokens={}".format(
-            MODEL, tag, worker_wallet, graph_commands, scalar_ops,
+        print("model={} llama_tag={} worker={} verified_streams={} graph_commands={} scalar_ops={} completion_tokens={}".format(
+            MODEL, tag, worker_wallet, int(report.get("verified_stream_count") or 1), graph_commands, scalar_ops,
             usage.get("completion_tokens", "?"),
         ))
         print("assistant={}".format(content.replace("\n", " ")[:160]))
