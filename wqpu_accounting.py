@@ -56,6 +56,11 @@ def meter_is_eligible(stats):
         return False
 
 
+# Compatibility alias for early v2-meter integration code. Keep the canonical predicate
+# above; both names preserve the same fail-closed semantics.
+meter_eligible = meter_is_eligible
+
+
 def meters_match(requester_stats, provider_stats):
     if not meter_is_eligible(requester_stats) or not meter_is_eligible(provider_stats):
         return False
