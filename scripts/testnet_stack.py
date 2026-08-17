@@ -19,6 +19,7 @@ import secrets
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import sys
 import time
@@ -207,8 +208,6 @@ def build_anvil_command(port, state_path=CHAIN_STATE_FILE):
     ]
     if state_path.exists():
         cmd += ["--load-state", str(state_path)]
-    # Dump on graceful exit and also checkpoint every second. This makes normal server
-    # restarts keep blocks, contract storage, balances and registry membership.
     cmd += ["--dump-state", str(state_path), "--state-interval", "1"]
     return cmd
 
@@ -229,6 +228,22 @@ def validate_loaded_deployment(rpc_url, deployment):
         )
 
 
+def resolve_public_tls(args, old):
+    cert = str(args.tls_cert or old.get("tls_cert") or "").strip()
+    key = str(args.tls_key or old.get("tls_key") or "").strip()
+    if bool(cert) != bool(key):
+        raise RuntimeError("both --tls-cert and --tls-key are required")
+    if not cert:
+        return "", ""
+    cert_path = Path(cert).expanduser().resolve()
+    key_path = Path(key).expanduser().resolve()
+    if not cert_path.is_file():
+        raise RuntimeError("TLS certificate not found: {}".format(cert_path))
+    if not key_path.is_file():
+        raise RuntimeError("TLS private key not found: {}".format(key_path))
+    return str(cert_path), str(key_path)
+
+
 def spawn(name, cmd, env=None):
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     log = (LOG_DIR / (name + ".log")).open("a", encoding="utf-8")
@@ -246,11 +261,12 @@ def spawn(name, cmd, env=None):
     return proc.pid
 
 
-def wait_http(url, timeout=20):
+def wait_http(url, timeout=20, insecure=False):
     deadline = time.time() + timeout
+    context = ssl._create_unverified_context() if insecure and str(url).startswith("https://") else None
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=2) as response:
+            with urllib.request.urlopen(url, timeout=2, context=context) as response:
                 if 200 <= response.status < 300:
                     return True
         except Exception:
@@ -308,9 +324,12 @@ def current_client_ref():
 
 
 def build_network_config(public_host, rpc_port, relayer_port, relay_port, relay_fp,
-                         token, registry, market, payments_enabled=False, faucet_enabled=True):
+                         token, registry, market, payments_enabled=False, faucet_enabled=True,
+                         scheme="http"):
+    if scheme not in ("http", "https"):
+        raise ValueError("unsupported public URL scheme")
     h = url_host(public_host)
-    relayer_base = "http://{}:{}".format(h, int(relayer_port))
+    relayer_base = "{}://{}:{}".format(scheme, h, int(relayer_port))
     return {
         "version": 3,
         "public": {
@@ -319,7 +338,7 @@ def build_network_config(public_host, rpc_port, relayer_port, relay_port, relay_
             "chain_id": "0x{:x}".format(DEFAULT_CHAIN_ID),
             "chain_name": "WQPU Testnet",
             "native_symbol": "ETH",
-            "rpc_url": "http://{}:{}".format(h, int(rpc_port)),
+            "rpc_url": "{}://{}:{}".format(scheme, h, int(rpc_port)),
             "token": token,
             "registry": registry,
             "market": market,
@@ -340,9 +359,9 @@ def build_network_config(public_host, rpc_port, relayer_port, relay_port, relay_
     }
 
 
-def write_join_files(public_host, relayer_port):
+def write_join_files(public_host, relayer_port, scheme="http"):
     h = url_host(public_host)
-    config_url = "http://{}:{}/network-config.json".format(h, int(relayer_port))
+    config_url = "{}://{}:{}/network-config.json".format(scheme, h, int(relayer_port))
     ref = current_client_ref()
     raw = "https://raw.githubusercontent.com/eav021107-debug/WQPU/{}".format(ref)
     sh = """#!/usr/bin/env sh
@@ -398,6 +417,8 @@ def start(args):
     STACK_DIR.mkdir(parents=True, exist_ok=True)
     LOG_DIR.mkdir(parents=True, exist_ok=True)
     public_host = args.public_host or old.get("public_host") or guess_public_host()
+    tls_cert, tls_key = resolve_public_tls(args, old)
+    scheme = "https" if tls_cert else "http"
     internal_rpc = "http://127.0.0.1:{}".format(args.internal_rpc_port)
     operator_key, operator, reused_operator = load_or_create_operator()
     deployment = load_deployment()
@@ -436,8 +457,6 @@ def start(args):
                 [token, registry], internal_rpc, operator_key,
             ).lower()
             deployment = save_deployment(operator, token, registry, market, args.price, args.supply)
-            # Give Anvil's periodic persistence checkpoint a chance to include deployments
-            # before public services are announced as ready.
             deadline = time.time() + 4
             while time.time() < deadline and not CHAIN_STATE_FILE.exists():
                 time.sleep(0.1)
@@ -445,22 +464,25 @@ def start(args):
         fp = relay_fingerprint()
         config = build_network_config(
             public_host, args.rpc_port, args.relayer_port, args.relay_port, fp,
-            token, registry, market, args.payments, not args.no_faucet,
+            token, registry, market, args.payments, not args.no_faucet, scheme,
         )
         CONFIG_FILE.write_text(json.dumps(config, indent=2) + "\n")
-        write_join_files(public_host, args.relayer_port)
+        write_join_files(public_host, args.relayer_port, scheme)
 
         env_gateway = os.environ.copy()
         env_gateway.update({
             "WQPU_ANVIL_RPC": internal_rpc,
             "WQPU_GATEWAY_QUIET": "1",
         })
-        print("WQPU testnet: starting restricted public RPC gateway...")
-        pids["rpc_gateway"] = spawn("rpc-gateway", [
+        gateway_cmd = [
             sys.executable, str(ROOT / "wqpu_rpc_gateway.py"),
             "--host", args.bind_host, "--port", str(args.rpc_port),
             "--upstream", internal_rpc,
-        ], env=env_gateway)
+        ]
+        if tls_cert:
+            gateway_cmd += ["--tls-cert", tls_cert, "--tls-key", tls_key]
+        print("WQPU testnet: starting restricted public {} RPC gateway...".format(scheme.upper()))
+        pids["rpc_gateway"] = spawn("rpc-gateway", gateway_cmd, env=env_gateway)
 
         env_relayer = os.environ.copy()
         env_relayer.update({
@@ -476,11 +498,14 @@ def start(args):
             "WQPU_TESTNET_FAUCET": "0" if args.no_faucet else "1",
             "WQPU_RELAYER_QUIET": "1",
         })
-        print("WQPU testnet: starting gas relayer{}...".format(" + faucet" if not args.no_faucet else ""))
-        pids["relayer"] = spawn("relayer", [
+        relayer_cmd = [
             sys.executable, str(ROOT / "wqpu_relayer.py"),
             "--host", args.bind_host, "--port", str(args.relayer_port),
-        ], env=env_relayer)
+        ]
+        if tls_cert:
+            relayer_cmd += ["--tls-cert", tls_cert, "--tls-key", tls_key]
+        print("WQPU testnet: starting {} gas relayer{}...".format(scheme.upper(), " + faucet" if not args.no_faucet else ""))
+        pids["relayer"] = spawn("relayer", relayer_cmd, env=env_relayer)
 
         env_transport = os.environ.copy()
         env_transport.update({
@@ -494,15 +519,20 @@ def start(args):
             "--host", args.bind_host, "--port", str(args.relay_port),
         ], env=env_transport)
 
-        wait_http("http://127.0.0.1:{}/health".format(args.rpc_port), 20)
-        wait_http("http://127.0.0.1:{}/health".format(args.relayer_port), 20)
+        local_scheme = scheme
+        wait_http("{}://127.0.0.1:{}/health".format(local_scheme, args.rpc_port), 20, insecure=bool(tls_cert))
+        wait_http("{}://127.0.0.1:{}/health".format(local_scheme, args.relayer_port), 20, insecure=bool(tls_cert))
         wait_tcp("127.0.0.1", args.relay_port, 20)
 
         state = {
-            "version": 2,
+            "version": 3,
             "started_at": int(time.time()),
             "public_host": public_host,
             "bind_host": args.bind_host,
+            "public_scheme": scheme,
+            "tls_enabled": bool(tls_cert),
+            "tls_cert": tls_cert or None,
+            "tls_key": tls_key or None,
             "internal_rpc": internal_rpc,
             "chain_id": "0x{:x}".format(DEFAULT_CHAIN_ID),
             "persistent": True,
@@ -537,20 +567,25 @@ def print_ready(state):
     host = state["public_host"]
     h = url_host(host)
     ports = state["ports"]
-    config_url = "http://{}:{}/network-config.json".format(h, ports["relayer"])
+    scheme = state.get("public_scheme") or "http"
+    config_url = "{}://{}:{}/network-config.json".format(scheme, h, ports["relayer"])
     print("\nWQPU TESTNET READY{}".format(" (RESUMED)" if state.get("resumed") else ""))
-    print("Public RPC:    http://{}:{}".format(h, ports["rpc"]))
-    print("Gas relayer:   http://{}:{}/relay".format(h, ports["relayer"]))
-    print("Faucet/config: http://{}:{}".format(h, ports["relayer"]))
+    print("Public RPC:    {}://{}:{}".format(scheme, h, ports["rpc"]))
+    print("Gas relayer:   {}://{}:{}/relay".format(scheme, h, ports["relayer"]))
+    print("Faucet/config: {}://{}:{}".format(scheme, h, ports["relayer"]))
     print("Transport:     {}:{}".format(host, ports["relay"]))
     print("Registry:      {}".format(state["registry"]))
     print("Market:        {}".format(state["market"]))
     print("Config:        {}".format(config_url))
     print("Persistent:    {}".format(CHAIN_STATE_FILE))
+    if state.get("tls_enabled"):
+        print("Public TLS:    enabled (certificate: {})".format(state.get("tls_cert")))
+    else:
+        print("Public TLS:    disabled; use --tls-cert/--tls-key for Internet-facing wallet endpoints")
     print("\nLinux/macOS client (one command):")
-    print("curl -fsSL http://{}:{}/join.sh | sh".format(h, ports["relayer"]))
+    print("curl -fsSL {}://{}:{}/join.sh | sh".format(scheme, h, ports["relayer"]))
     print("\nWindows PowerShell client (one command):")
-    print("irm http://{}:{}/join.ps1 | iex".format(h, ports["relayer"]))
+    print("irm {}://{}:{}/join.ps1 | iex".format(scheme, h, ports["relayer"]))
     print("\nNormal stop/start keeps this same testnet. Use `reset --yes` only to create a new one.")
     print("Operator key is testnet-only and stored with restricted permissions in {}.".format(OPERATOR_FILE))
 
@@ -558,8 +593,6 @@ def print_ready(state):
 def stop(_args):
     state = load_json(STATE_FILE, {})
     pids = state.get("pids") or {}
-    # Stop public services first, then terminate Anvil gracefully so --dump-state can
-    # persist the latest block/storage environment before the process exits.
     for name in ("transport_relay", "relayer", "rpc_gateway", "anvil"):
         pid = pids.get(name)
         if pid:
@@ -605,6 +638,8 @@ def status(_args):
         "running": running,
         "resumable": resumable,
         "persistent": True,
+        "public_scheme": state.get("public_scheme") or "http",
+        "tls_enabled": bool(state.get("tls_enabled")),
         "services": rows,
         "public_host": state.get("public_host"),
         "operator": state.get("operator"),
@@ -639,6 +674,8 @@ def main():
     start_p.add_argument("--supply", type=int, default=DEFAULT_SUPPLY)
     start_p.add_argument("--payments", action="store_true", help="enable automatic prototype vouchers in generated config")
     start_p.add_argument("--no-faucet", action="store_true")
+    start_p.add_argument("--tls-cert", default=None, help="trusted PEM certificate for public RPC/relayer HTTPS")
+    start_p.add_argument("--tls-key", default=None, help="PEM private key matching --tls-cert")
     sub.add_parser("stop")
     sub.add_parser("status")
     sub.add_parser("config")
