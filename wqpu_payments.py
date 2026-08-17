@@ -1,10 +1,5 @@
 #!/usr/bin/env python3
-"""Cumulative WQPU provider vouchers backed by one requester escrow.
-
-The requester wallet signs one bounded SpendAuthorization. This module then uses the
-local session key to issue cumulative vouchers to any selected provider without more
-wallet prompts. Providers or relayers can later submit the claim package on-chain.
-"""
+"""Cumulative WQPU provider vouchers backed by an activated requester escrow session."""
 
 from __future__ import print_function
 
@@ -14,6 +9,7 @@ import time
 from pathlib import Path
 
 from wqpu_session import (
+    active_session,
     escrow_balance,
     load_session,
     session_address,
@@ -71,11 +67,8 @@ class PaymentSession(object):
         self.max_amount = int(self.session.get("max_amount") or 0)
         self.price = int(self.session.get("price_per_million_units") or 0)
         self.valid_until = int(self.session.get("valid_until") or 0)
-        self.authorization_signature = str(self.session.get("authorization_signature") or "")
         if self.max_amount <= 0 or self.price <= 0:
             raise PaymentError("invalid payment session limits")
-        if not self.authorization_signature.startswith("0x"):
-            raise PaymentError("missing wallet session authorization")
 
     def validate(self):
         chain_id = self.chain.chain_id().lower()
@@ -86,11 +79,20 @@ class PaymentSession(object):
         block = self.chain.rpc("eth_getBlockByNumber", ["latest", False])
         now = int(block["timestamp"], 16)
         if now > self.valid_until:
-            raise PaymentError("payment session expired")
-        current_price = int(self.chain.global_price())
-        if current_price != self.price:
-            raise PaymentError("network price changed; authorize a new payment session")
-        return True
+            raise PaymentError("payment session expired for new work")
+
+        active = active_session(self.chain, self.market, self.requester, self.session_id)
+        if not active.get("active"):
+            raise PaymentError("payment session is not activated on-chain")
+        if active.get("session_key") != self.session_key:
+            raise PaymentError("activated session key mismatch")
+        if int(active.get("max_amount") or 0) != self.max_amount:
+            raise PaymentError("activated session limit mismatch")
+        if int(active.get("price_per_million_units") or 0) != self.price:
+            raise PaymentError("activated session price mismatch")
+        if int(active.get("valid_until") or 0) != self.valid_until:
+            raise PaymentError("activated session expiry mismatch")
+        return active
 
     def quote(self, cumulative_units):
         units = int(cumulative_units)
@@ -114,7 +116,7 @@ class PaymentSession(object):
         return sum(int(row.get("amount") or 0) for row in self._state()["providers"].values())
 
     def issue(self, provider, delta_units):
-        self.validate()
+        active = self.validate()
         provider = _address(provider, "provider")
         if provider == self.requester:
             raise PaymentError("cannot pay requester as provider")
@@ -140,9 +142,9 @@ class PaymentSession(object):
         if claimed > local_total:
             raise PaymentError("local payment state is behind on-chain session state")
         outstanding = local_total - claimed
-        onchain_escrow = escrow_balance(self.chain, self.market, self.requester)
-        if outstanding + delta_amount > onchain_escrow:
-            raise PaymentError("WQPU escrow cannot cover outstanding vouchers")
+        reserved_remaining = int(active.get("reserved_remaining") or 0)
+        if outstanding + delta_amount > reserved_remaining:
+            raise PaymentError("activated session reserve cannot cover outstanding vouchers")
 
         signature = sign_provider_voucher(
             self.chain,
@@ -162,7 +164,7 @@ class PaymentSession(object):
         save_payment_state(root)
 
         return {
-            "version": 1,
+            "version": 2,
             "kind": "wqpu-provider-voucher",
             "market": self.market,
             "requester": self.requester,
@@ -175,7 +177,6 @@ class PaymentSession(object):
             "cumulative_amount": cumulative_amount,
             "cumulative_units": cumulative_units,
             "voucher_signature": signature,
-            "authorization_signature": self.authorization_signature,
         }
 
 
@@ -184,12 +185,13 @@ if __name__ == "__main__":
 
     client = RegistryClient()
     session = PaymentSession(client)
-    session.validate()
+    active = session.validate()
     print(json.dumps({
         "requester": session.requester,
         "session_id": session.session_id,
         "local_spent": session.local_spent(),
         "max_amount": session.max_amount,
+        "reserved_remaining": active.get("reserved_remaining"),
         "escrow": escrow_balance(client, session.market, session.requester),
         "claimed": session_spent(client, session.market, session.requester, session.session_id),
     }, indent=2))
