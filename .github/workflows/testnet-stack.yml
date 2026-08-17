@@ -5,6 +5,8 @@ on:
     paths:
       - 'install-testnet.sh'
       - 'scripts/testnet_stack.py'
+      - 'wqpu_operator_service.py'
+      - 'wqpu_operator_service_cli.py'
       - 'wqpu_rpc_gateway.py'
       - 'wqpu_relayer.py'
       - 'wqpu_transport_relay.py'
@@ -14,11 +16,14 @@ on:
       - 'tests/test_testnet_stack.py'
       - 'tests/test_wallet_faucet.py'
       - 'tests/test_relayer_faucet.py'
+      - 'tests/test_operator_service.py'
       - '.github/workflows/testnet-stack.yml'
   pull_request:
     paths:
       - 'install-testnet.sh'
       - 'scripts/testnet_stack.py'
+      - 'wqpu_operator_service.py'
+      - 'wqpu_operator_service_cli.py'
       - 'wqpu_rpc_gateway.py'
       - 'wqpu_relayer.py'
       - 'wqpu_transport_relay.py'
@@ -28,6 +33,7 @@ on:
       - 'tests/test_testnet_stack.py'
       - 'tests/test_wallet_faucet.py'
       - 'tests/test_relayer_faucet.py'
+      - 'tests/test_operator_service.py'
       - '.github/workflows/testnet-stack.yml'
 
 jobs:
@@ -42,9 +48,16 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - name: Compile stack modules
-        run: python -m py_compile wqpu_rpc_gateway.py wqpu_relayer.py wqpu_wallet.py scripts/testnet_stack.py
-      - name: Test stack policy/config/backup
-        run: python -m unittest tests.test_rpc_gateway tests.test_testnet_stack tests.test_wallet_faucet tests.test_relayer_faucet -v
+        run: >-
+          python -m py_compile
+          wqpu_rpc_gateway.py wqpu_relayer.py wqpu_wallet.py
+          wqpu_operator_service.py wqpu_operator_service_cli.py
+          scripts/testnet_stack.py
+      - name: Test stack policy/config/backup/autostart
+        run: >-
+          python -m unittest
+          tests.test_rpc_gateway tests.test_testnet_stack tests.test_wallet_faucet
+          tests.test_relayer_faucet tests.test_operator_service -v
 
   operator-installer:
     runs-on: ubuntu-latest
@@ -76,6 +89,7 @@ jobs:
           test "$(cat "$OPERATOR_ROOT/.wqpu-testnet/sentinel")" = "preserve-me"
           "$TEST_HOME/.local/bin/wqpu-testnet" --help | grep -F 'WQPU one-command persistent EVM testnet operator stack'
           grep -F "WQPU_TESTNET_CLIENT_REF='$REF'" "$TEST_HOME/.local/bin/wqpu-testnet"
+          grep -F 'wqpu_operator_service_cli.py' "$TEST_HOME/.local/bin/wqpu-testnet"
           (cd "$OPERATOR_ROOT" && forge build >/dev/null)
 
   integration:
