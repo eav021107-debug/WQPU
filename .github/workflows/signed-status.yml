@@ -9,13 +9,18 @@ on:
       - 'wqpu_network_guard.py'
       - 'wqpu_node_identity.py'
       - 'wqpu_node_status.py'
+      - 'wqpu_public_config.py'
+      - 'wqpu_public_security.py'
       - 'wqpu_transport_relay.py'
       - 'scripts/testnet_stack.py'
+      - 'scripts/testnet_doctor.py'
       - 'scripts/check_signed_status_relay.py'
       - 'tests/test_network_guard.py'
       - 'tests/test_node_identity.py'
       - 'tests/test_node_status.py'
+      - 'tests/test_public_config.py'
       - 'tests/test_transport_network_uid.py'
+      - 'tests/test_transport_relay.py'
       - '.github/workflows/signed-status.yml'
   pull_request:
     paths:
@@ -25,13 +30,18 @@ on:
       - 'wqpu_network_guard.py'
       - 'wqpu_node_identity.py'
       - 'wqpu_node_status.py'
+      - 'wqpu_public_config.py'
+      - 'wqpu_public_security.py'
       - 'wqpu_transport_relay.py'
       - 'scripts/testnet_stack.py'
+      - 'scripts/testnet_doctor.py'
       - 'scripts/check_signed_status_relay.py'
       - 'tests/test_network_guard.py'
       - 'tests/test_node_identity.py'
       - 'tests/test_node_status.py'
+      - 'tests/test_public_config.py'
       - 'tests/test_transport_network_uid.py'
+      - 'tests/test_transport_relay.py'
       - '.github/workflows/signed-status.yml'
 
 jobs:
@@ -49,13 +59,14 @@ jobs:
         run: >-
           python -m py_compile
           wqpu.py wqpu_runtime.py wqpu_chain.py wqpu_network_guard.py
-          wqpu_node_identity.py wqpu_node_status.py wqpu_transport_relay.py
-          scripts/testnet_stack.py scripts/check_signed_status_relay.py
+          wqpu_node_identity.py wqpu_node_status.py wqpu_public_config.py
+          wqpu_public_security.py wqpu_transport_relay.py
+          scripts/testnet_stack.py scripts/testnet_doctor.py scripts/check_signed_status_relay.py
       - name: Unit-test signed public identity and load status
         run: >-
           python -m unittest
           tests.test_network_guard tests.test_node_identity tests.test_node_status
-          tests.test_transport_network_uid -v
+          tests.test_public_config tests.test_transport_network_uid tests.test_transport_relay -v
       - name: Start operator stack
         shell: bash
         run: |
@@ -70,7 +81,7 @@ jobs:
       - name: Signed load heartbeat through real relay
         run: python scripts/check_signed_status_relay.py
       - name: Operator doctor after dynamic status traffic
-        run: python scripts/testnet_stack.py doctor
+        run: python scripts/testnet_doctor.py
       - name: Stop operator stack
         if: always()
         run: python scripts/testnet_stack.py stop || true
