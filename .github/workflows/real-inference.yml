@@ -3,6 +3,7 @@ name: WQPU real inference
 on:
   push:
     paths:
+      - 'scripts/check_real_rpc_wire.py'
       - 'scripts/check_real_inference.py'
       - '.github/workflows/real-inference.yml'
       - 'wqpu_runtime_pin.py'
@@ -14,6 +15,7 @@ on:
       - 'wqpu_transport_relay.py'
   pull_request:
     paths:
+      - 'scripts/check_real_rpc_wire.py'
       - 'scripts/check_real_inference.py'
       - '.github/workflows/real-inference.yml'
       - 'wqpu_runtime_pin.py'
@@ -51,7 +53,8 @@ jobs:
           wqpu_network_guard.py wqpu_node_identity.py wqpu_node_status.py
           wqpu_public_config.py wqpu_public_security.py wqpu_transport_relay.py
           scripts/testnet_stack.py scripts/testnet_doctor.py
-          scripts/check_two_client_relay.py scripts/check_real_inference.py
+          scripts/check_two_client_relay.py scripts/check_real_rpc_wire.py
+          scripts/check_real_inference.py
       - name: Start isolated operator stack
         shell: bash
         run: |
@@ -63,6 +66,10 @@ jobs:
             --rpc-port 21545 \
             --relayer-port 21787 \
             --relay-port 21443
+      - name: Real b10456 HELLO/device-memory wire through authenticated relay
+        env:
+          WQPU_LLAMA_TAG: b10456
+        run: python scripts/check_real_rpc_wire.py
       - name: Real pinned llama.cpp chat through authenticated WQPU relay
         env:
           WQPU_LLAMA_TAG: b10456
