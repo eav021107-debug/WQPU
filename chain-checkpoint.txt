@@ -1,0 +1,12 @@
+# WQPU canonical chain checkpoint used to reject look-alike/fork bootstrap RPCs.
+#
+# Production format, exactly one non-comment line:
+#   <block-number> <0x-prefixed-32-byte-block-hash>
+#
+# The client already verifies EVM chain id + WQPU native protocol. This pinned
+# checkpoint adds an immutable canonical-chain anchor before any cached or
+# shipped RPC gateway is trusted.
+#
+# It is intentionally empty until the public WQPU genesis is frozen and the
+# canonical network has produced the chosen checkpoint block. Production RPC
+# entries must not be activated before this file is populated.
