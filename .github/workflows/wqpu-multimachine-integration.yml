@@ -11,6 +11,7 @@ on:
       - 'network.sh'
       - 'chain/devnet.sh'
       - 'chain/public-bootstrap.sh'
+      - 'chain/public-bootstrap-entry.sh'
       - 'chain/devnet_config.py'
       - 'chain/p2p_config.py'
       - 'chain/node_id.py'
@@ -65,6 +66,7 @@ jobs:
           bash -n ./up.sh
           bash -n ./chain/devnet.sh
           bash -n ./chain/public-bootstrap.sh
+          bash -n ./chain/public-bootstrap-entry.sh
           ! grep -Eq 'WQPU_CHAIN_DISCOVER|255\.255\.255\.255|start_lan_beacon|find_lan_rpc' ./up.sh
           grep -Fq 'BOOTSTRAP_CACHE' ./up.sh
           grep -Fq 'bootstrap-p2p.txt' ./up.sh
@@ -74,6 +76,8 @@ jobs:
           grep -Fq 'wqpu-rpc-verify' ./up.sh
           grep -Fq 'Only TCP/26656 should be public' ./chain/public-bootstrap.sh
           grep -Fq '127.0.0.1:26657/status' ./chain/public-bootstrap.sh
+          grep -Fq 'go run -mod=mod ./cmd/wqpu-compute-bootstrap address' ./chain/public-bootstrap.sh
+          grep -Fq 'WQPU_PUBLIC_RESET_PARTIAL' ./chain/public-bootstrap-entry.sh
           ! grep -Eq 'firewall-cmd .*--add-port=(8545|8546|26657)' ./chain/public-bootstrap.sh
 
       - name: Test CometBFT PEX configuration
