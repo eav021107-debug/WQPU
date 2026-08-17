@@ -118,6 +118,10 @@ fi
 
 [ -f "$SOURCE_DIR/chain/devnet.sh" ] || fail "WQPU source directory is invalid: $SOURCE_DIR"
 
+say "WQPU NEXT: resolving Go dependencies..."
+(cd "$SOURCE_DIR/chain" && GOWORK=off go mod tidy)
+(cd "$SOURCE_DIR/client" && GOWORK=off go mod tidy)
+
 export WQPU_CHAIN_SRC="${WQPU_CHAIN_SRC:-$BASE/chain-src/cosmos-evm}"
 export WQPU_CHAIN_BIN_DIR="${WQPU_CHAIN_BIN_DIR:-$BASE/chain-bin}"
 export WQPU_CHAIN_HOME="${WQPU_CHAIN_HOME:-$BASE/devnet-home}"
@@ -127,7 +131,7 @@ COMPUTE_LOG="${WQPU_COMPUTE_LOG:-$BASE/compute.log}"
 mkdir -p "$WQPU_CHAIN_BIN_DIR" "$RUNTIME_BASE"
 
 say "WQPU NEXT: preparing deterministic devnet compute identity..."
-WQPU_DEVNET_TEST_ADDRESS="$(cd "$SOURCE_DIR/chain" && go run ./cmd/wqpu-compute-bootstrap address)"
+WQPU_DEVNET_TEST_ADDRESS="$(cd "$SOURCE_DIR/chain" && GOWORK=off go run ./cmd/wqpu-compute-bootstrap address)"
 export WQPU_DEVNET_TEST_ADDRESS
 
 say "WQPU NEXT: building and starting sovereign devnet..."
@@ -161,10 +165,10 @@ done
 [ "$ready" -eq 1 ] || { cat "$CHAIN_LOG" >&2 || true; fail "devnet did not produce block 1"; }
 
 say "WQPU NEXT: publishing three equal compute nodes on-chain..."
-(cd "$SOURCE_DIR/chain" && go run ./cmd/wqpu-compute-bootstrap publish "$RPC")
+(cd "$SOURCE_DIR/chain" && GOWORK=off go run ./cmd/wqpu-compute-bootstrap publish "$RPC")
 
 say "WQPU NEXT: splitting one tiny LLM across two remote compute nodes..."
-(cd "$SOURCE_DIR/client" && go run ./cmd/wqpu-live-chain-compute-smoke "$RPC" "$RUNTIME_BASE") 2>&1 | tee "$COMPUTE_LOG"
+(cd "$SOURCE_DIR/client" && GOWORK=off go run ./cmd/wqpu-live-chain-compute-smoke "$RPC" "$RUNTIME_BASE") 2>&1 | tee "$COMPUTE_LOG"
 
 grep -Fq 'LIVE CHAIN COMPUTE PASSED' "$COMPUTE_LOG" || fail "distributed compute proof was not produced"
 grep -Fq '[alloc_buffer]' "$RUNTIME_BASE/live-chain-rpc-1.log" || fail "remote node RPC0 did not allocate model memory"
