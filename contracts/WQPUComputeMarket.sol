@@ -6,11 +6,16 @@ interface IWQPUToken {
     function transferFrom(address from, address to, uint256 value) external returns (bool);
 }
 
+interface IWQPURegistryPrice {
+    function globalPricePerMillionUnits() external view returns (uint128);
+}
+
 /// @title WQPU Compute Market
 /// @notice Escrowed payment channels for permissionless compute providers.
-/// @dev Providers do not mint tokens. Requesters deposit existing WQPU and sign cumulative vouchers.
+/// @dev Every channel snapshots the one global WQPU compute price when it opens.
 contract WQPUComputeMarket {
     uint256 public constant CLAIM_GRACE = 1 days;
+    uint256 public constant PRICE_UNITS = 1_000_000;
 
     bytes32 private constant DOMAIN_TYPEHASH = keccak256(
         "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
@@ -21,11 +26,11 @@ contract WQPUComputeMarket {
     bytes32 private constant NAME_HASH = keccak256("WQPU Compute Market");
     bytes32 private constant VERSION_HASH = keccak256("1");
 
-    // secp256k1n / 2, used to reject malleable signatures.
     uint256 private constant HALF_ORDER =
         0x7fffffffffffffffffffffffffffffff5d576e7357a4501ddfe92f46681b20a0;
 
     IWQPUToken public immutable token;
+    IWQPURegistryPrice public immutable registry;
     bytes32 public immutable DOMAIN_SEPARATOR;
 
     mapping(address => uint256) public nonces;
@@ -36,6 +41,7 @@ contract WQPUComputeMarket {
         uint128 deposited;
         uint128 paid;
         uint128 cumulativeUnits;
+        uint128 pricePerMillionUnits;
         uint64 expiresAt;
         bool refunded;
     }
@@ -47,6 +53,7 @@ contract WQPUComputeMarket {
         address indexed requester,
         address indexed provider,
         uint256 deposit,
+        uint128 pricePerMillionUnits,
         uint64 expiresAt
     );
     event ChannelToppedUp(bytes32 indexed channelId, uint256 amount, uint256 newDeposit);
@@ -59,9 +66,11 @@ contract WQPUComputeMarket {
     );
     event ChannelRefunded(bytes32 indexed channelId, address indexed requester, uint256 amount);
 
-    constructor(address tokenAddress) {
+    constructor(address tokenAddress, address registryAddress) {
         require(tokenAddress != address(0), "zero token");
+        require(registryAddress != address(0), "zero registry");
         token = IWQPUToken(tokenAddress);
+        registry = IWQPURegistryPrice(registryAddress);
         DOMAIN_SEPARATOR = keccak256(
             abi.encode(
                 DOMAIN_TYPEHASH,
@@ -81,6 +90,9 @@ contract WQPUComputeMarket {
         require(amount != 0 && amount <= type(uint128).max, "bad amount");
         require(expiresAt > block.timestamp, "bad expiry");
 
+        uint128 price = registry.globalPricePerMillionUnits();
+        require(price != 0, "zero network price");
+
         uint256 nonce = nonces[msg.sender]++;
         channelId = keccak256(
             abi.encode(block.chainid, address(this), msg.sender, provider, nonce)
@@ -95,11 +107,12 @@ contract WQPUComputeMarket {
             deposited: uint128(amount),
             paid: 0,
             cumulativeUnits: 0,
+            pricePerMillionUnits: price,
             expiresAt: expiresAt,
             refunded: false
         });
 
-        emit ChannelOpened(channelId, msg.sender, provider, amount, expiresAt);
+        emit ChannelOpened(channelId, msg.sender, provider, amount, price, expiresAt);
     }
 
     function topUp(bytes32 channelId, uint256 amount) external {
@@ -116,9 +129,18 @@ contract WQPUComputeMarket {
         emit ChannelToppedUp(channelId, amount, newDeposit);
     }
 
+    function amountForUnits(bytes32 channelId, uint256 cumulativeUnits)
+        public
+        view
+        returns (uint256)
+    {
+        Channel storage channel = channels[channelId];
+        require(channel.requester != address(0), "unknown channel");
+        return (cumulativeUnits * uint256(channel.pricePerMillionUnits)) / PRICE_UNITS;
+    }
+
     /// @notice Claim the newest cumulative voucher signed by the requester.
-    /// @param cumulativeAmount Total WQPU owed to the provider so far.
-    /// @param cumulativeUnits Total accepted compute units served so far.
+    /// @dev The amount must exactly match the network price captured at channel open.
     function claim(
         bytes32 channelId,
         uint256 cumulativeAmount,
@@ -129,10 +151,11 @@ contract WQPUComputeMarket {
         require(channel.provider == msg.sender, "not provider");
         require(!channel.refunded, "refunded");
         require(block.timestamp <= uint256(channel.expiresAt) + CLAIM_GRACE, "claim closed");
-        require(cumulativeAmount <= channel.deposited, "over deposit");
-        require(cumulativeAmount > channel.paid, "nothing new");
         require(cumulativeUnits >= channel.cumulativeUnits, "units decreased");
         require(cumulativeUnits <= type(uint128).max, "units too large");
+        require(cumulativeAmount == amountForUnits(channelId, cumulativeUnits), "wrong network price");
+        require(cumulativeAmount <= channel.deposited, "over deposit");
+        require(cumulativeAmount > channel.paid, "nothing new");
 
         bytes32 digest = voucherDigest(channelId, cumulativeAmount, cumulativeUnits);
         require(_recover(digest, signature) == channel.requester, "bad voucher");
