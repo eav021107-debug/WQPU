@@ -42,7 +42,7 @@ document.getElementById('endpoint').textContent = CFG.endpoint;
 if(!CFG.registerNode) document.getElementById('endpointRow').style.display='none';
 if(CFG.session) {
   const row=document.getElementById('sessionRow'); row.style.display='block';
-  row.textContent='Local payment session: limit '+CFG.session.maxAmount+' token-wei, valid until '+new Date(Number(CFG.session.validUntil)*1000).toLocaleString();
+  row.textContent='Payment session: limit '+CFG.session.maxAmount+' token-wei; network price '+CFG.session.pricePerMillionUnits+' per 1M units; valid until '+new Date(Number(CFG.session.validUntil)*1000).toLocaleString();
 }
 document.getElementById('connect').textContent = CFG.registerNode && CFG.session ? 'Connect, register and authorize session' : (CFG.registerNode ? 'Connect wallet and register node' : 'Authorize payment session');
 function hexPad(v){return BigInt(v).toString(16).padStart(64,'0')}
@@ -79,17 +79,18 @@ function sessionTypedData(account){
         {name:'name',type:'string'},{name:'version',type:'string'},
         {name:'chainId',type:'uint256'},{name:'verifyingContract',type:'address'}
       ],
-      SessionAuthorization:[
+      SpendAuthorization:[
         {name:'requester',type:'address'},{name:'sessionKey',type:'address'},
         {name:'sessionId',type:'bytes32'},{name:'maxAmount',type:'uint128'},
-        {name:'validUntil',type:'uint64'}
+        {name:'pricePerMillionUnits',type:'uint128'},{name:'validUntil',type:'uint64'}
       ]
     },
-    primaryType:'SessionAuthorization',
+    primaryType:'SpendAuthorization',
     domain:{name:'WQPU Compute Market',version:'1',chainId:Number(BigInt(CFG.chainId)),verifyingContract:CFG.session.market},
     message:{
       requester:account,sessionKey:CFG.session.sessionKey,sessionId:CFG.session.sessionId,
-      maxAmount:String(CFG.session.maxAmount),validUntil:String(CFG.session.validUntil)
+      maxAmount:String(CFG.session.maxAmount),pricePerMillionUnits:String(CFG.session.pricePerMillionUnits),
+      validUntil:String(CFG.session.validUntil)
     }
   };
 }
