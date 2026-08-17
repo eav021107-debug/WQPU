@@ -24,6 +24,32 @@ class AttestationError(RuntimeError):
     pass
 
 
+# Normal WQPU runs one node per process and therefore use wqpu.CERT/KEY. This optional
+# registry exists for integration tests and future multi-instance daemons where several
+# isolated node identities intentionally share one Python process.
+_IDENTITIES = {}
+
+
+def register_identity(node_id, cert_path, key_path):
+    node_id = str(node_id or "")
+    if not node_id:
+        raise AttestationError("node id is required for attestation identity")
+    _IDENTITIES[node_id] = (Path(cert_path), Path(key_path))
+
+
+def unregister_identity(node_id):
+    _IDENTITIES.pop(str(node_id or ""), None)
+
+
+def _identity_for_report(report):
+    node_id = str((report or {}).get("provider_node_id") or "")
+    found = _IDENTITIES.get(node_id)
+    if found:
+        return found
+    wqpu.ensure_cert()
+    return Path(wqpu.CERT), Path(wqpu.KEY)
+
+
 def _canonical(report):
     body = dict(report or {})
     body.pop("signature", None)
@@ -58,11 +84,11 @@ def certificate_fingerprint(pem):
 
 
 def sign_report(report):
-    wqpu.ensure_cert()
     openssl = _openssl()
+    cert_path, key_path = _identity_for_report(report)
     payload = _canonical(report)
     proc = subprocess.run(
-        [openssl, "dgst", "-sha256", "-sign", str(wqpu.KEY)],
+        [openssl, "dgst", "-sha256", "-sign", str(key_path)],
         input=payload,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -70,7 +96,7 @@ def sign_report(report):
     if proc.returncode != 0:
         raise AttestationError("could not sign worker usage report")
     signed = dict(report)
-    signed["certificate"] = wqpu.CERT.read_text()
+    signed["certificate"] = cert_path.read_text()
     signed["signature"] = base64.b64encode(proc.stdout).decode("ascii")
     return signed
 
