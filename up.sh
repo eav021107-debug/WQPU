@@ -34,7 +34,8 @@ Run the SAME command on every Linux/macOS machine:
 Normal mode has no host/join role, peer IP, RPC, or compute slot arguments.
 Bootstrap is intentionally invisible: the client first tries its locally saved
 verified WQPU RPC addrbook, then repository-shipped trusted bootstrap RPCs. Every
-candidate is re-verified against the WQPU chain id and native protocol before use.
+production candidate must use TLS and is re-verified against the WQPU chain id,
+native protocol and pinned canonical block checkpoint before use.
 After blockchain access, compute peers are discovered only from the on-chain registry.
 
 WQPU chain nodes use CometBFT PEX + persistent addrbook.json so public seed nodes
@@ -127,6 +128,7 @@ rm -f "$archive"
 [ -f "$stage/chain/devnet.sh" ] || fail "downloaded source is incomplete"
 [ -f "$stage/bootstrap-rpcs.txt" ] || fail "trusted bootstrap manifest is missing"
 [ -f "$stage/bootstrap-p2p.txt" ] || fail "P2P bootstrap manifest is missing"
+[ -f "$stage/chain-checkpoint.txt" ] || fail "canonical WQPU checkpoint manifest is missing"
 rm -rf "$SOURCE_DIR"
 mv "$stage" "$SOURCE_DIR"
 
@@ -166,26 +168,71 @@ case "$local_ip" in
   ""|*[!0-9.]*) fail "invalid local IPv4 address: $local_ip" ;;
 esac
 
-bootstrap_scheme_allowed() {
-  python3 - "$1" "${WQPU_DEV_ALLOW_INSECURE_RPC:-0}" <<'PY'
+trusted_scheme_allowed() {
+  python3 - "$1" <<'PY'
 import sys
 from urllib.parse import urlparse
 u = urlparse(sys.argv[1])
-allow_insecure = sys.argv[2] == "1"
+if u.username or u.password or u.fragment or not u.hostname:
+    raise SystemExit(1)
+raise SystemExit(0 if u.scheme in ("https", "wss") else 1)
+PY
+}
+
+dev_scheme_allowed() {
+  python3 - "$1" "${WQPU_DEV_MODE:-0}" "${WQPU_DEV_ALLOW_INSECURE_RPC:-0}" <<'PY'
+import sys
+from urllib.parse import urlparse
+u = urlparse(sys.argv[1])
+dev_mode = sys.argv[2] == "1"
+allow_insecure = sys.argv[3] == "1"
 if u.username or u.password or u.fragment or not u.hostname:
     raise SystemExit(1)
 if u.scheme in ("https", "wss"):
     raise SystemExit(0)
-if allow_insecure and u.scheme in ("http", "ws"):
+if dev_mode and allow_insecure and u.scheme in ("http", "ws"):
     raise SystemExit(0)
 raise SystemExit(1)
 PY
 }
 
-verify_wqpu_rpc() {
+load_chain_checkpoint() {
+  python3 - "$SOURCE_DIR/chain-checkpoint.txt" <<'PY'
+from pathlib import Path
+import re, sys
+path = Path(sys.argv[1])
+entries = []
+for raw in path.read_text(encoding="utf-8").splitlines():
+    value = raw.split("#", 1)[0].strip()
+    if value:
+        entries.append(value)
+if len(entries) != 1:
+    raise SystemExit(1)
+parts = entries[0].split()
+if len(parts) != 2:
+    raise SystemExit(1)
+block, block_hash = parts
+if not block.isdigit() or int(block) <= 0 or int(block) > (2**64 - 1):
+    raise SystemExit(1)
+if not re.fullmatch(r"0x[0-9a-fA-F]{64}", block_hash):
+    raise SystemExit(1)
+print(block, block_hash.lower())
+PY
+}
+
+verify_dev_rpc() {
   local candidate="$1"
-  bootstrap_scheme_allowed "$candidate" || return 1
+  dev_scheme_allowed "$candidate" || return 1
   (cd "$SOURCE_DIR/client" && GOWORK=off go run ./cmd/wqpu-rpc-verify "$candidate") >/dev/null 2>&1
+}
+
+verify_trusted_rpc() {
+  local candidate="$1" checkpoint block block_hash
+  trusted_scheme_allowed "$candidate" || return 1
+  checkpoint="$(load_chain_checkpoint 2>/dev/null)" || return 1
+  block="${checkpoint%% *}"
+  block_hash="${checkpoint#* }"
+  (cd "$SOURCE_DIR/client" && GOWORK=off go run ./cmd/wqpu-rpc-verify "$candidate" "$block" "$block_hash") >/dev/null 2>&1
 }
 
 try_rpc_file() {
@@ -196,7 +243,7 @@ try_rpc_file() {
     line="$(printf '%s' "$line" | tr -d '[:space:]')"
     [ -n "$line" ] || continue
     candidate="$line"
-    if verify_wqpu_rpc "$candidate"; then
+    if verify_trusted_rpc "$candidate"; then
       printf '%s\n' "$candidate"
       return 0
     fi
@@ -228,16 +275,17 @@ PY
 
 find_trusted_rpc() {
   # Manual RPC injection is disabled in normal mode. It exists only for explicit
-  # local development and still has to pass WQPU chain verification.
+  # local development and still has to pass WQPU chain/protocol verification.
   if [ "${WQPU_DEV_MODE:-0}" = "1" ] && [ -n "${WQPU_CHAIN_RPC:-}" ]; then
-    if verify_wqpu_rpc "$WQPU_CHAIN_RPC"; then
+    if verify_dev_rpc "$WQPU_CHAIN_RPC"; then
       printf '%s\n' "$WQPU_CHAIN_RPC"
       return 0
     fi
   fi
 
-  # Bitcoin/Cosmos-style behavior: prefer peers/gateways this machine already
+  # Bitcoin/Cosmos-style behavior: prefer gateways this machine already
   # verified successfully, then fall back to the shipped first-contact set.
+  # Both paths are rechecked against the pinned canonical WQPU checkpoint.
   try_rpc_file "$BOOTSTRAP_CACHE" && return 0
   try_rpc_file "$SOURCE_DIR/bootstrap-rpcs.txt" && return 0
   return 1
@@ -296,10 +344,13 @@ start_provider_background() {
 
 rpc=""
 if rpc="$(find_trusted_rpc 2>/dev/null)"; then
-  remember_verified_rpc "$rpc"
+  if [ "${WQPU_DEV_MODE:-0}" != "1" ] || [ "$rpc" != "${WQPU_CHAIN_RPC:-}" ]; then
+    remember_verified_rpc "$rpc"
+  fi
   say "WQPU UP: connected to verified WQPU network."
 elif [ "${WQPU_DEV_LOCAL_FALLBACK:-0}" = "1" ]; then
   say "WQPU UP: development fallback enabled; starting isolated local WQPU devnet."
+  export WQPU_DEV_MODE=1
   export WQPU_DEV_ALLOW_INSECURE_RPC=1
   WQPU_DEVNET_TEST_ADDRESS="$(cd "$SOURCE_DIR/chain" && GOWORK=off go run ./cmd/wqpu-compute-bootstrap address)"
   export WQPU_DEVNET_TEST_ADDRESS
@@ -309,7 +360,7 @@ elif [ "${WQPU_DEV_LOCAL_FALLBACK:-0}" = "1" ]; then
   rpc="http://127.0.0.1:8545"
   wait_local_rpc "$rpc" "$CHAIN_PID"
 else
-  fail "trusted WQPU bootstrap is unavailable; refusing LAN discovery, arbitrary RPCs, or automatic network creation"
+  fail "trusted WQPU bootstrap/checkpoint is unavailable; refusing LAN discovery, arbitrary RPCs, or automatic network creation"
 fi
 
 slot="$(slot_helper free "$rpc")"
