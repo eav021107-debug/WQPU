@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "public": {
     "enabled": false,
     "chain_id": null,
@@ -11,6 +11,9 @@
     "market": null,
     "relayer_url": null,
     "relays": [],
+    "payments_enabled": false,
+    "auto_claim": false,
+    "payment_enforcement": false,
     "llama_cpp_tag": "b10456",
     "llama_rpc_protocol_major": 5,
     "llama_rpc_op_count": 101
