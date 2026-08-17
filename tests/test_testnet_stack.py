@@ -1,4 +1,5 @@
 import importlib.util
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -37,6 +38,24 @@ class TestnetStackTests(unittest.TestCase):
         self.assertEqual(public["relays"][0]["fingerprint"], "ab" * 32)
         self.assertFalse(public["payments_enabled"])
         self.assertEqual(public["llama_cpp_tag"], "b10456")
+
+    def test_new_anvil_dumps_state_without_loading_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            cmd = stack.build_anvil_command(28545, path)
+            self.assertIn("--dump-state", cmd)
+            self.assertIn("--state-interval", cmd)
+            self.assertNotIn("--load-state", cmd)
+
+    def test_existing_anvil_state_is_loaded_and_dumped_again(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "state.json"
+            path.write_text("{}")
+            cmd = stack.build_anvil_command(28545, path)
+            self.assertIn("--load-state", cmd)
+            self.assertIn("--dump-state", cmd)
+            self.assertEqual(cmd[cmd.index("--load-state") + 1], str(path))
+            self.assertEqual(cmd[cmd.index("--dump-state") + 1], str(path))
 
 
 if __name__ == "__main__":
