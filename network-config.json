@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "public": {
+    "enabled": false,
+    "chain_id": null,
+    "chain_name": "WQPU",
+    "native_symbol": "WQPU",
+    "rpc_url": null,
+    "token": null,
+    "registry": null,
+    "market": null
+  }
+}
