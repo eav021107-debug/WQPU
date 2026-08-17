@@ -4,7 +4,7 @@ $root = Join-Path $env:LOCALAPPDATA 'WQPU'
 $bin = Join-Path $root 'bin'
 $join = $env:WQPU_JOIN
 $expectedWqpu = 'WQPU 0.6.0-dev'
-$cacheBuster = 'chain-0.6.0-dev-r2'
+$cacheBuster = 'chain-0.6.0-dev-r3'
 $chainState = Join-Path $HOME '.wqpu\chain.json'
 
 New-Item -ItemType Directory -Force -Path $root,$bin | Out-Null
@@ -116,6 +116,12 @@ $env:Path="$bin;$env:Path"
 
 $ver = if ($extra) { (& $exe $extra --version 2>&1) } else { (& $exe --version 2>&1) }
 Write-Host "WQPU installed: $coreVersion with $ver." -ForegroundColor Green
+
+if ($env:WQPU_NO_START -eq '1') {
+  Write-Host 'WQPU install-only mode: not starting the node.'
+  exit 0
+}
+
 if (-not [string]::IsNullOrWhiteSpace($join)) {
   & $launcher --join $join
 } elseif (($env:WQPU_RPC_URL -and $env:WQPU_REGISTRY) -or (Test-Path $chainState) -or $publicEnabled) {
