@@ -57,7 +57,14 @@ def main():
     import wqpu_runtime as runtime
     runtime.save_usage_receipt = wqpu_accounting.save_usage_receipt
 
+    # Public-network security is layered on only for ChainMesh. Legacy/private mode
+    # keeps the original Mesh behavior.
+    import wqpu_network_guard
+    wqpu_network_guard.install(runtime)
+
     import wqpu_autopay
+    import wqpu_public_security
+    wqpu_public_security.install(wqpu_autopay.AutoPayChainMesh)
     return wqpu_autopay.main()
 
 
