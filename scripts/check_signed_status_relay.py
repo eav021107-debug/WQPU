@@ -124,13 +124,19 @@ async def check():
         if not any(node_id == worker.me for node_id, _ in requester.peers()):
             raise RuntimeError("fresh signed worker status became unschedulable")
 
-        # Keep the valid signature but lie about the advertised load. Requester must
-        # reject this because public fields no longer match the signed status body.
+        # Keep the valid signature but lie about the advertised load. Send the tampered
+        # snapshot through the same relay service as a real heartbeat. Requester must
+        # reject it because public fields no longer match the signed status body.
         info = worker.my_info()
         tampered = dict(info)
         tampered["load_bps"] = 0
         for ctrl in list(worker.outbound.values()):
-            await worker.send(ctrl, {"type": "status", "info": tampered})
+            await worker.send(ctrl, {
+                "type": "open",
+                "service": "status",
+                "source": worker.me,
+                "info": tampered,
+            })
         await asyncio.sleep(0.5)
         if int(requester.peer_info[worker.me]["load_bps"]) != 8500:
             raise RuntimeError("tampered dynamic load crossed the signed relay boundary")
