@@ -243,9 +243,8 @@ async def wait_for_registration(chain, wallet, endpoint, fingerprint, timeout=12
 def configured_chain(args, state):
     rpc_url = args.rpc_url or os.environ.get("WQPU_RPC_URL") or state.get("rpc_url")
     registry = args.registry or os.environ.get("WQPU_REGISTRY") or state.get("registry")
-    if not rpc_url or not registry:
-        return None
-    return RegistryClient(rpc_url=rpc_url, registry=registry)
+    client = RegistryClient(rpc_url=rpc_url, registry=registry)
+    return client if client.configured else None
 
 
 async def ensure_wallet(chain, state, force=False):
@@ -264,6 +263,8 @@ async def ensure_wallet(chain, state, force=False):
             raise RuntimeError("could not verify saved wallet registration on the WQPU chain")
 
     chain_id = await wqpu.to_thread(chain.chain_id)
+    chain_name = os.environ.get("WQPU_CHAIN_NAME") or chain.network.get("chain_name")
+    native_symbol = os.environ.get("WQPU_NATIVE_SYMBOL") or chain.network.get("native_symbol")
     print("WQPU: opening browser wallet connector...")
     result = await wqpu.to_thread(
         connect_wallet,
@@ -275,8 +276,8 @@ async def ensure_wallet(chain, state, force=False):
         chain_id,
         180,
         chain.rpc_url,
-        os.environ.get("WQPU_CHAIN_NAME"),
-        os.environ.get("WQPU_NATIVE_SYMBOL"),
+        chain_name,
+        native_symbol,
     )
     wallet = str(result["wallet"]).lower()
 
@@ -351,8 +352,8 @@ async def run_public(args):
     chain = configured_chain(args, state)
     if chain is None:
         raise RuntimeError(
-            "public chain is not configured; set WQPU_RPC_URL and WQPU_REGISTRY "
-            "or use --legacy for the old private join-code mesh"
+            "public chain is not configured in network-config.json; "
+            "set WQPU_RPC_URL/WQPU_REGISTRY or use --legacy"
         )
 
     wqpu.ensure_cert()
