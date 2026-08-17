@@ -12,6 +12,7 @@ prototype, not the final sovereign WQPU consensus network and not a place for re
 from __future__ import print_function
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -22,6 +23,8 @@ import socket
 import ssl
 import subprocess
 import sys
+import tarfile
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -50,6 +53,10 @@ DEFAULT_RELAY_PORT = 7443
 DEFAULT_CHAIN_ID = 31337
 DEFAULT_PRICE = 10 ** 18
 DEFAULT_SUPPLY = 1_000_000_000
+BACKUP_FORMAT = "wqpu-testnet-backup"
+BACKUP_VERSION = 1
+BACKUP_REQUIRED = ("operator.json", "deployment.json", "anvil-state.json")
+BACKUP_PREFIX = "relay-home/"
 
 
 def secure_write(path, value):
@@ -78,6 +85,11 @@ def pid_alive(pid):
         return True
     except Exception:
         return False
+
+
+def stack_has_live_processes(stack_dir=STACK_DIR):
+    state = load_json(Path(stack_dir) / "state.json", {})
+    return any(pid_alive(pid) for pid in (state.get("pids") or {}).values())
 
 
 def terminate_pid(pid):
@@ -242,6 +254,206 @@ def resolve_public_tls(args, old):
     if not key_path.is_file():
         raise RuntimeError("TLS private key not found: {}".format(key_path))
     return str(cert_path), str(key_path)
+
+
+def _sha256_bytes(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def _safe_backup_member_name(name):
+    name = str(name or "").replace("\\", "/")
+    if not name or name.startswith("/") or name.startswith("../") or "/../" in ("/" + name + "/"):
+        return False
+    if name in BACKUP_REQUIRED:
+        return True
+    return name.startswith(BACKUP_PREFIX) and len(name) > len(BACKUP_PREFIX)
+
+
+def backup_relative_files(stack_dir=STACK_DIR):
+    stack_dir = Path(stack_dir)
+    paths = []
+    for name in BACKUP_REQUIRED:
+        path = stack_dir / name
+        if not path.is_file() or path.is_symlink():
+            raise RuntimeError("testnet backup requires {}".format(path))
+        paths.append((name, path))
+    relay = stack_dir / "relay-home"
+    if not relay.is_dir() or relay.is_symlink():
+        raise RuntimeError("testnet backup requires transport relay identity in {}".format(relay))
+    for path in sorted(relay.rglob("*")):
+        if path.is_symlink():
+            raise RuntimeError("symlinks are not allowed in WQPU testnet backup: {}".format(path))
+        if path.is_file():
+            rel = path.relative_to(stack_dir).as_posix()
+            if not _safe_backup_member_name(rel):
+                raise RuntimeError("unsafe WQPU backup path: {}".format(rel))
+            paths.append((rel, path))
+    if not any(name in ("relay-home/cert.pem", "relay-home/key.pem") for name, _ in paths):
+        raise RuntimeError("transport relay certificate/key are missing")
+    return paths
+
+
+def _destination_outside_stack(destination, stack_dir=STACK_DIR):
+    destination = os.path.abspath(str(Path(destination).expanduser()))
+    stack = os.path.abspath(str(Path(stack_dir)))
+    try:
+        return os.path.commonpath([destination, stack]) != stack
+    except ValueError:
+        return True
+
+
+def create_backup_archive(destination, stack_dir=STACK_DIR):
+    stack_dir = Path(stack_dir)
+    destination = Path(destination).expanduser().resolve()
+    if not _destination_outside_stack(destination, stack_dir):
+        raise RuntimeError("backup archive must be outside the .wqpu-testnet directory")
+    if stack_has_live_processes(stack_dir):
+        raise RuntimeError("stop the WQPU testnet before creating a backup")
+    files = backup_relative_files(stack_dir)
+    deployment = load_json(stack_dir / "deployment.json", {})
+    manifest_files = []
+    payloads = []
+    for rel, path in files:
+        data = path.read_bytes()
+        manifest_files.append({"path": rel, "size": len(data), "sha256": _sha256_bytes(data)})
+        payloads.append((rel, data))
+    manifest = {
+        "format": BACKUP_FORMAT,
+        "version": BACKUP_VERSION,
+        "created_at": int(time.time()),
+        "chain_id": deployment.get("chain_id"),
+        "operator": deployment.get("operator"),
+        "token": deployment.get("token"),
+        "registry": deployment.get("registry"),
+        "market": deployment.get("market"),
+        "files": manifest_files,
+    }
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    tmp = destination.with_name(destination.name + ".tmp-" + secrets.token_hex(4))
+    try:
+        with tarfile.open(str(tmp), "w:gz") as archive:
+            manifest_data = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode("utf-8")
+            info = tarfile.TarInfo("manifest.json")
+            info.size = len(manifest_data)
+            info.mode = 0o600
+            info.mtime = int(time.time())
+            import io
+            archive.addfile(info, io.BytesIO(manifest_data))
+            for rel, data in payloads:
+                info = tarfile.TarInfo(rel)
+                info.size = len(data)
+                info.mode = 0o600
+                info.mtime = int(time.time())
+                archive.addfile(info, io.BytesIO(data))
+        os.replace(str(tmp), str(destination))
+        try:
+            destination.chmod(0o600)
+        except Exception:
+            pass
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+    return destination, manifest
+
+
+def read_backup_archive(archive_path):
+    archive_path = Path(archive_path).expanduser().resolve()
+    if not archive_path.is_file():
+        raise RuntimeError("backup archive not found: {}".format(archive_path))
+    with tarfile.open(str(archive_path), "r:gz") as archive:
+        members = archive.getmembers()
+        names = [member.name.replace("\\", "/") for member in members]
+        if names.count("manifest.json") != 1:
+            raise RuntimeError("backup must contain exactly one manifest.json")
+        for member, name in zip(members, names):
+            if name == "manifest.json":
+                if not member.isfile():
+                    raise RuntimeError("backup manifest is not a regular file")
+                continue
+            if not member.isfile() or member.issym() or member.islnk() or not _safe_backup_member_name(name):
+                raise RuntimeError("unsafe member in WQPU testnet backup: {}".format(name))
+        manifest_file = archive.extractfile("manifest.json")
+        if manifest_file is None:
+            raise RuntimeError("could not read backup manifest")
+        manifest = json.loads(manifest_file.read().decode("utf-8"))
+        if manifest.get("format") != BACKUP_FORMAT or int(manifest.get("version") or 0) != BACKUP_VERSION:
+            raise RuntimeError("unsupported WQPU testnet backup format/version")
+        declared = manifest.get("files")
+        if not isinstance(declared, list):
+            raise RuntimeError("invalid backup manifest file list")
+        declared_by_path = {}
+        for item in declared:
+            if not isinstance(item, dict):
+                raise RuntimeError("invalid backup manifest entry")
+            name = str(item.get("path") or "").replace("\\", "/")
+            if not _safe_backup_member_name(name) or name in declared_by_path:
+                raise RuntimeError("invalid/duplicate backup path: {}".format(name))
+            declared_by_path[name] = item
+        for name in BACKUP_REQUIRED:
+            if name not in declared_by_path:
+                raise RuntimeError("backup is missing required {}".format(name))
+        if "relay-home/cert.pem" not in declared_by_path or "relay-home/key.pem" not in declared_by_path:
+            raise RuntimeError("backup is missing transport relay TLS identity")
+        actual_names = set(name for name in names if name != "manifest.json")
+        if actual_names != set(declared_by_path):
+            raise RuntimeError("backup manifest and archive contents differ")
+        payloads = {}
+        for name, item in declared_by_path.items():
+            fileobj = archive.extractfile(name)
+            if fileobj is None:
+                raise RuntimeError("could not read backup member {}".format(name))
+            data = fileobj.read()
+            if len(data) != int(item.get("size") or -1):
+                raise RuntimeError("backup size mismatch for {}".format(name))
+            if _sha256_bytes(data) != str(item.get("sha256") or "").lower():
+                raise RuntimeError("backup checksum mismatch for {}".format(name))
+            payloads[name] = data
+    return manifest, payloads
+
+
+def restore_backup_archive(archive_path, stack_dir=STACK_DIR):
+    stack_dir = Path(stack_dir)
+    if stack_has_live_processes(stack_dir):
+        raise RuntimeError("stop the WQPU testnet before restore")
+    manifest, payloads = read_backup_archive(archive_path)
+    operator = json.loads(payloads["operator.json"].decode("utf-8"))
+    deployment = json.loads(payloads["deployment.json"].decode("utf-8"))
+    private_key = str(operator.get("private_key") or "").lower()
+    operator_address = str(operator.get("address") or "").lower()
+    if not re.match(r"^0x[0-9a-f]{64}$", private_key) or int(private_key, 16) == 0:
+        raise RuntimeError("backup contains invalid operator private key")
+    if not re.match(r"^0x[0-9a-f]{40}$", operator_address):
+        raise RuntimeError("backup contains invalid operator address")
+    if str(deployment.get("operator") or "").lower() != operator_address:
+        raise RuntimeError("backup deployment/operator identity mismatch")
+    if str(deployment.get("chain_id") or "").lower() != "0x{:x}".format(DEFAULT_CHAIN_ID):
+        raise RuntimeError("backup chain id is incompatible")
+    for key in ("token", "registry", "market"):
+        try:
+            devnet.validate_address(deployment.get(key))
+        except Exception:
+            raise RuntimeError("backup contains invalid deployment {}".format(key))
+    parent = stack_dir.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    staging = Path(tempfile.mkdtemp(prefix=".wqpu-restore-", dir=str(parent)))
+    try:
+        for rel, data in payloads.items():
+            target = staging / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            try:
+                target.chmod(0o600)
+            except Exception:
+                pass
+        if stack_dir.exists():
+            shutil.rmtree(str(stack_dir))
+        os.replace(str(staging), str(stack_dir))
+    finally:
+        if staging.exists():
+            shutil.rmtree(str(staging), ignore_errors=True)
+    return manifest
 
 
 def spawn(name, cmd, env=None):
@@ -607,6 +819,29 @@ def stop(_args):
     return 0
 
 
+def backup(args):
+    destination = args.path
+    if not destination:
+        destination = "wqpu-testnet-backup-{}.tar.gz".format(time.strftime("%Y%m%d-%H%M%S"))
+    path, manifest = create_backup_archive(destination, STACK_DIR)
+    print("WQPU testnet backup created: {}".format(path))
+    print("Registry: {}".format(manifest.get("registry")))
+    print("WARNING: this archive contains TESTNET private keys; keep it private (mode 0600).")
+    return 0
+
+
+def restore(args):
+    if not args.yes:
+        raise RuntimeError("restore replaces the current testnet identity/state; rerun with `restore ARCHIVE --yes`")
+    if stack_has_live_processes(STACK_DIR):
+        raise RuntimeError("stop the WQPU testnet before restore")
+    manifest = restore_backup_archive(args.archive, STACK_DIR)
+    print("WQPU testnet restored from {}.".format(Path(args.archive).expanduser().resolve()))
+    print("Registry: {}".format(manifest.get("registry")))
+    print("Run `start --public-host ...` to publish the restored network from this server.")
+    return 0
+
+
 def reset(args):
     if not args.yes:
         raise RuntimeError("reset destroys the current testnet identity/state; rerun with `reset --yes`")
@@ -679,6 +914,11 @@ def main():
     sub.add_parser("stop")
     sub.add_parser("status")
     sub.add_parser("config")
+    backup_p = sub.add_parser("backup", help="create a private portable archive of chain/operator/relay identity")
+    backup_p.add_argument("path", nargs="?", default=None)
+    restore_p = sub.add_parser("restore", help="restore a private WQPU testnet backup")
+    restore_p.add_argument("archive")
+    restore_p.add_argument("--yes", action="store_true", help="confirm replacement of local testnet identity/state")
     reset_p = sub.add_parser("reset", help="destroy persisted TESTNET state and create a new network on next start")
     reset_p.add_argument("--yes", action="store_true", help="confirm destructive testnet reset")
     args = ap.parse_args()
@@ -691,6 +931,10 @@ def main():
         return status(args)
     if command == "config":
         return print_config(args)
+    if command == "backup":
+        return backup(args)
+    if command == "restore":
+        return restore(args)
     if command == "reset":
         return reset(args)
     return 2
