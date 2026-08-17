@@ -6,7 +6,7 @@ ROOT="${HOME}/.local/share/wqpu"
 BIN="${HOME}/.local/bin"
 JOIN="${WQPU_JOIN:-${1:-}}"
 EXPECTED_WQPU="WQPU 0.6.0-dev"
-CACHE_BUSTER="chain-0.6.0-dev-r1"
+CACHE_BUSTER="chain-0.6.0-dev-r2"
 CHAIN_STATE="${HOME}/.wqpu/chain.json"
 
 need() { command -v "$1" >/dev/null 2>&1; }
@@ -76,7 +76,7 @@ fi
 mkdir -p "$ROOT" "$BIN"
 
 echo "WQPU: downloading runtime..."
-for file in wqpu.py wqpu_chain.py wqpu_wallet.py wqpu_runtime.py; do
+for file in wqpu.py wqpu_chain.py wqpu_wallet.py wqpu_runtime.py network-config.json; do
   curl -fsSL --retry 3 "${RAW}/${file}?installer=${CACHE_BUSTER}" -o "$ROOT/$file"
 done
 chmod 755 "$ROOT/wqpu.py" "$ROOT/wqpu_chain.py" "$ROOT/wqpu_wallet.py" "$ROOT/wqpu_runtime.py"
@@ -90,11 +90,18 @@ chmod 755 "$ROOT/wqpu.py" "$ROOT/wqpu_chain.py" "$ROOT/wqpu_wallet.py" "$ROOT/wq
     exit 1
   }
 
+"$PYTHON" -c 'import json,sys; json.load(open(sys.argv[1]))' "$ROOT/network-config.json" || {
+  echo "WQPU network configuration is invalid." >&2
+  exit 1
+}
+
 CORE_VERSION="$("$PYTHON" "$ROOT/wqpu_runtime.py" --version 2>&1 || true)"
 if [ "$CORE_VERSION" != "$EXPECTED_WQPU" ]; then
   echo "WQPU version mismatch: expected '$EXPECTED_WQPU', got '${CORE_VERSION:-unknown}'." >&2
   exit 1
 fi
+
+PUBLIC_ENABLED="$("$PYTHON" -c 'import json,sys; d=json.load(open(sys.argv[1])); print("1" if (d.get("public") or {}).get("enabled") else "0")' "$ROOT/network-config.json")"
 
 cat > "$BIN/wqpu" <<EOF
 #!/usr/bin/env sh
@@ -115,9 +122,9 @@ fi
 echo "WQPU installed: $CORE_VERSION with $($PYTHON --version 2>&1)."
 if [ -n "$JOIN" ]; then
   exec "$BIN/wqpu" --join "$JOIN"
-elif { [ -n "${WQPU_RPC_URL:-}" ] && [ -n "${WQPU_REGISTRY:-}" ]; } || [ -f "$CHAIN_STATE" ]; then
+elif { [ -n "${WQPU_RPC_URL:-}" ] && [ -n "${WQPU_REGISTRY:-}" ]; } || [ -f "$CHAIN_STATE" ] || [ "$PUBLIC_ENABLED" = "1" ]; then
   exec "$BIN/wqpu"
 else
-  echo "WQPU public chain is not configured yet; starting the existing private mesh."
+  echo "WQPU public chain is not published yet; starting the existing private mesh."
   exec "$BIN/wqpu" --legacy
 fi
