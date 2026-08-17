@@ -98,19 +98,20 @@ async def main_async():
         "host": "127.0.0.1",
         "port": relay.server.sockets[0].getsockname()[1],
         "fingerprint": fp,
+        "relay": True,
     }
 
     rpc_server = await asyncio.start_server(echo_handler, "127.0.0.1", 0)
     old_rpc_port = wqpu.RPC_PORT
     wqpu.RPC_PORT = rpc_server.sockets[0].getsockname()[1]
 
-    requester = wqpu_autopay.AutoPayChainMesh(
-        {"secret": secret, "peers": []}, FakeChain(), REQUESTER_WALLET
-    )
+    # Match the real public runtime: a relay used for routing must be present in the
+    # configured peer set, not merely connected ad hoc. `routes` stores only the relay
+    # route key; open_rpc resolves that key back to this pinned host/port/fingerprint.
+    mesh_cfg = {"secret": secret, "peers": [relay_peer]}
+    requester = wqpu_autopay.AutoPayChainMesh(mesh_cfg, FakeChain(), REQUESTER_WALLET)
     requester.me = "requester-node"
-    worker = wqpu_autopay.AutoPayChainMesh(
-        {"secret": secret, "peers": []}, FakeChain(), WORKER_WALLET
-    )
+    worker = wqpu_autopay.AutoPayChainMesh(mesh_cfg, FakeChain(), WORKER_WALLET)
     worker.me = "worker-node"
 
     requester.chain_nodes[WORKER_WALLET] = {"fingerprint": fp}
