@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """WQPU public-chain runtime.
 
-Public mode uses the blockchain registry only for discovery/identity/price.
-Private keys never enter WQPU: node registration is submitted by an injected
-browser wallet through wqpu_wallet.py.
+Public mode uses the blockchain registry for discovery/identity/price. The browser
+wallet registers the node and authorizes a bounded local payment session; wallet
+private keys never enter WQPU.
 """
 
 from __future__ import print_function
@@ -13,6 +13,7 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
 import signal
 import socket
 import sys
@@ -20,11 +21,14 @@ import time
 
 import wqpu
 from wqpu_chain import RegistryClient, parse_endpoint
+from wqpu_session import load_session, save_session, session_address
 from wqpu_wallet import connect_wallet
 
 VERSION = "0.6.0-dev"
 STATE_FILE = wqpu.HOME / "chain.json"
 PUBLIC_PROTOCOL = "wqpu-public-v1"
+DEFAULT_SESSION_MAX_AMOUNT = 10 * 10 ** 18
+DEFAULT_SESSION_LIFETIME = 24 * 60 * 60
 
 
 def load_state():
@@ -124,6 +128,75 @@ def registration_matches(node, endpoint, fingerprint):
     return str(node.get("endpoint") or "") == endpoint and registered_fp == expected_fp
 
 
+def configured_market(chain, state):
+    return (
+        os.environ.get("WQPU_MARKET")
+        or state.get("market")
+        or chain.network.get("market")
+        or ""
+    ).strip().lower()
+
+
+def latest_block_timestamp(chain):
+    block = chain.rpc("eth_getBlockByNumber", ["latest", False])
+    return int(block["timestamp"], 16)
+
+
+def make_session_request(chain, market):
+    max_amount = int(os.environ.get("WQPU_SESSION_MAX_AMOUNT", str(DEFAULT_SESSION_MAX_AMOUNT)))
+    lifetime = int(os.environ.get("WQPU_SESSION_LIFETIME", str(DEFAULT_SESSION_LIFETIME)))
+    if max_amount <= 0 or max_amount >= 2 ** 128:
+        raise RuntimeError("WQPU_SESSION_MAX_AMOUNT must fit uint128")
+    if lifetime < 60:
+        raise RuntimeError("WQPU_SESSION_LIFETIME must be at least 60 seconds")
+    now = latest_block_timestamp(chain)
+    return {
+        "market": market,
+        "sessionKey": session_address(chain),
+        "sessionId": "0x" + secrets.token_hex(32),
+        "maxAmount": max_amount,
+        "validUntil": now + lifetime,
+    }
+
+
+def session_is_usable(chain, wallet, market):
+    if not market:
+        return True
+    saved = load_session()
+    if not saved:
+        return False
+    try:
+        now = latest_block_timestamp(chain)
+        local_key = session_address(chain)
+        return (
+            str(saved.get("requester") or "").lower() == wallet.lower()
+            and str(saved.get("market") or "").lower() == market.lower()
+            and str(saved.get("chain_id") or "").lower() == chain.chain_id().lower()
+            and str(saved.get("session_key") or "").lower() == local_key.lower()
+            and str(saved.get("authorization_signature") or "").startswith("0x")
+            and int(saved.get("valid_until") or 0) > now + 60
+            and int(saved.get("max_amount") or 0) > 0
+        )
+    except Exception:
+        return False
+
+
+def persist_session(wallet, chain_id, request, signature):
+    if not request or not signature:
+        return
+    save_session({
+        "requester": wallet.lower(),
+        "market": request["market"].lower(),
+        "chain_id": chain_id.lower(),
+        "session_key": request["sessionKey"].lower(),
+        "session_id": request["sessionId"].lower(),
+        "max_amount": int(request["maxAmount"]),
+        "valid_until": int(request["validUntil"]),
+        "authorization_signature": signature,
+        "authorized_at": int(time.time()),
+    })
+
+
 class ChainMesh(wqpu.Mesh):
     def __init__(self, cfg, chain, wallet):
         super(ChainMesh, self).__init__(cfg)
@@ -133,6 +206,7 @@ class ChainMesh(wqpu.Mesh):
         self.chain_nodes = {}
         self.chain_peers = {}
         self.verified_node_ids = set()
+        self.payment_session = load_session()
 
     def my_info(self):
         info = super(ChainMesh, self).my_info()
@@ -176,8 +250,6 @@ class ChainMesh(wqpu.Mesh):
 
     async def refresh_chain(self):
         try:
-            # Registration is persistent. Liveness/load comes from direct P2P, so a wallet
-            # does not need to approve an on-chain heartbeat transaction every few minutes.
             nodes = await wqpu.to_thread(self.chain.discover, self.wallet or None, 512, 0)
             self.merge_chain_nodes(nodes)
             self.chain_price = await wqpu.to_thread(self.chain.global_price)
@@ -190,9 +262,7 @@ class ChainMesh(wqpu.Mesh):
             if tick % 4 == 0:
                 await self.refresh_chain()
 
-            candidates = dict(self.chain_peers)
-
-            for key, peer in list(candidates.items()):
+            for key, peer in list(self.chain_peers.items()):
                 if key in self.outbound:
                     continue
                 try:
@@ -247,24 +317,63 @@ def configured_chain(args, state):
     return client if client.configured else None
 
 
+async def authorize_session(chain, state, wallet, endpoint, fingerprint, market):
+    chain_id = await wqpu.to_thread(chain.chain_id)
+    request = await wqpu.to_thread(make_session_request, chain, market)
+    chain_name = os.environ.get("WQPU_CHAIN_NAME") or chain.network.get("chain_name")
+    native_symbol = os.environ.get("WQPU_NATIVE_SYMBOL") or chain.network.get("native_symbol")
+    print("WQPU: payment session needs one wallet authorization...")
+    result = await wqpu.to_thread(
+        connect_wallet,
+        chain.registry,
+        endpoint,
+        fingerprint,
+        capacity_units(),
+        system_load_bps(),
+        chain_id,
+        180,
+        chain.rpc_url,
+        chain_name,
+        native_symbol,
+        False,
+        request,
+    )
+    connected = str(result["wallet"]).lower()
+    if connected != wallet.lower():
+        raise RuntimeError("payment session was authorized by a different wallet")
+    signature = result.get("session_authorization_signature")
+    persist_session(wallet, chain_id, request, signature)
+    state["market"] = market
+    save_state(state)
+    print("WQPU: bounded local payment session authorized.")
+
+
 async def ensure_wallet(chain, state, force=False):
     wallet = str(state.get("wallet") or "").lower()
     endpoint = os.environ.get("WQPU_PUBLIC_ENDPOINT", "").strip() or state.get("public_endpoint") or local_endpoint()
     parse_endpoint(endpoint)
     fingerprint = "0x" + wqpu.cert_fingerprint()
+    market = configured_market(chain, state)
 
+    registration_ok = False
     if wallet and not force:
         try:
             node = await wqpu.to_thread(chain.find_wallet, wallet, 512)
-            if registration_matches(node, endpoint, fingerprint):
-                return wallet
-            print("WQPU: saved wallet registration no longer matches this node; reconnecting wallet...")
+            registration_ok = registration_matches(node, endpoint, fingerprint)
         except Exception:
             raise RuntimeError("could not verify saved wallet registration on the WQPU chain")
+
+        if registration_ok:
+            if market and not session_is_usable(chain, wallet, market):
+                await authorize_session(chain, state, wallet, endpoint, fingerprint, market)
+            return wallet
+        print("WQPU: saved wallet registration no longer matches this node; reconnecting wallet...")
 
     chain_id = await wqpu.to_thread(chain.chain_id)
     chain_name = os.environ.get("WQPU_CHAIN_NAME") or chain.network.get("chain_name")
     native_symbol = os.environ.get("WQPU_NATIVE_SYMBOL") or chain.network.get("native_symbol")
+    session_request = await wqpu.to_thread(make_session_request, chain, market) if market else None
+
     print("WQPU: opening browser wallet connector...")
     result = await wqpu.to_thread(
         connect_wallet,
@@ -278,6 +387,8 @@ async def ensure_wallet(chain, state, force=False):
         chain.rpc_url,
         chain_name,
         native_symbol,
+        True,
+        session_request,
     )
     wallet = str(result["wallet"]).lower()
 
@@ -290,19 +401,28 @@ async def ensure_wallet(chain, state, force=False):
         "wallet": wallet,
         "rpc_url": chain.rpc_url,
         "registry": chain.registry,
+        "market": market or None,
         "chain_id": chain_id,
         "public_endpoint": endpoint,
         "registration_tx": result.get("tx_hash"),
     })
     save_state(state)
+    persist_session(
+        wallet,
+        chain_id,
+        session_request,
+        result.get("session_authorization_signature"),
+    )
     print("WQPU: node registration confirmed on-chain.")
+    if session_request:
+        print("WQPU: bounded local payment session authorized.")
     return wallet
 
 
 async def interactive(mesh, server_bin):
     wqpu.ensure_console_stdin()
     print("\nWQPU public peer is online. Type a question.")
-    print("Commands: /status  /peers  /chain  /wallet  /exit\n")
+    print("Commands: /status  /peers  /chain  /wallet  /session  /exit\n")
     while not mesh.stop.is_set():
         try:
             line = (await wqpu.to_thread(input, "wqpu> ")).strip()
@@ -321,10 +441,20 @@ async def interactive(mesh, server_bin):
         if line == "/wallet":
             print(mesh.wallet or "No wallet connected")
             continue
+        if line == "/session":
+            session = load_session()
+            if not session:
+                print("No payment session authorized.")
+            else:
+                print("Session key: {}".format(session.get("session_key")))
+                print("Limit: {} token-wei".format(session.get("max_amount")))
+                print("Valid until: {}".format(session.get("valid_until")))
+            continue
         if line == "/chain":
             price = mesh.chain_price
             print("RPC: {}".format(mesh.chain.rpc_url))
             print("Registry: {}".format(mesh.chain.registry))
+            print("Market: {}".format(configured_market(mesh.chain, load_state()) or "unconfigured"))
             print("Global price / 1M units: {}".format(price if price is not None else "unavailable"))
             print("Known active wallets: {}".format(len(mesh.chain_nodes)))
             continue
