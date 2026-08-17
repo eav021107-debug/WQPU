@@ -9,6 +9,7 @@ SRC_DIR="${WQPU_CHAIN_SRC:-$HOME/.cache/wqpu-chain/cosmos-evm-$COSMOS_EVM_TAG}"
 BIN_DIR="${WQPU_CHAIN_BIN_DIR:-$HOME/.local/share/wqpu-chain/bin}"
 CHAIN_HOME="${WQPU_CHAIN_HOME:-$HOME/.wqpu-chain-dev}"
 DEV_TEST_ADDRESS="${WQPU_DEVNET_TEST_ADDRESS:-}"
+PUBLIC_JSON_RPC="${WQPU_DEVNET_PUBLIC_RPC:-0}"
 BIN="$BIN_DIR/wqpud"
 KEYRING="test" # local devnet only; never use this backend for a public validator
 RESET=0
@@ -20,6 +21,9 @@ Usage: chain/devnet.sh [--reset] [--build-only]
 
 --reset       delete only the local WQPU devnet state and create a fresh genesis
 --build-only  fetch/verify/patch/build the pinned WQPU chain runtime, then exit
+
+Set WQPU_DEVNET_PUBLIC_RPC=1 only for an isolated LAN test. It binds the devnet
+JSON-RPC/WS ports to all interfaces so other physical WQPU machines can join.
 EOF
 }
 
@@ -32,6 +36,11 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+if [ "$PUBLIC_JSON_RPC" != "0" ] && [ "$PUBLIC_JSON_RPC" != "1" ]; then
+  echo "WQPU_DEVNET_PUBLIC_RPC must be 0 or 1." >&2
+  exit 2
+fi
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -142,12 +151,33 @@ python3 "$HERE/devnet_config.py" app-toml "$CHAIN_HOME/config/app.toml" \
   --evm-chain-id "$EVM_CHAIN_ID"
 python3 "$HERE/devnet_config.py" config-toml "$CHAIN_HOME/config/config.toml"
 
+JSON_RPC_ADDRESS="127.0.0.1:8545"
+if [ "$PUBLIC_JSON_RPC" = "1" ]; then
+  # devnet_config.py deliberately defaults to loopback. Multi-machine devnet
+  # mode explicitly widens only JSON-RPC/WS after that safe baseline is applied.
+  python3 - "$CHAIN_HOME/config/app.toml" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old_rpc = 'address = "127.0.0.1:8545"'
+old_ws = 'ws-address = "127.0.0.1:8546"'
+if text.count(old_rpc) != 1 or text.count(old_ws) != 1:
+    raise SystemExit("WQPU public devnet RPC patch could not find the expected safe bindings")
+text = text.replace(old_rpc, 'address = "0.0.0.0:8545"')
+text = text.replace(old_ws, 'ws-address = "0.0.0.0:8546"')
+path.write_text(text, encoding="utf-8")
+PY
+  JSON_RPC_ADDRESS="0.0.0.0:8545"
+  echo "WARNING: WQPU devnet JSON-RPC is exposed to the LAN. Do not expose ports 8545/8546 to the public Internet."
+fi
+
 echo "WQPU sovereign devnet"
 echo "  chain-id:      $CHAIN_ID"
 echo "  EVM chain-id:  $EVM_CHAIN_ID"
 echo "  native coin:   $DISPLAY_DENOM ($BASE_DENOM)"
 echo "  precompile:    0x0000000000000000000000000000000000000900"
-echo "  JSON-RPC:      http://127.0.0.1:8545"
+echo "  JSON-RPC:      http://$JSON_RPC_ADDRESS"
 echo "  data:          $CHAIN_HOME"
 echo
 
