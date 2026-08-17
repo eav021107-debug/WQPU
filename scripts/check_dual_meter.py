@@ -23,7 +23,8 @@ REQUEST_ID = "ab" * 16
 
 
 class FakeChain(object):
-    network = {}
+    def __init__(self, relays=None):
+        self.network = {"relays": list(relays or [])}
 
 
 def frame(cmd, payload=b""):
@@ -105,13 +106,14 @@ async def main_async():
     old_rpc_port = wqpu.RPC_PORT
     wqpu.RPC_PORT = rpc_server.sockets[0].getsockname()[1]
 
-    # Match the real public runtime: a relay used for routing must be present in the
-    # configured peer set, not merely connected ad hoc. `routes` stores only the relay
-    # route key; open_rpc resolves that key back to this pinned host/port/fingerprint.
-    mesh_cfg = {"secret": secret, "peers": [relay_peer]}
-    requester = wqpu_autopay.AutoPayChainMesh(mesh_cfg, FakeChain(), REQUESTER_WALLET)
+    # AutoPay intentionally replaces arbitrary cfg peers with the relay set published by
+    # chain.network. Model the real network-config path so this smoke test cannot pass via
+    # an ad-hoc peer source that production public mode would reject.
+    chain = FakeChain([relay_peer])
+    mesh_cfg = {"secret": secret, "peers": []}
+    requester = wqpu_autopay.AutoPayChainMesh(mesh_cfg, chain, REQUESTER_WALLET)
     requester.me = "requester-node"
-    worker = wqpu_autopay.AutoPayChainMesh(mesh_cfg, FakeChain(), WORKER_WALLET)
+    worker = wqpu_autopay.AutoPayChainMesh(mesh_cfg, chain, WORKER_WALLET)
     worker.me = "worker-node"
 
     requester.chain_nodes[WORKER_WALLET] = {"fingerprint": fp}
