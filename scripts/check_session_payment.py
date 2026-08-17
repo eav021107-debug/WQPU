@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end reserved-session payment smoke test on the local Anvil devnet."""
+"""End-to-end gasless requester payment smoke test on local Anvil."""
 
 from __future__ import print_function
 
@@ -14,9 +14,11 @@ sys.path.insert(0, str(ROOT))
 from wqpu_chain import RegistryClient  # noqa: E402
 from wqpu_claim import (  # noqa: E402
     activate_via_rpc,
+    fund_via_rpc,
     relay_via_rpc,
     simulate_activation,
     simulate_claim,
+    simulate_funding,
     wait_receipt,
 )
 from wqpu_session import (  # noqa: E402
@@ -48,15 +50,45 @@ def selector(client, signature):
     return strip0x(hashed)[:8]
 
 
+def keccak(client, raw_hex):
+    value = client.rpc("web3_sha3", ["0x" + strip0x(raw_hex)])
+    if not isinstance(value, str) or len(strip0x(value)) != 64:
+        raise RuntimeError("bad web3_sha3 result")
+    return value.lower()
+
+
+def eth_call_word(client, contract, signature, args=""):
+    data = selector(client, signature) + args
+    value = client.rpc("eth_call", [{"to": contract, "data": "0x" + data}, "latest"])
+    raw = strip0x(value)
+    if len(raw) < 64:
+        raise RuntimeError("short eth_call result for {}".format(signature))
+    return raw[-64:]
+
+
 def send(client, sender, to, data):
     tx = client.rpc("eth_sendTransaction", [{"from": sender, "to": to, "data": "0x" + data}])
     return wait_receipt(client, tx)
 
 
 def balance_of(client, token, wallet):
-    data = selector(client, "balanceOf(address)") + address_word(wallet)
-    result = client.rpc("eth_call", [{"to": token, "data": "0x" + data}, "latest"])
-    return int(result, 16)
+    raw = eth_call_word(client, token, "balanceOf(address)", address_word(wallet))
+    return int(raw, 16)
+
+
+def permit_digest(client, token, owner, spender, amount, deadline):
+    domain = eth_call_word(client, token, "DOMAIN_SEPARATOR()")
+    typehash = eth_call_word(client, token, "PERMIT_TYPEHASH()")
+    nonce = int(eth_call_word(client, token, "nonces(address)", address_word(owner)), 16)
+    struct_hash = strip0x(keccak(client, "".join([
+        typehash,
+        address_word(owner),
+        address_word(spender),
+        word(amount),
+        word(nonce),
+        word(deadline),
+    ])))
+    return keccak(client, "1901" + domain + struct_hash)
 
 
 def main():
@@ -68,7 +100,7 @@ def main():
     accounts = [str(x).lower() for x in client.rpc("eth_accounts", [])]
     if len(accounts) < 2:
         raise RuntimeError("Anvil returned fewer than two unlocked accounts")
-    deployer = accounts[0]
+    relayer = accounts[0]
     provider = accounts[1]
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -79,19 +111,9 @@ def main():
         requester = session_address(client, requester_pem).lower()
         session_key = session_address(client, session_pem).lower()
 
-        # Devnet-only setup: impersonate the independently generated requester only to
-        # approve/deposit test tokens. The private key itself never enters the RPC wallet.
-        client.rpc("anvil_setBalance", [requester, hex(100 * 10 ** 18)])
-        client.rpc("anvil_impersonateAccount", [requester])
-
         deposit = 10 * 10 ** 18
         transfer_data = selector(client, "transfer(address,uint256)") + address_word(requester) + word(deposit)
-        send(client, deployer, token, transfer_data)
-
-        approve_data = selector(client, "approve(address,uint256)") + address_word(market) + word(2 ** 256 - 1)
-        send(client, requester, token, approve_data)
-        deposit_data = selector(client, "deposit(uint256)") + word(deposit)
-        send(client, requester, market, deposit_data)
+        send(client, relayer, token, transfer_data)
 
         block = client.rpc("eth_getBlockByNumber", ["latest", False])
         now = int(block["timestamp"], 16)
@@ -99,18 +121,41 @@ def main():
         max_amount = 5 * 10 ** 18
         valid_until = now + 3600
 
-        auth_digest = spend_authorization_digest(
-            client,
-            market,
-            requester,
-            session_key,
-            session_id,
-            max_amount,
-            price,
-            valid_until,
-        )
-        compact_auth = strip0x(sign_digest(auth_digest, requester_pem))
+        # Requester signs token permit only. Relayer performs the actual deposit.
+        permit_raw = strip0x(sign_digest(
+            permit_digest(client, token, requester, market, deposit, valid_until),
+            requester_pem,
+        ))
+        funding = None
+        for recovery in (27, 28):
+            candidate = {
+                "market": market,
+                "requester": requester,
+                "amount": deposit,
+                "deadline": valid_until,
+                "permit_signature": "0x" + permit_raw + "{:02x}".format(recovery),
+            }
+            try:
+                simulate_funding(client, candidate)
+                funding = candidate
+                break
+            except Exception:
+                pass
+        if funding is None:
+            raise RuntimeError("neither recovery id produced a valid token permit")
+        funding_tx = fund_via_rpc(client, funding, relayer)
+        wait_receipt(client, funding_tx)
+        if balance_of(client, token, requester) != 0:
+            raise RuntimeError("permit funding did not transfer requester tokens into escrow")
 
+        # Requester signs bounded session authorization only. Relayer activates/reserves it.
+        auth_raw = strip0x(sign_digest(
+            spend_authorization_digest(
+                client, market, requester, session_key, session_id,
+                max_amount, price, valid_until,
+            ),
+            requester_pem,
+        ))
         activation = None
         for recovery in (27, 28):
             candidate = {
@@ -121,7 +166,7 @@ def main():
                 "max_amount": max_amount,
                 "price_per_million_units": price,
                 "valid_until": valid_until,
-                "authorization_signature": "0x" + compact_auth + "{:02x}".format(recovery),
+                "authorization_signature": "0x" + auth_raw + "{:02x}".format(recovery),
             }
             try:
                 simulate_activation(client, candidate)
@@ -130,26 +175,22 @@ def main():
             except Exception:
                 pass
         if activation is None:
-            raise RuntimeError("neither wallet recovery id produced a valid spend authorization")
-
-        activation_tx = activate_via_rpc(client, activation, deployer)
+            raise RuntimeError("neither recovery id produced a valid spend authorization")
+        activation_tx = activate_via_rpc(client, activation, relayer)
         wait_receipt(client, activation_tx)
         active = active_session(client, market, requester, session_id)
         if not active.get("active") or int(active.get("reserved_remaining") or 0) != max_amount:
             raise RuntimeError("session activation did not reserve the authorized amount")
 
+        # Local session key signs provider work; relayer claims it; provider receives WQPU.
         units = 1_000_000
         amount = price
-        voucher_digest = provider_voucher_digest(
-            client,
-            market,
-            requester,
-            provider,
-            session_id,
-            amount,
-            units,
+        voucher_signature = sign_digest(
+            provider_voucher_digest(
+                client, market, requester, provider, session_id, amount, units,
+            ),
+            session_pem,
         )
-        voucher_signature = sign_digest(voucher_digest, session_pem)
         package = {
             "version": 2,
             "kind": "wqpu-provider-voucher",
@@ -168,13 +209,12 @@ def main():
 
         simulate_claim(client, package)
         before = balance_of(client, token, provider)
-        tx_hash = relay_via_rpc(client, package, deployer)
+        tx_hash = relay_via_rpc(client, package, relayer)
         wait_receipt(client, tx_hash)
         after = balance_of(client, token, provider)
         if after - before != amount:
             raise RuntimeError("provider received {}, expected {}".format(after - before, amount))
 
-        # The exact same cumulative voucher must not pay twice.
         try:
             simulate_claim(client, package)
         except Exception:
@@ -188,8 +228,7 @@ def main():
         if int(active.get("reserved_remaining") or 0) != max_amount - amount:
             raise RuntimeError("claim did not consume session reservation")
 
-        client.rpc("anvil_stopImpersonatingAccount", [requester])
-        print("WQPU reserved-session payment round-trip OK: {} wei -> {}".format(amount, provider))
+        print("WQPU gasless payment round-trip OK: permit -> reserve -> {} wei -> {}".format(amount, provider))
     return 0
 
 
