@@ -31,8 +31,6 @@ jobs:
       - name: Validate POSIX installer syntax
         run: sh -n install.sh
       - name: Run installer against this commit
-        env:
-          WQPU_NO_START: '1'
         run: |
           REF="${{ github.event.pull_request.head.sha || github.sha }}"
           TEST_HOME="$RUNNER_TEMP/wqpu-home"
@@ -90,5 +88,7 @@ jobs:
           version: stable
       - name: Foundry build
         run: forge build
+      - name: Contract tests
+        run: forge test -vv
       - name: Deploy local WQPU devnet
         run: python scripts/devnet.py
