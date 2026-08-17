@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""WQPU runtime extension: voucher delivery + optional gasless relayed claiming.
+"""WQPU runtime extension: reserved-session activation, voucher delivery and claiming.
 
-This deliberately rides the existing WQPU control protocol (`type=open`) with a new
+Payment traffic rides the existing WQPU control protocol (`type=open`) with
 `service=payment`; no second P2P network or wallet private key is introduced.
 """
 
@@ -12,7 +12,8 @@ import os
 
 import wqpu
 import wqpu_runtime as runtime
-from wqpu_claim import relay, wait_receipt
+from wqpu_claim import relay, relay_activation, wait_receipt
+from wqpu_session import active_session, load_session, save_session
 from wqpu_vouchers import accept as accept_voucher
 from wqpu_vouchers import mark_claimed
 
@@ -22,6 +23,56 @@ MAX_PAYMENT_HOPS = 4
 
 
 class AutoPayChainMesh(runtime.ChainMesh):
+    def __init__(self, cfg, chain, wallet):
+        super(AutoPayChainMesh, self).__init__(cfg, chain, wallet)
+        self._ensure_payment_session_active()
+
+    def _ensure_payment_session_active(self):
+        session = load_session()
+        if not session:
+            return
+        market = str(session.get("market") or "").lower()
+        requester = str(session.get("requester") or "").lower()
+        session_id = str(session.get("session_id") or "").lower()
+        if not market or requester != self.wallet or not session_id:
+            return
+        try:
+            current = active_session(self.chain, market, requester, session_id)
+        except Exception as exc:
+            print("[WQPU payment session check unavailable: {}]".format(exc))
+            return
+
+        if current.get("active"):
+            expected = (
+                str(current.get("session_key") or "").lower() == str(session.get("session_key") or "").lower()
+                and int(current.get("max_amount") or 0) == int(session.get("max_amount") or 0)
+                and int(current.get("price_per_million_units") or 0) == int(session.get("price_per_million_units") or 0)
+                and int(current.get("valid_until") or 0) == int(session.get("valid_until") or 0)
+            )
+            if expected:
+                self.payment_session = session
+            else:
+                print("[WQPU active payment session does not match local authorization]")
+            return
+
+        if not str(session.get("authorization_signature") or "").startswith("0x"):
+            print("[WQPU payment session has no wallet authorization signature]")
+            return
+        try:
+            tx_hash = relay_activation(self.chain, session)
+            wait_receipt(self.chain, tx_hash, 120)
+            current = active_session(self.chain, market, requester, session_id)
+            if not current.get("active"):
+                raise RuntimeError("activation transaction confirmed but session is inactive")
+            session["activation_tx"] = tx_hash
+            save_session(session)
+            self.payment_session = session
+            print("[WQPU payment session activated and funds reserved]")
+        except Exception as exc:
+            # Compute can still run; automatic requester payments remain disabled until a
+            # relayer is configured and the signed session is successfully activated.
+            print("[WQPU payment session pending activation: {}]".format(exc))
+
     async def _route_payment(self, target, voucher, ttl=MAX_PAYMENT_HOPS, trace=None):
         target = str(target or "")
         ttl = int(ttl)
@@ -44,7 +95,6 @@ class AutoPayChainMesh(runtime.ChainMesh):
             "trace": trace,
         }
 
-        # Prefer a direct inbound control connection to the target.
         direct = self.controls.get(target)
         if direct:
             try:
@@ -53,7 +103,6 @@ class AutoPayChainMesh(runtime.ChainMesh):
             except Exception:
                 pass
 
-        # Otherwise use the same route table already used for llama.cpp RPC streams.
         for route_key in list(self.routes.get(target) or []):
             ctrl = self.outbound.get(route_key)
             if not ctrl:
@@ -81,7 +130,6 @@ class AutoPayChainMesh(runtime.ChainMesh):
             await wqpu.to_thread(mark_claimed, voucher, tx_hash)
             print("[WQPU payment claimed: {}]".format(tx_hash))
         except Exception as exc:
-            # The cumulative voucher remains safely stored and can be relayed later.
             print("[WQPU payment stored; auto-claim unavailable: {}]".format(exc))
         return True
 
