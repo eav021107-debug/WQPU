@@ -26,6 +26,7 @@ os.environ["WQPU_HOME"] = str(TEST_HOME)
 
 import wqpu  # noqa: E402
 import wqpu_network_guard  # noqa: E402
+import wqpu_public_security  # noqa: E402
 import wqpu_runtime as runtime  # noqa: E402
 from wqpu_chain import RegistryClient  # noqa: E402
 
@@ -85,6 +86,7 @@ async def check():
     relay_peer = dict(config["relays"][0])
     mesh_cfg = {"secret": secret, "peers": [relay_peer]}
     wqpu_network_guard.install(runtime)
+    wqpu_public_security.install(runtime.ChainMesh)
 
     worker = runtime.ChainMesh(mesh_cfg, chain, wallet)
     requester = runtime.ChainMesh(mesh_cfg, chain, wallet)
