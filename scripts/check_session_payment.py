@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""End-to-end shared-escrow payment smoke test on the local Anvil devnet."""
+"""End-to-end reserved-session payment smoke test on the local Anvil devnet."""
 
 from __future__ import print_function
 
@@ -12,8 +12,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from wqpu_chain import RegistryClient  # noqa: E402
-from wqpu_claim import ClaimError, relay_via_rpc, simulate_claim, wait_receipt  # noqa: E402
+from wqpu_claim import (  # noqa: E402
+    activate_via_rpc,
+    relay_via_rpc,
+    simulate_activation,
+    simulate_claim,
+    wait_receipt,
+)
 from wqpu_session import (  # noqa: E402
+    active_session,
     ensure_session_key,
     provider_voucher_digest,
     session_address,
@@ -72,8 +79,8 @@ def main():
         requester = session_address(client, requester_pem).lower()
         session_key = session_address(client, session_pem).lower()
 
-        # Anvil-only test setup: impersonate the independently generated requester so the
-        # test can deposit its tokens without ever exporting that key into an RPC wallet.
+        # Devnet-only setup: impersonate the independently generated requester only to
+        # approve/deposit test tokens. The private key itself never enters the RPC wallet.
         client.rpc("anvil_setBalance", [requester, hex(100 * 10 ** 18)])
         client.rpc("anvil_impersonateAccount", [requester])
 
@@ -104,6 +111,33 @@ def main():
         )
         compact_auth = strip0x(sign_digest(auth_digest, requester_pem))
 
+        activation = None
+        for recovery in (27, 28):
+            candidate = {
+                "market": market,
+                "requester": requester,
+                "session_key": session_key,
+                "session_id": session_id,
+                "max_amount": max_amount,
+                "price_per_million_units": price,
+                "valid_until": valid_until,
+                "authorization_signature": "0x" + compact_auth + "{:02x}".format(recovery),
+            }
+            try:
+                simulate_activation(client, candidate)
+                activation = candidate
+                break
+            except Exception:
+                pass
+        if activation is None:
+            raise RuntimeError("neither wallet recovery id produced a valid spend authorization")
+
+        activation_tx = activate_via_rpc(client, activation, deployer)
+        wait_receipt(client, activation_tx)
+        active = active_session(client, market, requester, session_id)
+        if not active.get("active") or int(active.get("reserved_remaining") or 0) != max_amount:
+            raise RuntimeError("session activation did not reserve the authorized amount")
+
         units = 1_000_000
         amount = price
         voucher_digest = provider_voucher_digest(
@@ -116,9 +150,8 @@ def main():
             units,
         )
         voucher_signature = sign_digest(voucher_digest, session_pem)
-
-        base = {
-            "version": 1,
+        package = {
+            "version": 2,
             "kind": "wqpu-provider-voucher",
             "market": market,
             "requester": requester,
@@ -133,19 +166,7 @@ def main():
             "voucher_signature": voucher_signature,
         }
 
-        package = None
-        for recovery in (27, 28):
-            candidate = dict(base)
-            candidate["authorization_signature"] = "0x" + compact_auth + "{:02x}".format(recovery)
-            try:
-                simulate_claim(client, candidate)
-                package = candidate
-                break
-            except Exception:
-                pass
-        if package is None:
-            raise RuntimeError("neither wallet recovery id produced a valid spend authorization")
-
+        simulate_claim(client, package)
         before = balance_of(client, token, provider)
         tx_hash = relay_via_rpc(client, package, deployer)
         wait_receipt(client, tx_hash)
@@ -163,8 +184,12 @@ def main():
         if not replay_blocked:
             raise RuntimeError("already-claimed cumulative voucher remained claimable")
 
+        active = active_session(client, market, requester, session_id)
+        if int(active.get("reserved_remaining") or 0) != max_amount - amount:
+            raise RuntimeError("claim did not consume session reservation")
+
         client.rpc("anvil_stopImpersonatingAccount", [requester])
-        print("WQPU session payment round-trip OK: {} wei -> {}".format(amount, provider))
+        print("WQPU reserved-session payment round-trip OK: {} wei -> {}".format(amount, provider))
     return 0
 
 
