@@ -3,9 +3,38 @@
 `WQPU 0.6.x` can run a self-contained EVM testnet operator stack for multi-PC testing.
 This is **not** the final sovereign WQPU L1 and must not hold real funds.
 
-## Start
+## One-command operator install
 
-Install Foundry (`anvil`, `forge`, `cast`) and OpenSSL, then from the repository:
+On a Linux/macOS testnet server, the intended operator path is:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install-testnet.sh | sh -s -- --public-host YOUR_SERVER_IP_OR_DNS
+```
+
+The installer works in user space. It prepares Python/OpenSSL/base tools when the local
+package manager permits it, installs Foundry in the user's home if `anvil`/`forge`/`cast`
+are missing, downloads WQPU, validates the Python modules, runs `forge build`, creates
+`~/.local/bin/wqpu-testnet`, and starts the stack.
+
+Re-running the installer updates operator code **without deleting** the existing
+`~/.local/share/wqpu-operator/.wqpu-testnet/` chain/operator/deployment/relay identity.
+
+For an Internet-facing domain with a trusted certificate:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/eav021107-debug/WQPU/main/install-testnet.sh | sh -s -- \
+  --public-host testnet.example.com \
+  --tls-cert /etc/letsencrypt/live/testnet.example.com/fullchain.pem \
+  --tls-key /etc/letsencrypt/live/testnet.example.com/privkey.pem
+```
+
+For development from a specific branch/commit, set `WQPU_OPERATOR_REF` before running the
+installer. The generated client join scripts use that same ref, so operator and clients
+do not silently mix incompatible code.
+
+## Manual start from a repository checkout
+
+If Foundry (`anvil`, `forge`, `cast`) and OpenSSL are already installed:
 
 ```bash
 python scripts/testnet_stack.py start --public-host YOUR_SERVER_IP_OR_DNS
@@ -40,7 +69,7 @@ Plain HTTP is useful for localhost/LAN testing. For a real Internet-facing domai
 trusted PEM certificate and matching private key:
 
 ```bash
-python scripts/testnet_stack.py start \
+wqpu-testnet start \
   --public-host testnet.example.com \
   --tls-cert /etc/letsencrypt/live/testnet.example.com/fullchain.pem \
   --tls-key /etc/letsencrypt/live/testnet.example.com/privkey.pem
@@ -61,16 +90,18 @@ Normal `stop` / `start` cycles preserve the same testnet. Anvil checkpoints its 
 addresses are also retained. Balances, registry membership and contract storage therefore
 survive an operator restart.
 
+With the operator launcher:
+
 ```bash
-python scripts/testnet_stack.py stop
-python scripts/testnet_stack.py start
+wqpu-testnet stop
+wqpu-testnet start
 ```
 
 To intentionally destroy that testnet and create a new chain/operator/contracts:
 
 ```bash
-python scripts/testnet_stack.py reset --yes
-python scripts/testnet_stack.py start --public-host YOUR_SERVER_IP_OR_DNS
+wqpu-testnet reset --yes
+wqpu-testnet start --public-host YOUR_SERVER_IP_OR_DNS
 ```
 
 `reset --yes` is destructive. Already connected clients must receive the new generated
@@ -81,8 +112,8 @@ network config after a reset.
 Stop the stack first, then create a portable backup outside `.wqpu-testnet/`:
 
 ```bash
-python scripts/testnet_stack.py stop
-python scripts/testnet_stack.py backup ~/wqpu-testnet-backup.tar.gz
+wqpu-testnet stop
+wqpu-testnet backup ~/wqpu-testnet-backup.tar.gz
 ```
 
 The backup contains:
@@ -99,11 +130,11 @@ restore only accepts the expected regular files (no symlinks/path traversal).
 **Treat the backup as a secret.** Anyone who obtains it receives the testnet operator and
 relay private keys. The archive is not a production key-management mechanism.
 
-On the destination server:
+On the destination server, install the operator code, stop any empty/new stack, then:
 
 ```bash
-python scripts/testnet_stack.py restore ~/wqpu-testnet-backup.tar.gz --yes
-python scripts/testnet_stack.py start --public-host NEW_SERVER_IP_OR_DNS
+wqpu-testnet restore ~/wqpu-testnet-backup.tar.gz --yes
+wqpu-testnet start --public-host NEW_SERVER_IP_OR_DNS
 ```
 
 If the Internet hostname/server changed, provide the appropriate trusted public HTTPS
@@ -113,16 +144,17 @@ embedded in the WQPU backup.
 ## Operations
 
 ```bash
-python scripts/testnet_stack.py status
-python scripts/testnet_stack.py config
-python scripts/testnet_stack.py stop
-python scripts/testnet_stack.py backup ~/wqpu-testnet-backup.tar.gz
-python scripts/testnet_stack.py restore ~/wqpu-testnet-backup.tar.gz --yes
-python scripts/testnet_stack.py reset --yes
+wqpu-testnet status
+wqpu-testnet config
+wqpu-testnet stop
+wqpu-testnet backup ~/wqpu-testnet-backup.tar.gz
+wqpu-testnet restore ~/wqpu-testnet-backup.tar.gz --yes
+wqpu-testnet reset --yes
 ```
 
-Runtime files are under `.wqpu-testnet/`. The operator private key is stored only there
-with restricted file permissions and is marked testnet-only.
+Runtime files are under the operator install root's `.wqpu-testnet/` directory. The
+operator private key is stored only there with restricted file permissions and is marked
+testnet-only.
 
 ## Ports
 
