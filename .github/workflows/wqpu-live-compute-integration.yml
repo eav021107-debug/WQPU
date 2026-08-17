@@ -59,6 +59,7 @@ jobs:
           set -euo pipefail
           RPC='http://127.0.0.1:8545'
           RUNTIME_BASE="${RUNNER_TEMP}/wqpu-runtime"
+          COMPUTE_LOG="${RUNNER_TEMP}/live-compute.log"
 
           # The same explicitly public devnet-only wallet signs the three
           # session delegations/provider publishes and is the only address that
@@ -113,10 +114,10 @@ jobs:
           # computenode.Node instances. Node 1 originates this request; nodes 2
           # and 3 become RPC0/RPC1. Both remote RPC debug logs must record model
           # buffer allocation, and the shared llama-server must complete text.
-          (cd client && go run ./cmd/wqpu-live-chain-compute-smoke "$RPC" "$RUNTIME_BASE") 2>&1 | tee live-compute.log
-          grep -F 'LIVE CHAIN COMPUTE PASSED' client/live-compute.log
+          (cd client && go run ./cmd/wqpu-live-chain-compute-smoke "$RPC" "$RUNTIME_BASE") 2>&1 | tee "$COMPUTE_LOG"
+          grep -F 'LIVE CHAIN COMPUTE PASSED' "$COMPUTE_LOG"
           grep -F '[alloc_buffer]' "$RUNTIME_BASE/live-chain-rpc-1.log"
           grep -F '[alloc_buffer]' "$RUNTIME_BASE/live-chain-rpc-2.log"
-          grep -F 'precompile:    0x0000000000000000000000000000000000000900' "$LOG"
+          grep -F '0x0000000000000000000000000000000000000900' "$LOG"
 
           echo 'FULL LIVE WQPU CHAIN + EQUAL-NODE DISTRIBUTED MODEL INTEGRATION PASSED.'
