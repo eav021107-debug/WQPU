@@ -28,7 +28,9 @@ jobs:
       - name: Three-node NAT relay round-trip
         run: python scripts/check_nat_relay.py
       - name: Unified runtime version
-        run: python wqpu_entry.py --version
+        run: python wqpu_entry.py --version | grep -F 'WQPU 0.6.0'
+      - name: Doctor command
+        run: python wqpu_entry.py doctor
       - name: Provider claim command
         run: python wqpu_entry.py claim
       - name: Validate published network JSON
@@ -55,7 +57,8 @@ jobs:
           WQPU_NO_START=1 \
           WQPU_RAW_BASE="https://raw.githubusercontent.com/eav021107-debug/WQPU/$REF" \
           sh install.sh
-          "$TEST_HOME/.local/bin/wqpu" --version | grep -F 'WQPU 0.6.0-dev'
+          "$TEST_HOME/.local/bin/wqpu" --version | grep -F 'WQPU 0.6.0'
+          "$TEST_HOME/.local/bin/wqpu" doctor
           "$TEST_HOME/.local/bin/wqpu" claim | grep -F 'No pending WQPU provider vouchers.'
 
   installer-windows:
@@ -82,7 +85,9 @@ jobs:
           .\install.ps1
           $launcher = Join-Path $env:LOCALAPPDATA 'WQPU\bin\wqpu.cmd'
           $version = (& $launcher --version | Out-String).Trim()
-          if ($version -ne 'WQPU 0.6.0-dev') { throw "Unexpected installed version: $version" }
+          if ($version -ne 'WQPU 0.6.0') { throw "Unexpected installed version: $version" }
+          & $launcher doctor
+          if ($LASTEXITCODE -ne 0) { throw 'wqpu doctor failed' }
           $claim = (& $launcher claim | Out-String).Trim()
           if ($claim -ne 'No pending WQPU provider vouchers.') { throw "Unexpected claim output: $claim" }
 
