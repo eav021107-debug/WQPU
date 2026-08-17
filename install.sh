@@ -5,8 +5,8 @@ RAW="${WQPU_RAW_BASE:-https://raw.githubusercontent.com/eav021107-debug/WQPU/mai
 ROOT="${HOME}/.local/share/wqpu"
 BIN="${HOME}/.local/bin"
 JOIN="${WQPU_JOIN:-${1:-}}"
-EXPECTED_WQPU="WQPU 0.6.0-dev"
-CACHE_BUSTER="meter-v2-0.6.0-dev-r1"
+EXPECTED_WQPU="WQPU 0.6.0"
+CACHE_BUSTER="wqpu-0.6.0-r1"
 CHAIN_STATE="${HOME}/.wqpu/chain.json"
 
 need() { command -v "$1" >/dev/null 2>&1; }
