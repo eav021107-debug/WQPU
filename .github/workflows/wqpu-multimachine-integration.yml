@@ -1,0 +1,57 @@
+name: wqpu-multimachine-integration
+
+on:
+  push:
+    branches: [next-foundation]
+    paths:
+      - 'network.sh'
+      - 'chain/devnet.sh'
+      - 'chain/devnet_config.py'
+      - 'chain/runtime.lock'
+      - 'chain/runtime_patch*.py'
+      - 'chain/cmd/wqpu-compute-bootstrap/**'
+      - 'chain/x/wqpu/precompile/**'
+      - 'client/internal/chainclient/**'
+      - 'client/internal/chainregistry/**'
+      - 'client/internal/computenode/**'
+      - 'client/internal/devidentity/**'
+      - 'client/internal/llamaruntime/**'
+      - 'client/internal/carrier/**'
+      - 'client/internal/peertransport/**'
+      - 'client/internal/rpctunnel/**'
+      - 'client/internal/rpcmesh/**'
+      - 'client/internal/sessionkey/**'
+      - 'client/internal/transport/**'
+      - 'client/cmd/wqpu-dev-node/**'
+      - 'client/cmd/wqpu-dev-infer/**'
+      - '.github/workflows/wqpu-multimachine-integration.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cross-machine-proof:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.9'
+
+      - name: Run shared-chain independent-node distributed inference proof
+        shell: bash
+        env:
+          WQPU_SOURCE_DIR: ${{ github.workspace }}
+          WQPU_USE_SYSTEM_GO: '1'
+          WQPU_NETWORK_HOME: ${{ runner.temp }}/wqpu-network
+        run: bash ./network.sh ci
