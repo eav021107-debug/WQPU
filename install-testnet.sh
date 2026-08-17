@@ -88,6 +88,7 @@ SRC="$(find "$TMP" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 cp -R "$SRC"/. "$ROOT"/
 chmod 755 \
   "$ROOT/scripts/testnet_stack.py" \
+  "$ROOT/scripts/testnet_doctor.py" \
   "$ROOT/wqpu_rpc_gateway.py" \
   "$ROOT/wqpu_relayer.py" \
   "$ROOT/wqpu_transport_relay.py" \
@@ -95,6 +96,7 @@ chmod 755 \
 
 "$PYTHON" -m py_compile \
   "$ROOT/scripts/testnet_stack.py" \
+  "$ROOT/scripts/testnet_doctor.py" \
   "$ROOT/scripts/devnet.py" \
   "$ROOT/wqpu_rpc_gateway.py" \
   "$ROOT/wqpu_relayer.py" \
@@ -115,6 +117,10 @@ if [ "\${1:-}" = "autostart" ]; then
     --script "$ROOT/scripts/testnet_stack.py" \
     --state "$ROOT/.wqpu-testnet/state.json" \
     --config "$ROOT/.wqpu-testnet/network-config.json"
+fi
+if [ "\${1:-}" = "doctor" ]; then
+  shift
+  exec "$PYTHON" "$ROOT/scripts/testnet_doctor.py" "\$@"
 fi
 exec "$PYTHON" "$ROOT/scripts/testnet_stack.py" "\$@"
 EOF
