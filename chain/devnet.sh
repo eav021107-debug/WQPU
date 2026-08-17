@@ -10,6 +10,9 @@ BIN_DIR="${WQPU_CHAIN_BIN_DIR:-$HOME/.local/share/wqpu-chain/bin}"
 CHAIN_HOME="${WQPU_CHAIN_HOME:-$HOME/.wqpu-chain-dev}"
 DEV_TEST_ADDRESS="${WQPU_DEVNET_TEST_ADDRESS:-}"
 PUBLIC_JSON_RPC="${WQPU_DEVNET_PUBLIC_RPC:-0}"
+P2P_SEEDS_FILE="${WQPU_P2P_SEEDS_FILE:-$HERE/../bootstrap-p2p.txt}"
+P2P_SEED_MODE="${WQPU_P2P_SEED_MODE:-0}"
+P2P_EXTERNAL_ADDRESS="${WQPU_P2P_EXTERNAL_ADDRESS:-}"
 BIN="$BIN_DIR/wqpud"
 KEYRING="test" # local devnet only; never use this backend for a public validator
 RESET=0
@@ -21,6 +24,14 @@ Usage: chain/devnet.sh [--reset] [--build-only]
 
 --reset       delete only the local WQPU devnet state and create a fresh genesis
 --build-only  fetch/verify/patch/build the pinned WQPU chain runtime, then exit
+
+P2P bootstrap/PEX controls:
+  WQPU_P2P_SEEDS_FILE=/path/to/seeds.txt
+  WQPU_P2P_SEED_MODE=0|1
+  WQPU_P2P_EXTERNAL_ADDRESS=tcp://HOST:26656
+
+CometBFT PEX is always enabled. Seeds are only first-contact peers; learned peers
+are persisted by CometBFT in config/addrbook.json and used on later starts.
 
 Set WQPU_DEVNET_PUBLIC_RPC=1 only for an isolated LAN test. It binds the devnet
 JSON-RPC/WS ports to all interfaces so other physical WQPU machines can join.
@@ -41,6 +52,10 @@ if [ "$PUBLIC_JSON_RPC" != "0" ] && [ "$PUBLIC_JSON_RPC" != "1" ]; then
   echo "WQPU_DEVNET_PUBLIC_RPC must be 0 or 1." >&2
   exit 2
 fi
+if [ "$P2P_SEED_MODE" != "0" ] && [ "$P2P_SEED_MODE" != "1" ]; then
+  echo "WQPU_P2P_SEED_MODE must be 0 or 1." >&2
+  exit 2
+fi
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -52,6 +67,8 @@ need() {
 need git
 need go
 need python3
+[ -f "$HERE/p2p_config.py" ] || { echo "WQPU P2P config helper is missing." >&2; exit 1; }
+[ -f "$P2P_SEEDS_FILE" ] || { echo "WQPU P2P seed manifest is missing: $P2P_SEEDS_FILE" >&2; exit 1; }
 
 mkdir -p "$(dirname "$SRC_DIR")" "$BIN_DIR"
 
@@ -151,6 +168,16 @@ python3 "$HERE/devnet_config.py" app-toml "$CHAIN_HOME/config/app.toml" \
   --evm-chain-id "$EVM_CHAIN_ID"
 python3 "$HERE/devnet_config.py" config-toml "$CHAIN_HOME/config/config.toml"
 
+P2P_ARGS=(
+  "$CHAIN_HOME/config/config.toml"
+  --seeds-file "$P2P_SEEDS_FILE"
+  --seed-mode "$P2P_SEED_MODE"
+)
+if [ -n "$P2P_EXTERNAL_ADDRESS" ]; then
+  P2P_ARGS+=(--external-address "$P2P_EXTERNAL_ADDRESS")
+fi
+python3 "$HERE/p2p_config.py" "${P2P_ARGS[@]}"
+
 JSON_RPC_ADDRESS="127.0.0.1:8545"
 if [ "$PUBLIC_JSON_RPC" = "1" ]; then
   # devnet_config.py deliberately defaults to loopback. Multi-machine devnet
@@ -178,6 +205,8 @@ echo "  EVM chain-id:  $EVM_CHAIN_ID"
 echo "  native coin:   $DISPLAY_DENOM ($BASE_DENOM)"
 echo "  precompile:    0x0000000000000000000000000000000000000900"
 echo "  JSON-RPC:      http://$JSON_RPC_ADDRESS"
+echo "  P2P/PEX:       enabled (addrbook persisted)"
+echo "  P2P seed mode: $P2P_SEED_MODE"
 echo "  data:          $CHAIN_HOME"
 echo
 
