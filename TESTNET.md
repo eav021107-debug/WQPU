@@ -161,3 +161,12 @@ testnet-only.
 Defaults are `8545` (RPC gateway), `8787` (relayer/config/faucet), and `7443` (transport
 relay). If the server is behind a router/firewall, those three ports must be reachable by
 participating PCs. The internal Anvil port `28545` must stay private.
+
+## Relay-backed dual metering
+
+NAT/CGNAT workers learn the public transport relay from the same published
+`network-config.json` used by the normal runtime. Requester and worker independently meter
+the same forwarded llama.cpp RPC stream, and the worker signs its usage report with the
+TLS identity whose fingerprint is tied to its on-chain wallet registration. A missing,
+invalid or mismatched report remains fail-closed for voucher creation; it does not make an
+unverified computation payable.
