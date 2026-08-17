@@ -17,6 +17,10 @@ import subprocess
 
 
 VALID_MODES = ("auto", "cpu", "metal", "vulkan", "cuda12")
+# NVIDIA CUDA 12.4 GA release notes pair Windows x64 with driver 551.61+. Auto mode is
+# deliberately conservative; an explicit WQPU_ACCEL=cuda12 remains available to advanced
+# users relying on CUDA minor-version compatibility or custom compatibility packages.
+CUDA12_WINDOWS_DRIVER_MIN = (551, 61)
 
 
 def _machine():
@@ -39,21 +43,65 @@ def _command_exists(name):
     return bool(shutil.which(name))
 
 
-def _nvidia_present():
+def _nvidia_query(field):
     exe = shutil.which("nvidia-smi")
     if not exe:
-        return False
+        return ""
     try:
         proc = subprocess.run(
-            [exe, "--query-gpu=name", "--format=csv,noheader"],
+            [exe, "--query-gpu={}".format(field), "--format=csv,noheader"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             universal_newlines=True,
             timeout=5,
         )
-        return proc.returncode == 0 and bool(proc.stdout.strip())
+        if proc.returncode != 0:
+            return ""
+        return proc.stdout.strip()
     except Exception:
+        return ""
+
+
+def _nvidia_present():
+    return bool(_nvidia_query("name"))
+
+
+def _version_tuple(value):
+    out = []
+    for piece in str(value or "").strip().split("."):
+        digits = "".join(ch for ch in piece if ch.isdigit())
+        if not digits:
+            break
+        out.append(int(digits))
+    return tuple(out)
+
+
+def _version_at_least(value, minimum):
+    parsed = _version_tuple(value)
+    if not parsed:
         return False
+    width = max(len(parsed), len(minimum))
+    left = parsed + (0,) * (width - len(parsed))
+    right = tuple(minimum) + (0,) * (width - len(minimum))
+    return left >= right
+
+
+def nvidia_driver_version():
+    raw = _nvidia_query("driver_version")
+    if not raw:
+        return ""
+    # Multi-GPU machines normally share one driver. Choose the lowest reported version so
+    # mixed/virtualized environments cannot make auto mode optimistic.
+    versions = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not versions:
+        return ""
+    return min(versions, key=lambda item: _version_tuple(item) or (0,))
+
+
+def _cuda12_auto_supported():
+    if _system() != "Windows" or not _x64() or not _nvidia_present():
+        return False
+    return _version_at_least(nvidia_driver_version(), CUDA12_WINDOWS_DRIVER_MIN)
 
 
 def _vulkan_loader_present():
@@ -88,8 +136,9 @@ def _vulkan_gpu_present():
     if _system() == "Linux":
         return _nvidia_present() or _linux_render_device_present()
     if _system() == "Windows":
-        # Presence of vulkan-1.dll means an installed ICD/loader path is available. Auto
-        # selection still prefers CUDA for NVIDIA, so this mainly covers AMD/Intel GPUs.
+        # Vulkan loader presence normally comes from an installed display driver. NVIDIA
+        # with an old CUDA driver reaches this fallback before CPU; AMD/Intel use it as the
+        # primary accelerator path.
         return True
     return False
 
@@ -118,7 +167,7 @@ def auto_mode():
         # Intel Macs can still fall back internally when Metal is not usable.
         return "metal"
     if system == "Windows":
-        if _x64() and _nvidia_present():
+        if _cuda12_auto_supported():
             return "cuda12"
         if _x64() and _vulkan_gpu_present():
             return "vulkan"
@@ -190,24 +239,18 @@ def rpc_device_args():
 
 
 def nvidia_vram_mb():
-    exe = shutil.which("nvidia-smi")
-    if not exe:
+    raw = _nvidia_query("memory.total")
+    if not raw:
         return 0
     try:
-        proc = subprocess.run(
-            [exe, "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            timeout=5,
-        )
-        if proc.returncode != 0:
-            return 0
         values = []
-        for line in proc.stdout.splitlines():
+        for line in raw.splitlines():
             line = line.strip()
-            if line:
-                values.append(int(float(line)))
+            if not line:
+                continue
+            # nvidia-smi may include a unit suffix depending on driver/tool version.
+            number = line.split()[0]
+            values.append(int(float(number)))
         return sum(values)
     except Exception:
         return 0
@@ -224,6 +267,7 @@ def info(total_ram_mb=None):
         "vram_mb": int(vram),
         "unified_memory": bool(unified),
         "capacity_mb": capacity,
+        "nvidia_driver": nvidia_driver_version() if _nvidia_present() else "",
     }
 
 
