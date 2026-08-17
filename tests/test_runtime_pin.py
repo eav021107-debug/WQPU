@@ -9,6 +9,12 @@ from unittest import mock
 import wqpu_runtime_pin
 
 
+class FakeHttpError(RuntimeError):
+    def __init__(self, code):
+        super(FakeHttpError, self).__init__("http {}".format(code))
+        self.code = code
+
+
 class RuntimePinTests(unittest.TestCase):
     def test_desired_tag_prefers_environment_then_config_then_default(self):
         with mock.patch.object(wqpu_runtime_pin, "network_runtime_config", return_value={"llama_cpp_tag": "b200"}), \
@@ -79,6 +85,52 @@ class RuntimePinTests(unittest.TestCase):
                 )
             finally:
                 wqpu_runtime_pin.wqpu.RUNTIME = old_runtime
+
+    def test_release_lookup_retries_transient_5xx(self):
+        release = {"tag_name": "b10456", "assets": []}
+        with mock.patch.object(
+            wqpu_runtime_pin.wqpu,
+            "api_json",
+            side_effect=[FakeHttpError(504), FakeHttpError(502), release],
+        ) as lookup, mock.patch.object(wqpu_runtime_pin, "_backoff") as backoff:
+            actual = wqpu_runtime_pin._release_json("b10456")
+        self.assertEqual(actual, release)
+        self.assertEqual(lookup.call_count, 3)
+        self.assertEqual(backoff.call_count, 2)
+
+    def test_release_lookup_does_not_retry_exact_4xx(self):
+        with mock.patch.object(
+            wqpu_runtime_pin.wqpu, "api_json", side_effect=FakeHttpError(404)
+        ) as lookup, mock.patch.object(wqpu_runtime_pin, "_backoff") as backoff:
+            with self.assertRaises(RuntimeError):
+                wqpu_runtime_pin._release_json("missing")
+        self.assertEqual(lookup.call_count, 1)
+        backoff.assert_not_called()
+
+    def test_asset_download_retries_and_removes_partial_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "asset.zip"
+
+            def flaky(_url, target):
+                if not path.exists():
+                    path.write_bytes(b"partial")
+                    raise FakeHttpError(503)
+                target.write_bytes(b"complete")
+
+            calls = {"n": 0}
+
+            def retry_download(_url, target):
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    target.write_bytes(b"partial")
+                    raise FakeHttpError(503)
+                target.write_bytes(b"complete")
+
+            with mock.patch.object(wqpu_runtime_pin.wqpu, "download", side_effect=retry_download), \
+                 mock.patch.object(wqpu_runtime_pin, "_backoff"):
+                wqpu_runtime_pin._download_asset("https://example.invalid/asset", path)
+            self.assertEqual(calls["n"], 2)
+            self.assertEqual(path.read_bytes(), b"complete")
 
     def test_asset_sha256_verification(self):
         with tempfile.TemporaryDirectory() as tmp:
