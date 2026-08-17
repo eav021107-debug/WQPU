@@ -6,7 +6,7 @@ ROOT="${HOME}/.local/share/wqpu"
 BIN="${HOME}/.local/bin"
 JOIN="${WQPU_JOIN:-${1:-}}"
 EXPECTED_WQPU="WQPU 0.6.0-dev"
-CACHE_BUSTER="chain-0.6.0-dev-r3"
+CACHE_BUSTER="session-0.6.0-dev-r1"
 CHAIN_STATE="${HOME}/.wqpu/chain.json"
 
 need() { command -v "$1" >/dev/null 2>&1; }
@@ -76,15 +76,16 @@ fi
 mkdir -p "$ROOT" "$BIN"
 
 echo "WQPU: downloading runtime..."
-for file in wqpu.py wqpu_chain.py wqpu_wallet.py wqpu_runtime.py network-config.json; do
+for file in wqpu.py wqpu_chain.py wqpu_wallet.py wqpu_session.py wqpu_runtime.py network-config.json; do
   curl -fsSL --retry 3 "${RAW}/${file}?installer=${CACHE_BUSTER}" -o "$ROOT/$file"
 done
-chmod 755 "$ROOT/wqpu.py" "$ROOT/wqpu_chain.py" "$ROOT/wqpu_wallet.py" "$ROOT/wqpu_runtime.py"
+chmod 755 "$ROOT/wqpu.py" "$ROOT/wqpu_chain.py" "$ROOT/wqpu_wallet.py" "$ROOT/wqpu_session.py" "$ROOT/wqpu_runtime.py"
 
 "$PYTHON" -m py_compile \
   "$ROOT/wqpu.py" \
   "$ROOT/wqpu_chain.py" \
   "$ROOT/wqpu_wallet.py" \
+  "$ROOT/wqpu_session.py" \
   "$ROOT/wqpu_runtime.py" || {
     echo "WQPU files were downloaded but did not pass the Python compatibility check." >&2
     exit 1
