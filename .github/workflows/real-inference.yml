@@ -3,6 +3,7 @@ name: WQPU real inference
 on:
   push:
     paths:
+      - 'scripts/check_direct_llama_rpc.py'
       - 'scripts/check_real_rpc_wire.py'
       - 'scripts/check_real_inference.py'
       - '.github/workflows/real-inference.yml'
@@ -16,6 +17,7 @@ on:
       - 'wqpu_transport_relay.py'
   pull_request:
     paths:
+      - 'scripts/check_direct_llama_rpc.py'
       - 'scripts/check_real_rpc_wire.py'
       - 'scripts/check_real_inference.py'
       - '.github/workflows/real-inference.yml'
@@ -56,7 +58,7 @@ jobs:
           wqpu_public_config.py wqpu_public_security.py wqpu_transport_relay.py
           scripts/testnet_stack.py scripts/testnet_doctor.py
           scripts/check_two_client_relay.py scripts/check_real_rpc_wire.py
-          scripts/check_real_inference.py
+          scripts/check_direct_llama_rpc.py scripts/check_real_inference.py
       - name: Start isolated operator stack
         shell: bash
         run: |
@@ -73,6 +75,12 @@ jobs:
           WQPU_LLAMA_TAG: b10456
           GGML_RDMA_DEV: __wqpu_tcp_tunnel_only__
         run: python scripts/check_real_rpc_wire.py
+      - name: Direct full-model llama.cpp RPC baseline
+        env:
+          WQPU_LLAMA_TAG: b10456
+          WQPU_REAL_MODEL: ggml-org/gemma-3-1b-it-GGUF:Q4_K_M
+          GGML_RDMA_DEV: __wqpu_tcp_tunnel_only__
+        run: python scripts/check_direct_llama_rpc.py
       - name: Real pinned llama.cpp chat through authenticated WQPU relay
         env:
           WQPU_LLAMA_TAG: b10456
