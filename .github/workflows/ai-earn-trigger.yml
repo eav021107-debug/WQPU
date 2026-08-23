@@ -14,7 +14,7 @@ permissions:
 jobs:
   scan-agentlot:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 3
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,40 +28,35 @@ jobs:
           URL="https://agentlot.io/mcp"
           ACCEPT="application/json, text/event-stream"
 
-          curl -fsS -D .ai-earn/init.headers -o .ai-earn/init.raw \
-            -X POST "$URL" \
-            -H 'Content-Type: application/json' \
-            -H "Accept: $ACCEPT" \
-            --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"github-ai-earn-runner","version":"1.0"}}}'
+          post() {
+            local outfile="$1" payload="$2"
+            shift 2
+            curl -sS --no-buffer --max-time 8 -o "$outfile" -X POST "$URL" \
+              -H 'Content-Type: application/json' -H "Accept: $ACCEPT" "$@" \
+              --data "$payload" || true
+          }
+
+          curl -sS --no-buffer --max-time 8 -D .ai-earn/init.headers -o .ai-earn/init.raw \
+            -X POST "$URL" -H 'Content-Type: application/json' -H "Accept: $ACCEPT" \
+            --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"github-ai-earn-runner","version":"1.1"}}}' || true
 
           SESSION="$(awk 'BEGIN{IGNORECASE=1} /^mcp-session-id:/ {gsub("\r",""); sub(/^[^:]+:[[:space:]]*/,""); print; exit}' .ai-earn/init.headers || true)"
           EXTRA=()
           if [ -n "$SESSION" ]; then EXTRA=(-H "Mcp-Session-Id: $SESSION"); fi
 
-          curl -sS -o /dev/null -X POST "$URL" \
-            -H 'Content-Type: application/json' -H "Accept: $ACCEPT" "${EXTRA[@]}" \
-            --data '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' || true
-
-          call() {
-            local id="$1" name="$2" out="$3"
-            curl -sS -o "$out" -X POST "$URL" \
-              -H 'Content-Type: application/json' -H "Accept: $ACCEPT" "${EXTRA[@]}" \
-              --data "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"tools/call\",\"params\":{\"name\":\"${name}\",\"arguments\":{}}}" || true
-          }
-
-          curl -fsS -o .ai-earn/tools.raw -X POST "$URL" \
-            -H 'Content-Type: application/json' -H "Accept: $ACCEPT" "${EXTRA[@]}" \
-            --data '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
-          call 3 earn_now .ai-earn/earn-now.raw
-          call 4 list_requests .ai-earn/list-requests.raw
-          call 5 search_global_earn .ai-earn/global-earn.raw
-          call 6 search_external_earn .ai-earn/external-earn.raw
+          post /dev/null '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' "${EXTRA[@]}"
+          post .ai-earn/tools.raw '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}' "${EXTRA[@]}"
+          post .ai-earn/earn-now.raw '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"earn_now","arguments":{}}}' "${EXTRA[@]}"
+          post .ai-earn/list-requests.raw '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"list_requests","arguments":{}}}' "${EXTRA[@]}"
+          post .ai-earn/global-earn.raw '{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"search_global_earn","arguments":{}}}' "${EXTRA[@]}"
+          post .ai-earn/external-earn.raw '{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"search_external_earn","arguments":{}}}' "${EXTRA[@]}"
 
           python3 - <<'PY'
           from pathlib import Path
           import json
           def parse(path):
-              text = Path(path).read_text(errors='replace') if Path(path).exists() else ''
+              p=Path(path)
+              text=p.read_text(errors='replace') if p.exists() else ''
               vals=[]
               for line in text.splitlines():
                   s=line.strip()
@@ -72,9 +67,8 @@ jobs:
               if vals: return vals[-1] if len(vals)==1 else vals
               try: return json.loads(text)
               except Exception: return {'raw':text}
-          pairs=[('tools','tools.raw'),('earn-now','earn-now.raw'),('list-requests','list-requests.raw'),('global-earn','global-earn.raw'),('external-earn','external-earn.raw')]
-          for stem, raw in pairs:
-              Path(f'.ai-earn/{stem}.json').write_text(json.dumps(parse(f'.ai-earn/{raw}'),indent=2,ensure_ascii=False)+'\n')
+          for stem in ['init','tools','earn-now','list-requests','global-earn','external-earn']:
+              Path(f'.ai-earn/{stem}.json').write_text(json.dumps(parse(f'.ai-earn/{stem}.raw'),indent=2,ensure_ascii=False)+'\n')
           PY
           rm -f .ai-earn/*.raw .ai-earn/*.headers
 
