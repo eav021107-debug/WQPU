@@ -1,0 +1,88 @@
+name: AI Earn Trigger
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/ai-earn-trigger.yml
+
+permissions:
+  contents: write
+
+jobs:
+  scan-agentlot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ai-earn-runner
+
+      - name: Query AgentLot MCP anonymously
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .ai-earn
+          URL="https://agentlot.io/mcp"
+          ACCEPT="application/json, text/event-stream"
+
+          curl -fsS -D .ai-earn/init.headers -o .ai-earn/init.raw \
+            -X POST "$URL" \
+            -H 'Content-Type: application/json' \
+            -H "Accept: $ACCEPT" \
+            --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"github-ai-earn-runner","version":"1.0"}}}'
+
+          SESSION="$(awk 'BEGIN{IGNORECASE=1} /^mcp-session-id:/ {gsub("\r",""); sub(/^[^:]+:[[:space:]]*/,""); print; exit}' .ai-earn/init.headers || true)"
+          EXTRA=()
+          if [ -n "$SESSION" ]; then EXTRA=(-H "Mcp-Session-Id: $SESSION"); fi
+
+          curl -sS -o /dev/null -X POST "$URL" \
+            -H 'Content-Type: application/json' -H "Accept: $ACCEPT" "${EXTRA[@]}" \
+            --data '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}' || true
+
+          call() {
+            local id="$1" name="$2" out="$3"
+            curl -sS -o "$out" -X POST "$URL" \
+              -H 'Content-Type: application/json' -H "Accept: $ACCEPT" "${EXTRA[@]}" \
+              --data "{\"jsonrpc\":\"2.0\",\"id\":${id},\"method\":\"tools/call\",\"params\":{\"name\":\"${name}\",\"arguments\":{}}}" || true
+          }
+
+          curl -fsS -o .ai-earn/tools.raw -X POST "$URL" \
+            -H 'Content-Type: application/json' -H "Accept: $ACCEPT" "${EXTRA[@]}" \
+            --data '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
+          call 3 earn_now .ai-earn/earn-now.raw
+          call 4 list_requests .ai-earn/list-requests.raw
+          call 5 search_global_earn .ai-earn/global-earn.raw
+          call 6 search_external_earn .ai-earn/external-earn.raw
+
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          def parse(path):
+              text = Path(path).read_text(errors='replace') if Path(path).exists() else ''
+              vals=[]
+              for line in text.splitlines():
+                  s=line.strip()
+                  if s.startswith('data:'): s=s[5:].strip()
+                  if not s or s.startswith(('event:', ':')): continue
+                  try: vals.append(json.loads(s))
+                  except Exception: pass
+              if vals: return vals[-1] if len(vals)==1 else vals
+              try: return json.loads(text)
+              except Exception: return {'raw':text}
+          pairs=[('tools','tools.raw'),('earn-now','earn-now.raw'),('list-requests','list-requests.raw'),('global-earn','global-earn.raw'),('external-earn','external-earn.raw')]
+          for stem, raw in pairs:
+              Path(f'.ai-earn/{stem}.json').write_text(json.dumps(parse(f'.ai-earn/{raw}'),indent=2,ensure_ascii=False)+'\n')
+          PY
+          rm -f .ai-earn/*.raw .ai-earn/*.headers
+
+      - name: Commit public scan results to isolated branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "ai-earn-runner"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .ai-earn/
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m "chore: record live AgentLot earning opportunities"
+          git push origin HEAD:ai-earn-runner
