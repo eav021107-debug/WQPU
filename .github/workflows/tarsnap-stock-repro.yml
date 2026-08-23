@@ -3,6 +3,8 @@ name: Tarsnap stock repro
 on:
   push:
     branches: ["bounty/tarsnap-crash-hunt"]
+  pull_request:
+    branches: ["main"]
 
 permissions:
   contents: read
