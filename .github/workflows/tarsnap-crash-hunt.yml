@@ -3,6 +3,8 @@ name: Tarsnap local crash hunt
 on:
   push:
     branches: ["bounty/tarsnap-crash-hunt"]
+  pull_request:
+    branches: ["main"]
 
 permissions:
   contents: read
@@ -36,7 +38,7 @@ jobs:
           cd /tmp/tarsnap
           mkdir -p /tmp/findings
           python3 - <<'PY'
-          import os, random, shutil, struct, subprocess, tempfile, pathlib, sys
+          import os, random, shutil, struct, subprocess, pathlib
 
           ROOT = pathlib.Path('/tmp/tarsnap')
           FIND = pathlib.Path('/tmp/findings')
@@ -56,9 +58,6 @@ jobs:
               except subprocess.TimeoutExpired:
                   return 124, 'TIMEOUT', False
 
-          findings = []
-
-          # 1) Mutate the repository's known-valid test keyfile and exercise both import and re-export.
           seed = (ROOT / 'tests/fake.keys').read_bytes()
           for i in range(600):
               data = bytearray(seed)
@@ -89,18 +88,14 @@ jobs:
               ]:
                   rc, err, crash = run(cmd)
                   if crash:
-                      # Ignore the already-public zero-BIGNUM export_BN crash (#753).
                       if 'export_BN' in err and 'crypto_keys_subr.c' in err:
                           continue
-                      dst = FIND / f'{label}-{i}.bin'
-                      shutil.copy2(f, dst)
-                      (FIND / f'{label}-{i}.log').write_text(f'rc={rc}\n{err}')
-                      findings.append((label, i, rc, err[-1200:]))
+                      shutil.copy2(f, FIND/f'{label}-{i}.bin')
+                      (FIND/f'{label}-{i}.log').write_text(f'rc={rc}\n{err}')
                       print(f'CRASH_FOUND key {label} case={i} rc={rc}')
-                      print(err[-1200:])
+                      print(err[-1600:])
                       raise SystemExit(0)
 
-          # 2) Fuzz cachedir directory records. This is local dry-run only; no service contact.
           inp = pathlib.Path('/tmp/tarsnap-fuzz-input.txt')
           inp.write_text('hello\n')
           for i in range(500):
@@ -109,28 +104,23 @@ jobs:
               nrec = random.randint(0,5)
               header = struct.pack('<QQQ', random.randrange(3), random.randrange(3), random.randrange(3))
               recs = bytearray()
-              for r in range(nrec):
-                  h = os.urandom(32)
+              for _ in range(nrec):
                   fields = [random.choice([0,1,2,0xffffffff,0x3fffffff,0x40000000,0x80000000,random.randrange(2**32)]) for _ in range(4)]
-                  recs += h + struct.pack('<IIII', *fields)
-              # Add occasional short/trailing bytes.
+                  recs += os.urandom(32) + struct.pack('<IIII', *fields)
               blob = header + recs + (os.urandom(random.randint(0,15)) if i % 3 == 0 else b'')
               (cache/'directory').write_bytes(blob)
               cmd = ['./tarsnap','--no-default-config','--keyfile','tests/fake.keys','--cachedir',str(cache),
                      '-c','--dry-run','-f',f'fuzz-{i}',str(inp)]
               rc, err, crash = run(cmd, timeout=5)
               if crash:
-                  # Ignore already-public CHDATA_MALLOC ownership crash (#754).
                   if ('chunks_directory.c:93' in err or 'callback_free' in err) and ('use-after-free' in err or 'double free' in err):
                       continue
                   shutil.copy2(cache/'directory', FIND/f'directory-{i}.bin')
                   (FIND/f'directory-{i}.log').write_text(f'rc={rc}\n{err}')
-                  findings.append(('directory', i, rc, err[-1200:]))
                   print(f'CRASH_FOUND directory case={i} rc={rc}')
-                  print(err[-1200:])
+                  print(err[-1600:])
                   raise SystemExit(0)
 
-          # 3) Boundary values for user-controlled option arguments, using dry-run and fake keys.
           options = [
               '--cachedir=', '--csv-file=', '--archive-names=', '--exclude=', '--include=',
               '--newer=', '--newer-ctime=', '--newer-mtime=', '--snaptime=', '--creationtime=',
@@ -144,7 +134,7 @@ jobs:
               if crash:
                   (FIND/f'option-{i}.txt').write_text(' '.join(cmd)+'\n'+f'rc={rc}\n{err}')
                   print(f'CRASH_FOUND option {opt} rc={rc}')
-                  print(err[-1200:])
+                  print(err[-1600:])
                   raise SystemExit(0)
 
           print('NO_NEW_CRASH_FOUND')
