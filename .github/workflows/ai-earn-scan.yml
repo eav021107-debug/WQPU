@@ -5,6 +5,8 @@ on:
     branches: [ai-earn-runner]
     paths:
       - .github/workflows/ai-earn-scan.yml
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
@@ -38,7 +40,6 @@ jobs:
           EXTRA=()
           if [ -n "$SESSION" ]; then EXTRA=(-H "Mcp-Session-Id: $SESSION"); fi
 
-          # Initialization notification is best-effort; some stateless servers do not need it.
           curl -sS -o .ai-earn/initialized.raw \
             -X POST "$URL" \
             -H 'Content-Type: application/json' \
@@ -101,7 +102,6 @@ jobs:
               Path(dst).write_text(json.dumps(parse_sse(src), indent=2, ensure_ascii=False) + '\n')
           PY
 
-          # Do not persist session identifiers or transport headers.
           rm -f .ai-earn/*.raw .ai-earn/*.headers .ai-earn/session-id.txt .ai-earn/initialized.raw
 
       - name: Commit public scan results
