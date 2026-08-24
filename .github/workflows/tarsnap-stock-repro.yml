@@ -1,0 +1,46 @@
+name: Tarsnap stock repro
+
+on:
+  push:
+    branches: ["bounty/tarsnap-crash-hunt"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc make autoconf automake autoconf-archive pkg-config libssl-dev zlib1g-dev e2fslibs-dev python3
+      - name: Build stock current Tarsnap
+        run: |
+          git clone --depth=1 https://github.com/Tarsnap/tarsnap.git /tmp/tarsnap
+          cd /tmp/tarsnap
+          autoreconf -i
+          CFLAGS='-O2 -g -Wall' ./configure
+          make -j2
+          git rev-parse HEAD
+      - name: Reproduce exact 24-byte cachedir input
+        run: |
+          cd /tmp/tarsnap
+          mkdir -p /tmp/cache-exact
+          python3 - <<'PY'
+          from pathlib import Path
+          Path('/tmp/cache-exact/directory').write_bytes(bytes.fromhex('000000000000000001000000000000000200000000000000'))
+          Path('/tmp/tarsnap-fuzz-input.txt').write_text('hello\n')
+          PY
+          set +e
+          ./tarsnap --no-default-config --keyfile tests/fake.keys --cachedir /tmp/cache-exact -c --dry-run -f stock-repro /tmp/tarsnap-fuzz-input.txt > /tmp/stdout.txt 2> /tmp/stderr.txt
+          rc=$?
+          set -e
+          echo "STOCK_RC=$rc"
+          echo '--- stderr ---'
+          cat /tmp/stderr.txt
+          if [ "$rc" -ge 128 ]; then echo 'STOCK_CRASH=YES'; else echo 'STOCK_CRASH=NO'; fi

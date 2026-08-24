@@ -1,0 +1,148 @@
+name: Tarsnap local crash hunt
+
+on:
+  push:
+    branches: ["bounty/tarsnap-crash-hunt"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  hunt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            gcc make autoconf automake autoconf-archive pkg-config \
+            libssl-dev zlib1g-dev e2fslibs-dev python3
+      - name: Build current Tarsnap with ASan/UBSan
+        run: |
+          git clone --depth=1 https://github.com/Tarsnap/tarsnap.git /tmp/tarsnap
+          cd /tmp/tarsnap
+          autoreconf -i
+          CFLAGS='-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer' \
+          LDFLAGS='-fsanitize=address,undefined' ./configure
+          make -j2
+          ./tarsnap --version || true
+      - name: Mutational crash hunt on local parsers
+        env:
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: |
+          cd /tmp/tarsnap
+          mkdir -p /tmp/findings
+          python3 - <<'PY'
+          import os, random, shutil, struct, subprocess, pathlib
+
+          ROOT = pathlib.Path('/tmp/tarsnap')
+          FIND = pathlib.Path('/tmp/findings')
+          random.seed(0x544152534E4150)
+
+          def run(cmd, timeout=3):
+              try:
+                  p = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                     timeout=timeout, env={**os.environ,
+                                     'ASAN_OPTIONS':'detect_leaks=0:abort_on_error=1:halt_on_error=1',
+                                     'UBSAN_OPTIONS':'halt_on_error=1:print_stacktrace=1'})
+                  err = p.stderr.decode('utf-8','replace')
+                  crash = (p.returncode < 0 or p.returncode in (132,133,134,136,137,138,139) or
+                           'AddressSanitizer' in err or 'runtime error:' in err or
+                           'double free' in err or 'Segmentation fault' in err)
+                  return p.returncode, err, crash
+              except subprocess.TimeoutExpired:
+                  return 124, 'TIMEOUT', False
+
+          seed = (ROOT / 'tests/fake.keys').read_bytes()
+          for i in range(600):
+              data = bytearray(seed)
+              mode = i % 6
+              if mode == 0 and len(data) > 1:
+                  data = data[:random.randrange(0, len(data))]
+              elif mode == 1:
+                  for _ in range(random.randint(1,6)):
+                      if data: data[random.randrange(len(data))] ^= 1 << random.randrange(8)
+              elif mode == 2:
+                  for _ in range(random.randint(1,4)):
+                      if data: data[random.randrange(len(data))] = random.randrange(256)
+              elif mode == 3 and len(data) > 8:
+                  off = random.randrange(0, len(data)-4)
+                  data[off:off+4] = struct.pack('<I', random.choice([0,1,2,3,0x3fffffff,0x40000000,0x7fffffff,0xffffffff]))
+              elif mode == 4:
+                  pos = random.randrange(len(data)+1)
+                  data[pos:pos] = os.urandom(random.randint(1,8))
+              else:
+                  if data:
+                      pos = random.randrange(len(data))
+                      del data[pos:min(len(data), pos+random.randint(1,8))]
+              f = pathlib.Path('/tmp') / f'keymut-{i}.bin'
+              f.write_bytes(data)
+              for label, cmd in [
+                  ('key-id', ['./tarsnap-keymgmt','--print-key-id',str(f)]),
+                  ('key-export', ['./tarsnap-keymgmt','--outkeyfile',f'/tmp/out-{i}.keys','--keylist','1',str(f)])
+              ]:
+                  rc, err, crash = run(cmd)
+                  if crash:
+                      if 'export_BN' in err and 'crypto_keys_subr.c' in err:
+                          continue
+                      shutil.copy2(f, FIND/f'{label}-{i}.bin')
+                      (FIND/f'{label}-{i}.log').write_text(f'rc={rc}\n{err}')
+                      print(f'CRASH_FOUND key {label} case={i} rc={rc}')
+                      print(err[-1600:])
+                      raise SystemExit(0)
+
+          inp = pathlib.Path('/tmp/tarsnap-fuzz-input.txt')
+          inp.write_text('hello\n')
+          for i in range(500):
+              cache = pathlib.Path(f'/tmp/cache-{i}')
+              cache.mkdir(exist_ok=True)
+              nrec = random.randint(0,5)
+              header = struct.pack('<QQQ', random.randrange(3), random.randrange(3), random.randrange(3))
+              recs = bytearray()
+              for _ in range(nrec):
+                  fields = [random.choice([0,1,2,0xffffffff,0x3fffffff,0x40000000,0x80000000,random.randrange(2**32)]) for _ in range(4)]
+                  recs += os.urandom(32) + struct.pack('<IIII', *fields)
+              blob = header + recs + (os.urandom(random.randint(0,15)) if i % 3 == 0 else b'')
+              (cache/'directory').write_bytes(blob)
+              cmd = ['./tarsnap','--no-default-config','--keyfile','tests/fake.keys','--cachedir',str(cache),
+                     '-c','--dry-run','-f',f'fuzz-{i}',str(inp)]
+              rc, err, crash = run(cmd, timeout=5)
+              if crash:
+                  if ('chunks_directory.c:93' in err or 'callback_free' in err) and ('use-after-free' in err or 'double free' in err):
+                      continue
+                  shutil.copy2(cache/'directory', FIND/f'directory-{i}.bin')
+                  (FIND/f'directory-{i}.log').write_text(f'rc={rc}\n{err}')
+                  print(f'CRASH_FOUND directory case={i} rc={rc}')
+                  print(err[-1600:])
+                  raise SystemExit(0)
+
+          options = [
+              '--cachedir=', '--csv-file=', '--archive-names=', '--exclude=', '--include=',
+              '--newer=', '--newer-ctime=', '--newer-mtime=', '--snaptime=', '--creationtime=',
+              '--strip-components=', '--checkpoint-bytes=', '--progress-bytes=', '--maxbw=',
+              '--maxbw-rate=', '--maxbw-rate-down=', '--maxbw-rate-up=', '--disk-pause=',
+              '--passphrase=', '--configfile='
+          ]
+          for i, opt in enumerate(options):
+              cmd = ['./tarsnap','--no-default-config','--keyfile','tests/fake.keys','-c','--dry-run','-f',f'opt-{i}',opt,str(inp)]
+              rc, err, crash = run(cmd, timeout=5)
+              if crash:
+                  (FIND/f'option-{i}.txt').write_text(' '.join(cmd)+'\n'+f'rc={rc}\n{err}')
+                  print(f'CRASH_FOUND option {opt} rc={rc}')
+                  print(err[-1600:])
+                  raise SystemExit(0)
+
+          print('NO_NEW_CRASH_FOUND')
+          PY
+      - name: Upload any crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarsnap-crash-findings
+          path: /tmp/findings
+          if-no-files-found: ignore

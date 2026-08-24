@@ -1,0 +1,160 @@
+name: Tarsnap stock crash hunt
+
+on:
+  push:
+    branches: ["bounty/tarsnap-crash-hunt"]
+  pull_request:
+    branches: ["main"]
+
+permissions:
+  contents: read
+
+jobs:
+  hunt-stock:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc make autoconf automake autoconf-archive pkg-config libssl-dev zlib1g-dev e2fslibs-dev python3
+      - name: Build stock Tarsnap
+        run: |
+          git clone --depth=1 https://github.com/Tarsnap/tarsnap.git /tmp/tarsnap
+          cd /tmp/tarsnap
+          autoreconf -i
+          CFLAGS='-O2 -g -Wall -Wextra' ./configure
+          make -j2
+          git rev-parse HEAD
+      - name: Generate valid local cache seed
+        run: |
+          cd /tmp/tarsnap
+          rm -rf /tmp/seedcache && mkdir -p /tmp/seedcache /tmp/inputdir
+          for i in $(seq 1 12); do printf 'file-%s-%04096d\n' "$i" "$i" > "/tmp/inputdir/f$i"; done
+          set +e
+          ./tarsnap --no-default-config --keyfile tests/fake.keys --cachedir /tmp/seedcache -c --dry-run -f seed /tmp/inputdir >/tmp/seed.out 2>/tmp/seed.err
+          set -e
+          ls -l /tmp/seedcache || true
+      - name: Stock-only local parser mutations
+        run: |
+          cd /tmp/tarsnap
+          mkdir -p /tmp/stock-findings
+          python3 - <<'PY'
+          import os, pathlib, random, shutil, struct, subprocess
+          ROOT = pathlib.Path('/tmp/tarsnap')
+          OUT = pathlib.Path('/tmp/stock-findings')
+          random.seed(0x53544f434b435241)
+
+          def run(cmd, timeout=4):
+              try:
+                  p = subprocess.run(cmd, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+                  err = p.stderr.decode('utf-8','replace')
+                  crash = p.returncode < 0 or p.returncode >= 128 or any(x in err.lower() for x in ['segmentation fault','double free','aborted','core dumped'])
+                  return p.returncode, err, crash
+              except subprocess.TimeoutExpired:
+                  return 124, 'TIMEOUT', False
+
+          # A. Mutate a legitimately generated chunkification cache.
+          seedp = pathlib.Path('/tmp/seedcache/cache')
+          if seedp.exists():
+              seed = seedp.read_bytes()
+              print('CACHE_SEED_BYTES', len(seed))
+              for i in range(2200):
+                  data = bytearray(seed)
+                  mode = i % 8
+                  if mode == 0 and data:
+                      data = data[:random.randrange(len(data)+1)]
+                  elif mode == 1 and data:
+                      for _ in range(random.randint(1,8)):
+                          data[random.randrange(len(data))] ^= 1 << random.randrange(8)
+                  elif mode == 2 and len(data) >= 4:
+                      off = random.randrange(0, len(data)-3)
+                      data[off:off+4] = struct.pack('<I', random.choice([0,1,2,10,0x7fffffff,0x80000000,0xfffffffe,0xffffffff]))
+                  elif mode == 3 and len(data) >= 8:
+                      off = random.randrange(0, len(data)-7)
+                      data[off:off+8] = struct.pack('<Q', random.choice([0,1,2,0x7fffffffffffffff,0x8000000000000000,0xffffffffffffffff]))
+                  elif mode == 4:
+                      pos = random.randrange(len(data)+1)
+                      data[pos:pos] = os.urandom(random.randint(1,32))
+                  elif mode == 5 and data:
+                      pos = random.randrange(len(data))
+                      del data[pos:min(len(data), pos+random.randint(1,32))]
+                  elif mode == 6 and len(data) > 4:
+                      # Focus on declared record count and nearby record fields.
+                      data[:4] = struct.pack('<I', random.choice([0,1,2,255,65535,0xffffffff]))
+                  else:
+                      for _ in range(random.randint(1,4)):
+                          if data: data[random.randrange(len(data))] = random.randrange(256)
+                  cdir = pathlib.Path('/tmp/case-cache')
+                  cdir.mkdir(exist_ok=True)
+                  (cdir/'cache').write_bytes(data)
+                  # Keep directory absent to avoid the already-known #754 crash family.
+                  try: (cdir/'directory').unlink()
+                  except FileNotFoundError: pass
+                  rc, err, crash = run(['./tarsnap','--no-default-config','--keyfile','tests/fake.keys','--cachedir',str(cdir),'-c','--dry-run','-f',f'cache-{i}','/tmp/inputdir'])
+                  if crash:
+                      (OUT/f'cache-{i}.bin').write_bytes(data)
+                      (OUT/f'cache-{i}.log').write_text(f'rc={rc}\n{err}')
+                      print('STOCK_CRASH_FOUND cache', i, 'rc', rc)
+                      print(err[-2000:])
+                      raise SystemExit(0)
+
+          # B. Import-only key parser mutations (avoids the known #753 export crash).
+          seed = (ROOT/'tests/fake.keys').read_bytes()
+          for i in range(2400):
+              data = bytearray(seed)
+              mode = i % 7
+              if mode == 0:
+                  data = data[:random.randrange(len(data)+1)]
+              elif mode == 1 and data:
+                  for _ in range(random.randint(1,10)):
+                      data[random.randrange(len(data))] ^= 1 << random.randrange(8)
+              elif mode == 2 and len(data) >= 4:
+                  off = random.randrange(len(data)-3)
+                  data[off:off+4] = struct.pack('<I', random.choice([0,1,4,5,0x7fffffff,0x80000000,0xffffffff]))
+              elif mode == 3:
+                  pos = random.randrange(len(data)+1)
+                  data[pos:pos] = os.urandom(random.randint(1,48))
+              elif mode == 4 and data:
+                  pos = random.randrange(len(data))
+                  del data[pos:min(len(data), pos+random.randint(1,48))]
+              elif mode == 5:
+                  data = bytearray(os.urandom(random.randint(1,512)))
+              else:
+                  for _ in range(random.randint(1,5)):
+                      if data: data[random.randrange(len(data))] = random.randrange(256)
+              f = pathlib.Path('/tmp/keycase')
+              f.write_bytes(data)
+              rc, err, crash = run(['./tarsnap-keymgmt','--print-key-id',str(f)])
+              if crash:
+                  (OUT/f'key-{i}.bin').write_bytes(data)
+                  (OUT/f'key-{i}.log').write_text(f'rc={rc}\n{err}')
+                  print('STOCK_CRASH_FOUND key-import', i, 'rc', rc)
+                  print(err[-2000:])
+                  raise SystemExit(0)
+
+          # C. Base64/text-key parser edge corpus.
+          alphabet = b'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/='
+          corpus = [b'A'*n + e for n in range(1,257) for e in [b'\n',b'\r',b'\r\n']]
+          corpus += [b'#'+b'A'*n+b'\n' for n in [1,2,3,4,7,8,63,64,255,1024,65535]]
+          for i, data in enumerate(corpus):
+              f = pathlib.Path('/tmp/textkeycase')
+              f.write_bytes(data)
+              rc, err, crash = run(['./tarsnap-keymgmt','--print-key-id',str(f)])
+              if crash:
+                  (OUT/f'textkey-{i}.bin').write_bytes(data)
+                  (OUT/f'textkey-{i}.log').write_text(f'rc={rc}\n{err}')
+                  print('STOCK_CRASH_FOUND text-key', i, 'rc', rc)
+                  print(err[-2000:])
+                  raise SystemExit(0)
+
+          print('NO_STOCK_CRASH_FOUND')
+          PY
+      - name: Upload stock crash artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarsnap-stock-findings
+          path: /tmp/stock-findings
+          if-no-files-found: ignore
